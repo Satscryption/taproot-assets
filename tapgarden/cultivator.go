@@ -178,18 +178,24 @@ func (b *Cultivator) augmenter() GenesisTxAugmenter {
 
 // NewCultivator creates a new Taproot Asset cultivator based on the passed
 // config.
-func NewCultivator(cfg *CultivatorConfig) *Cultivator {
-	return &Cultivator{
-		batchKey:     asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
-		cfg:          cfg,
-		confEvent:    make(chan *chainntnfs.TxConfirmation, 1),
-		abandonEvent: make(chan struct{}, 1),
-		done:         make(chan struct{}),
+//
+// TODO(roasbeef): rename to Cultivator?
+func NewBatchCaretaker(cfg *BatchCaretakerConfig) *BatchCaretaker {
+	caretaker := &BatchCaretaker{
+		batchKey:  asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
+		cfg:       cfg,
+		confEvent: make(chan *chainntnfs.TxConfirmation, 1),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),
 		},
 	}
+	if cfg.Batch.GenesisPacket != nil {
+		caretaker.anchorOutputIndex = cfg.Batch.GenesisPacket.
+			AssetAnchorOutIdx
+	}
+
+	return caretaker
 }
 
 // Done returns a channel that is closed once the cultivator's main
@@ -933,6 +939,12 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			return 0, fmt.Errorf("genesis TX failed final checks: "+
 				"%w", err)
 		}
+		if err := validateExclusionProofOutputs(
+			signedPkt, b.anchorOutputIndex,
+		); err != nil {
+
+			return 0, err
+		}
 
 		// Populate how much this tx paid in on-chain fees.
 		chainFees, err := signedPkt.GetTxFee()
@@ -1085,13 +1097,25 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			ctx, signedTx, IssuanceTxLabel,
 		)
 		if err != nil {
-			regCancel()
-
-			return 0, fmt.Errorf("unable to publish "+
-				"transaction: %w", err)
+			return 0, fmt.Errorf("unable to publish transaction: %w", err)
 		}
 
 		txHash := signedTx.TxHash()
+		confCtx, confCancel := b.WithCtxQuitNoTimeout()
+		confNtfn, errChan, err := b.cfg.ChainBridge.RegisterConfirmationsNtfn(
+			confCtx, &txHash,
+			signedTx.TxOut[b.anchorOutputIndex].PkScript, 1,
+			heightHint, true, nil,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("unable to register for "+
+				"minting tx conf: %w", err)
+		}
+
+		// Launch a goroutine that'll notify us when the transaction
+		// confirms.
+		//
+		// TODO(roasbeef): make blocking here?
 		b.Wg.Add(1)
 		go func() {
 			defer regCancel()

@@ -1289,7 +1289,6 @@ func customGenesisPsbt(chainParams address.ChainParams,
 		return zero, fmt.Errorf("invalid custom asset anchor internal "+
 			"key: %w", err)
 	}
-
 	funded := tapsend.FundedPsbt{
 		Pkt:               packet,
 		ChangeOutputIndex: changeOutputIndex,
@@ -1358,6 +1357,12 @@ func customGenesisPsbt(chainParams address.ChainParams,
 		return zero, fmt.Errorf("pre-commitment output index specified " +
 			"for batch without supply commitments")
 	}
+	if err := validateExclusionProofOutputs(
+		packet, assetAnchorOutIdx,
+	); err != nil {
+
+		return zero, err
+	}
 	indexes := AnchorTxOutputIndexes{
 		AssetAnchorOutIdx: assetAnchorOutIdx,
 		ChangeOutIdx:      0,
@@ -1367,6 +1372,32 @@ func customGenesisPsbt(chainParams address.ChainParams,
 	return NewFundedMintAnchorPsbt(
 		funded, indexes, preCommitOut,
 	)
+}
+
+// validateExclusionProofOutputs ensures every non-anchor P2TR output can be
+// represented in the minting proofs. Doing this before broadcast prevents an
+// otherwise valid mint from becoming unprovable only after confirmation.
+func validateExclusionProofOutputs(packet *psbt.Packet,
+	assetAnchorOutIdx uint32) error {
+
+	if packet == nil || packet.UnsignedTx == nil {
+		return fmt.Errorf("cannot validate exclusion proof outputs without " +
+			"an unsigned transaction")
+	}
+
+	baseProof := &proof.BaseProofParams{}
+	err := proof.AddExclusionProofs(
+		baseProof, packet.UnsignedTx, packet.Outputs,
+		func(outputIndex uint32) bool {
+			return outputIndex == assetAnchorOutIdx
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("anchor PSBT cannot produce exclusion "+
+			"proofs: %w", err)
+	}
+
+	return nil
 }
 
 // filterSeedlingsWithGroup separates a set of seedlings into two sets based on
@@ -2204,13 +2235,22 @@ func (c *ChainPlanter) cancelMintingBatch(ctx context.Context,
 	log.Infof("Cancelling MintingBatch(key=%x, num_assets=%v)",
 		batchKeySerialized, len(c.pendingBatch.Seedlings))
 
-	// If the target batch was not assigned a cultivator, the only
-	// non-cancelled batch in play is c.pendingBatch (canCancelBatch
-	// guarantees this). Update the batch state on disk and in memory in
-	// a single atomic call.
-	err := c.cfg.BatchStore.UpdateBatchState(
-		ctx, c.pendingBatch, BatchStateSeedlingCancelled,
-	)
+	// If the target batch was not assigned a caretaker, we only need to
+	// update the batch state on disk to cancel it.
+	var cancelState BatchState
+	switch c.pendingBatch.State() {
+	case BatchStatePending, BatchStateFrozen:
+		cancelState = BatchStateSeedlingCancelled
+
+	case BatchStateCommitted:
+		cancelState = BatchStateSproutCancelled
+
+	default:
+		return fmt.Errorf("batch state %v is not cancellable",
+			c.pendingBatch.State())
+	}
+
+	err := c.cfg.Log.UpdateBatchState(ctx, batchKey, cancelState)
 	if err != nil {
 		return fmt.Errorf("unable to cancel minting batch: %w", err)
 	}
@@ -2586,9 +2626,10 @@ func (c *ChainPlanter) gardener() {
 
 				case err := <-caretaker.cfg.BroadcastErrChan:
 					req.Error(err)
-					// Unrecoverable error, stop caretaker
-					// directly. The pending batch will not
-					// be saved.
+					// Stop the failed caretaker directly. Custom
+					// batches remain pending so the same signed
+					// transaction can be retried; legacy batches
+					// retain their existing terminal behavior.
 					stopErr := caretaker.Stop()
 					if stopErr != nil {
 						log.Warnf("Unable to stop "+
@@ -2621,7 +2662,9 @@ func (c *ChainPlanter) gardener() {
 				ctx, cancel := c.WithCtxQuit()
 				err = c.cancelMintingBatch(ctx, batchKey)
 				cancel()
-				c.pendingBatch = nil
+				if err == nil {
+					c.pendingBatch = nil
+				}
 
 				// Always return the key of the batch we tried
 				// to cancel.
@@ -3525,11 +3568,15 @@ func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 			return nil, fmt.Errorf("signed PSBT cannot be combined with " +
 				"fee rate or tapscript sibling")
 		}
-		if c.pendingBatch.State() != BatchStateCommitted ||
+		state := c.pendingBatch.State()
+		// A broadcast custom packet can be resubmitted after an ambiguous
+		// publication or confirmation-registration error. The merge below
+		// still requires the prepared transaction and metadata to be identical.
+		if (state != BatchStateCommitted && state != BatchStateBroadcast) ||
 			!isCustomAnchorPsbt(c.pendingBatch.GenesisPacket.Pkt) {
 
-			return nil, fmt.Errorf("no prepared custom batch awaiting " +
-				"an external signature")
+			return nil, fmt.Errorf("no prepared or broadcast custom batch " +
+				"available for external finalization")
 		}
 		merged, err := mergeSignedCustomPsbt(
 			c.pendingBatch.GenesisPacket.Pkt, params.SignedPsbt,
