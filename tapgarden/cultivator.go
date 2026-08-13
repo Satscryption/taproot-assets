@@ -910,11 +910,16 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		// TODO(roasbeef): only execute if finalized? or missing sig
 		ctx, cancel := b.WithCtxQuit()
 		defer cancel()
-		signedPkt, err := b.cfg.Wallet.SignAndFinalizePsbt(
-			ctx, b.cfg.Batch.GenesisPacket.Pkt,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("unable to sign psbt: %w", err)
+		signedPkt := b.cfg.Batch.GenesisPacket.Pkt
+		_, extractErr := psbt.Extract(signedPkt)
+		if extractErr != nil {
+			signedPkt, extractErr = b.cfg.Wallet.SignAndFinalizePsbt(
+				ctx, signedPkt,
+			)
+			if extractErr != nil {
+				return 0, fmt.Errorf("unable to sign psbt: %w",
+					extractErr)
+			}
 		}
 
 		// Final TX sanity check.
@@ -1159,6 +1164,10 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		// output we need to create an exclusion proof for it (and for
 		// all other P2TR outputs, we just assume BIP-0086 here).
 		batchCommitment := b.cfg.Batch.RootAssetCommitment
+		mintingInternalKey, err := b.cfg.Batch.MintingInternalKey()
+		if err != nil {
+			return 0, err
+		}
 
 		pkt := b.cfg.Batch.GenesisPacket
 		genesisOutPoint, err := pkt.GenesisOutpoint().UnwrapOrErr(
@@ -1174,8 +1183,8 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 				BlockHeight:      confInfo.BlockHeight,
 				Tx:               confInfo.Tx,
 				TxIndex:          int(confInfo.TxIndex),
-				OutputIndex:      int(pkt.AssetAnchorOutIdx),
-				InternalKey:      b.cfg.Batch.BatchKey.PubKey,
+				OutputIndex:      int(b.anchorOutputIndex),
+				InternalKey:      mintingInternalKey,
 				TapscriptSibling: batchSibling,
 				TaprootAssetRoot: batchCommitment,
 			},

@@ -1045,8 +1045,8 @@ func fetchAssetSeedlings(ctx context.Context, q PendingAssetStore,
 // generation, the GroupKeyFamily and GroupKeyIndex fields of the
 // FetchAssetsForBatchRow need to be manually modified to be sql.NullInt32.
 func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
-	rawBatchKey, batchSibling, genScript []byte) (*commitment.TapCommitment,
-	error) {
+	rawBatchKey, batchSibling, genScript []byte,
+	mintingInternalKey *btcec.PublicKey) (*commitment.TapCommitment, error) {
 
 	dbSprout, err := q.FetchAssetsForBatch(ctx, rawBatchKey)
 	if err != nil {
@@ -1168,13 +1168,6 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 		sprouts[i] = assetSprout
 	}
 
-	// Verify that we can reconstruct the genesis output script used in the
-	// anchor TX.
-	batchKey, err := btcec.ParsePubKey(rawBatchKey)
-	if err != nil {
-		return nil, err
-	}
-
 	var tapSibling *chainhash.Hash
 	if len(batchSibling) != 0 {
 		tapSibling, err = chainhash.NewHash(batchSibling)
@@ -1184,7 +1177,7 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 	}
 
 	return tapgarden.VerifyOutputScript(
-		batchKey, tapSibling, genScript, sprouts,
+		mintingInternalKey, tapSibling, genScript, sprouts,
 	)
 }
 
@@ -1487,8 +1480,13 @@ func marshalMintingBatch(ctx context.Context, q PendingAssetStore,
 		genesisTx := batch.GenesisPacket.Pkt.UnsignedTx
 		genesisScript := genesisTx.TxOut[assetAnchorOutIdx].PkScript
 		tapscriptSibling := batch.TapSibling()
+		mintingInternalKey, err := batch.MintingInternalKey()
+		if err != nil {
+			return nil, err
+		}
 		batch.RootAssetCommitment, err = fetchAssetSprouts(
 			ctx, q, dbBatch.RawKey, tapscriptSibling, genesisScript,
+			mintingInternalKey,
 		)
 		if err != nil {
 			return nil, err
