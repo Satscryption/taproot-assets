@@ -1001,6 +1001,40 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			return 0, err
 		}
 
+		// Custom anchor transactions can contain inputs that aren't owned
+		// by lnd. Ask the chain backend to validate and submit the fully
+		// signed transaction before we persist the irreversible Broadcast
+		// state. A conclusive application rejection leaves the batch in
+		// Committed, while an ambiguous transport failure must be treated as
+		// potentially published.
+		var publishErr error
+		if isCustomAnchorPsbt(signedPkt) {
+			publishCtx, publishCancel := b.WithCtxQuit()
+			publishErr = b.cfg.ChainBridge.
+				ValidateAndPublishTransaction(
+					publishCtx, signedTx, IssuanceTxLabel,
+				)
+			publishCancel()
+			if tapnode.IsDefinitivePublishError(publishErr) {
+				setCustomAnchorPublishState(
+					signedPkt, customAnchorPublishRejected,
+				)
+				storeCtx, storeCancel := b.WithCtxQuit()
+				storeErr := b.cfg.Log.StoreSignedGenesisPsbt(
+					storeCtx, b.cfg.Batch.BatchKey.PubKey,
+					&b.cfg.Batch.GenesisPacket.FundedPsbt,
+				)
+				storeCancel()
+				if storeErr != nil {
+					return 0, fmt.Errorf("unable to store definitive "+
+						"publication rejection: %w", storeErr)
+				}
+
+				return 0, fmt.Errorf("transaction rejected before "+
+					"broadcast state: %w", publishErr)
+			}
+		}
+
 		// To spend this output in the future, we must also commit the
 		// Taproot Asset commitment root and batch tapscript sibling.
 		tapCommitmentRoot := b.cfg.Batch.RootAssetCommitment.
@@ -1031,28 +1065,18 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			return 0, fmt.Errorf("unable to import key: %w", err)
 		}
 
-		changeIdx := b.cfg.Batch.GenesisPacket.ChangeOutputIndex
-		signedFundedPsbt := tapsend.FundedPsbt{
-			Pkt:               signedPkt,
-			ChangeOutputIndex: changeIdx,
-			ChainFees:         int64(chainFees),
-		}
-		err = b.cfg.BatchStore.CommitSignedGenesisTx(
-			ctx, b.cfg.Batch,
-			&signedFundedPsbt,
-			b.cfg.Batch.GenesisPacket.AssetAnchorOutIdx,
-			merkleRoot, tapCommitmentRoot[:], siblingBytes,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("unable to commit genesis "+
-				"tx: %w", err)
+		// If validation failed ambiguously, the transaction might still
+		// have reached the backend. The durable signed transaction and
+		// Broadcast state make an exact retry safe after this caretaker
+		// exits.
+		if publishErr != nil {
+			b.cfg.Batch.UpdateState(BatchStateBroadcast)
+
+			return 0, fmt.Errorf("unable to publish transaction: %w",
+				publishErr)
 		}
 
-		// DB write succeeded; sync in-memory batch with disk.
-		b.cfg.Batch.GenesisPacket.Pkt = signedPkt
-		b.cfg.Batch.GenesisPacket.ChainFees = int64(chainFees)
-
-		log.Infof("Cultivator(%x): transition states: %v -> %v",
+		log.Infof("BatchCaretaker(%x): transition states: %v -> %v",
 			b.batchKey[:], BatchStateCommitted, BatchStateBroadcast)
 
 		return BatchStateBroadcast, nil
