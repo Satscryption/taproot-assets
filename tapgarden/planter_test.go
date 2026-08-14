@@ -133,6 +133,8 @@ type mintingTestHarness struct {
 	testing.TB
 
 	errChan chan error
+
+	leaseRenewalInterval time.Duration
 }
 
 // newMintingTestHarness creates a new test harness from an active minting
@@ -189,9 +191,10 @@ func (t *mintingTestHarness) refreshChainPlanter() {
 			AnchoringWatcher:   t.registrar,
 			GenesisTxAugmenter: t.augmenter,
 		},
-		ChainParams:  *chainParams,
-		ProofUpdates: t.proofFiles,
-		ErrChan:      t.errChan,
+		ChainParams:                      *chainParams,
+		ProofUpdates:                     t.proofFiles,
+		ErrChan:                          t.errChan,
+		CustomAnchorLeaseRenewalInterval: t.leaseRenewalInterval,
 	})
 	require.NoError(t, t.planter.Start())
 }

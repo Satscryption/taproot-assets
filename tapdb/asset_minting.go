@@ -1430,7 +1430,8 @@ func marshalMintingBatch(ctx context.Context, q PendingAssetStore,
 		// the funded PSBT on readback.
 		batch.GenesisPacket = &tapgarden.FundedMintAnchorPsbt{
 			FundedPsbt: tapsend.FundedPsbt{
-				Pkt: genesisPkt,
+				Pkt:         genesisPkt,
+				LockedUTXOs: tapgarden.CustomAnchorLockedUTXOs(genesisPkt),
 				ChangeOutputIndex: extractSqlInt32[int32](
 					dbBatch.ChangeOutputIndex,
 				),
