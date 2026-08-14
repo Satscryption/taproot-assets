@@ -813,6 +813,11 @@ type ChainPlanter struct {
 	// any relevant resources.
 	completionSignals chan BatchKey
 
+	// startupCaretakerResults carries the first publication result from a
+	// custom caretaker that was resumed during startup. The gardener is the
+	// sole owner of the corresponding caretaker and pending batch mutations.
+	startupCaretakerResults chan startupCaretakerResult
+
 	// stateReqs is the channel that any outside requests for the state of
 	// the planter will come across. Each request is a closure that runs
 	// inside the gardener loop with full access to ChainPlanter state.
@@ -830,22 +835,26 @@ type ChainPlanter struct {
 	*fn.ContextGuard
 }
 
+// startupCaretakerResult is the first publication result from a custom batch
+// caretaker that was resumed during startup.
+type startupCaretakerResult struct {
+	batchKey  BatchKey
+	caretaker *BatchCaretaker
+	err       error
+}
+
 // NewChainPlanter creates a new ChainPlanter instance given the passed config.
 func NewChainPlanter(cfg PlanterConfig) *ChainPlanter {
 	return &ChainPlanter{
-		cfg:         cfg,
-		cultivators: make(map[BatchKey]*Cultivator),
-		waiters:     tapreorg.NewDeliveryWaiters(),
-		// Buffer size 1 is a fast path only: it lets a single
-		// cultivator that finishes while the gardener is inside a
-		// stateReq closure hand off its signal inline. Exit never
-		// depends on buffer space; a full buffer diverts the send
-		// to a goroutine (see SignalCompletion in
-		// newCultivatorForBatch).
-		completionSignals: make(chan BatchKey, 1),
-		seedlingReqs:      make(chan *Seedling),
-		stateReqs:         make(chan stateReq),
-		subscribers:       make(map[uint64]*fn.EventReceiver[fn.Event]),
+		cfg:                     cfg,
+		caretakers:              make(map[BatchKey]*BatchCaretaker),
+		completionSignals:       make(chan BatchKey),
+		startupCaretakerResults: make(chan startupCaretakerResult, 1),
+		seedlingReqs:            make(chan *Seedling),
+		stateReqs:               make(chan stateRequest),
+		subscribers: make(
+			map[uint64]*fn.EventReceiver[fn.Event],
+		),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),
@@ -1044,6 +1053,27 @@ func (c *ChainPlanter) Start() error {
 				continue
 			}
 
+			// A custom batch with a signed transaction awaiting import or
+			// publication is resumed automatically. Adopt it as the exclusive
+			// pending batch before launching its caretaker so no new batch can
+			// be admitted while recovery is in flight.
+			startupCustomRecovery := customBatch &&
+				batchState == BatchStateCommitted &&
+				(publishState == customAnchorImportPending ||
+					publishState == customAnchorPublishPending)
+			if startupCustomRecovery {
+				if c.pendingBatch != nil {
+					startErr = fmt.Errorf("multiple custom batches " +
+						"require startup recovery")
+					return
+				}
+
+				// The caretaker mutates its batch while crossing import and
+				// publication boundaries. Reserve an independent copy so API
+				// reads and the gardener never race those mutations.
+				c.pendingBatch = batch.Copy()
+			}
+
 			// If batch funding or sealing fail during startup, the
 			// batch will be marked as cancelled. The batch can
 			// still be displayed by the planter, and can be
@@ -1148,53 +1178,22 @@ func (c *ChainPlanter) Start() error {
 				}
 			}
 
-			log.Infof("Launching Cultivator(%x)", batchKey)
-			cultivator := c.newCultivatorForBatch(batch, nil)
-			if batch.State() == BatchStateConfirmed {
-				signedTx, err := psbt.Extract(
-					batch.GenesisPacket.Pkt,
-				)
-				if err != nil {
-					startErr = fmt.Errorf(
-						"unable to extract "+
-							"legacy confirmed "+
-							"batch "+
-							"transaction: %w", err,
-					)
-					return
-				}
-
-				err = cultivator.registerMintAnchoring(
-					ctx, signedTx,
-				)
-				if err != nil {
-					startErr = fmt.Errorf(
-						"unable to adopt "+
-							"legacy confirmed "+
-							"batch: %w", err,
-					)
-					return
-				}
-			}
-			if err := cultivator.Start(); err != nil {
+			log.Infof("Launching ChainCaretaker(%x)", batchKey)
+			caretaker := c.newCaretakerForBatch(batch, nil)
+			if err := caretaker.Start(); err != nil {
+				delete(c.caretakers, asset.ToSerialized(
+					batch.BatchKey.PubKey,
+				))
 				startErr = err
 				return
 			}
 
-			// The cultivator advances the batch in the background,
-			// and nothing else reads its broadcast channels on
-			// this path: BroadcastErrChan is otherwise only
-			// consumed by the interactive finalize handler. Watch
-			// for a pre-broadcast failure so a failed resume
-			// cannot leave the batch occupying the singleton slot
-			// enforced by the migration 000061 index, which would
-			// block all further minting. A batch resumed at
-			// BatchStateConfirmed skips the broadcast phase
-			// entirely and reports through the completion signal,
-			// so there is nothing to watch.
-			if batch.State() != BatchStateConfirmed {
+			if startupCustomRecovery {
+				batchKey := asset.ToSerialized(batch.BatchKey.PubKey)
 				c.Wg.Add(1)
-				go c.watchResumedCultivator(cultivator)
+				go c.forwardStartupCaretakerResult(
+					batchKey, caretaker,
+				)
 			}
 		}
 
@@ -1206,6 +1205,33 @@ func (c *ChainPlanter) Start() error {
 	})
 
 	return startErr
+}
+
+// forwardStartupCaretakerResult forwards exactly one publication result from
+// a custom caretaker resumed during startup. It never mutates planter state;
+// the gardener processes the result serially with all API requests.
+func (c *ChainPlanter) forwardStartupCaretakerResult(batchKey BatchKey,
+	caretaker *BatchCaretaker) {
+
+	defer c.Wg.Done()
+
+	var result startupCaretakerResult
+	result.batchKey = batchKey
+	result.caretaker = caretaker
+
+	select {
+	case <-caretaker.cfg.BroadcastCompleteChan:
+
+	case result.err = <-caretaker.cfg.BroadcastErrChan:
+
+	case <-c.Quit:
+		return
+	}
+
+	select {
+	case c.startupCaretakerResults <- result:
+	case <-c.Quit:
+	}
 }
 
 // Stop signals the ChainPlanter to halt all operations gracefully.
@@ -2813,11 +2839,65 @@ func (c *ChainPlanter) gardener() {
 
 	for {
 		select {
+		case result := <-c.startupCaretakerResults:
+			caretaker, ok := c.caretakers[result.batchKey]
+			if !ok || caretaker != result.caretaker {
+				// A fast confirmation can remove the caretaker before the
+				// gardener consumes its forwarded publication success. The
+				// matching reservation is still safe to release.
+				if result.err == nil && c.pendingBatch != nil &&
+					asset.ToSerialized(
+						c.pendingBatch.BatchKey.PubKey,
+					) == result.batchKey {
+
+					c.pendingBatch = nil
+				}
+
+				log.Warnf("Ignoring stale startup caretaker result for %x",
+					result.batchKey[:])
+				continue
+			}
+
+			if result.err == nil {
+				// Publication succeeded. Release the exclusive recovery
+				// slot, but retain the caretaker while it waits for
+				// confirmation.
+				if c.pendingBatch != nil &&
+					asset.ToSerialized(
+						c.pendingBatch.BatchKey.PubKey,
+					) == result.batchKey {
+
+					c.pendingBatch = nil
+				}
+
+				continue
+			}
+
+			// The caretaker has exited before publication completed. Remove
+			// it before returning the same batch to the pending slot so
+			// Finalize and Cancel cannot target a dead caretaker.
+			if err := caretaker.Stop(); err != nil {
+				log.Warnf("Unable to stop failed startup caretaker: %v",
+					err)
+			}
+			delete(c.caretakers, result.batchKey)
+			c.pendingBatch = caretaker.cfg.Batch
+			log.Warnf("Startup recovery failed for batch %x: %v",
+				result.batchKey[:], result.err)
+
 		case <-leaseRenewalTicker.C:
 			batch := c.pendingBatch
 			if batch == nil || batch.GenesisPacket == nil ||
 				!isCustomAnchorPsbt(batch.GenesisPacket.Pkt) {
 
+				continue
+			}
+
+			// A startup recovery caretaker owns lease renewal until its first
+			// publication result. The pending batch is only an immutable
+			// reservation while that caretaker is active.
+			batchKey := asset.ToSerialized(batch.BatchKey.PubKey)
+			if _, ok := c.caretakers[batchKey]; ok {
 				continue
 			}
 			switch batch.State() {
@@ -2906,6 +2986,17 @@ func (c *ChainPlanter) gardener() {
 			}
 
 			delete(c.cultivators, batchKey)
+
+			// A recovered custom caretaker can confirm before its forwarded
+			// publication success is selected. Release its exact reservation
+			// here as well so event ordering cannot strand a Committed batch.
+			if c.pendingBatch != nil &&
+				asset.ToSerialized(
+					c.pendingBatch.BatchKey.PubKey,
+				) == batchKey {
+
+				c.pendingBatch = nil
+			}
 
 			// TODO(roasbeef): send completion signal?
 
@@ -3074,6 +3165,10 @@ func (c *ChainPlanter) gardener() {
 
 				batchKey := c.pendingBatch.BatchKey.PubKey
 				batchKeySerial := asset.ToSerialized(batchKey)
+				if _, ok := c.caretakers[batchKeySerial]; ok {
+					req.Error(fmt.Errorf("batch recovery is in progress"))
+					break
+				}
 				log.Infof("Finalizing batch %x", batchKeySerial)
 
 				finalizeReqParams, err :=
@@ -3136,6 +3231,16 @@ func (c *ChainPlanter) gardener() {
 				}
 
 			case reqTypeCancelBatch:
+				if c.pendingBatch != nil {
+					batchKey := asset.ToSerialized(
+						c.pendingBatch.BatchKey.PubKey,
+					)
+					if _, ok := c.caretakers[batchKey]; ok {
+						req.Error(fmt.Errorf("batch recovery is in progress"))
+						break
+					}
+				}
+
 				batchKey, err := c.canCancelBatch()
 				if err != nil {
 					req.Error(err)
