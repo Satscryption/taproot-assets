@@ -319,10 +319,10 @@ type BatchStore interface {
 	// left/right sibling for the Taproot Asset tapscript commitment in the
 	// transaction.
 	//
-	// NOTE: On success the batch transitions to BatchStateBroadcast on
-	// disk and the in-memory state of the supplied batch is advanced to
-	// match. On failure neither moves.
-	CommitSignedGenesisTx(ctx context.Context, batch *MintingBatch,
+	// NOTE: The BatchState should transition to the BatchStateBroadcast
+	// state upon a successful call.
+	CommitSignedGenesisTx(ctx context.Context, batchKey *btcec.PublicKey,
+		mintingInternalKey keychain.KeyDescriptor,
 		genesisTx *tapsend.FundedPsbt, anchorOutputIndex uint32,
 		merkleRoot, tapTreeRoot, tapSibling []byte) error
 

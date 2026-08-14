@@ -19,7 +19,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapnode"
-	"github.com/lightninglabs/taproot-assets/tapreorg"
+	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -279,8 +279,17 @@ func (b *Cultivator) Cancel(respCh chan<- CancelResp) error {
 		cancelResp = CancelResp{true, err}
 
 	case BatchStateCommitted:
-		err := b.cfg.BatchStore.UpdateBatchState(
-			ctx, b.cfg.Batch,
+		if customAnchorPublicationPending(b.cfg.Batch) {
+
+			err := fmt.Errorf("BatchCaretaker(%x), custom anchor "+
+				"publication status is ambiguous and is not cancellable",
+				batchKey)
+			cancelResp = CancelResp{false, err}
+			break
+		}
+
+		err := b.cfg.Log.UpdateBatchState(
+			ctx, b.cfg.Batch.BatchKey.PubKey,
 			BatchStateSproutCancelled,
 		)
 		if err != nil {
@@ -839,9 +848,18 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 				"script: %w", err)
 		}
 
-		anchorOut := genesisTxPkt.UnsignedTx.
-			TxOut[genesisPkt.AssetAnchorOutIdx]
-		anchorOut.PkScript = genesisScript
+		genesisTxPkt.UnsignedTx.
+			TxOut[b.anchorOutputIndex].PkScript = genesisScript
+		if isCustomAnchorPsbt(genesisTxPkt) {
+			// Once the asset root changes the output script, an internal
+			// key without a matching PSBT_OUT_TAP_TREE would describe a
+			// contradictory BIP-86 output. Keep the independently validated
+			// BIP32 locator for wallet bookkeeping, but remove the stale
+			// BIP-371 output declarations before external signing.
+			pOut := &genesisTxPkt.Outputs[b.anchorOutputIndex]
+			pOut.TaprootInternalKey = nil
+			pOut.TaprootBip32Derivation = nil
+		}
 
 		log.Infof("Cultivator(%x): committing sprouts to disk",
 			b.batchKey[:])
@@ -960,7 +978,13 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 
 		log.Infof("Cultivator(%x): GenesisPacket finalized "+
 			"(absolute_fee_sats: %d)", b.batchKey[:], chainFees)
-		log.Tracef("GenesisPacket: %v", spew.Sdump(signedPkt))
+		if isCustomAnchorPsbt(signedPkt) {
+			log.Tracef("Custom GenesisPacket finalized: txid=%v, "+
+				"inputs=%d, outputs=%d", signedTx.TxHash(),
+				len(signedTx.TxIn), len(signedTx.TxOut))
+		} else {
+			log.Tracef("GenesisPacket: %v", spew.Sdump(signedPkt))
+		}
 
 		// At this point we have a fully signed PSBT packet which'll
 		// create our set of assets once mined. We import the public
@@ -1039,15 +1063,40 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		// Taproot Asset commitment root and batch tapscript sibling.
 		tapCommitmentRoot := b.cfg.Batch.RootAssetCommitment.
 			TapscriptRoot(nil)
+		mintingInternalKey := b.cfg.Batch.BatchKey
+		if isCustomAnchorPsbt(signedPkt) {
+			pOut := signedPkt.Outputs[b.anchorOutputIndex]
+			if len(pOut.Bip32Derivation) != 1 {
+				return 0, fmt.Errorf("custom anchor output must have " +
+					"exactly one BIP32 derivation")
+			}
+			mintingInternalKey, err = tappsbt.KeyDescFromBip32Derivation(
+				pOut.Bip32Derivation[0],
+			)
+			if err != nil {
+				return 0, fmt.Errorf("unable to derive custom anchor "+
+					"internal key: %w", err)
+			}
+		}
 
-		// Import the minting output key into the backing wallet so it
-		// recognizes the de minimis amt of sats under our control.
-		// This MUST happen before the state-transition write below: a
-		// crash between writing Broadcast and importing the key would
-		// leave lnd unaware of the output forever, since the Broadcast
-		// branch on restart never re-runs this step. With the import
-		// first, a crash anywhere in this branch resumes from Committed
-		// and the (idempotent) import retries cleanly.
+		err = b.cfg.Log.CommitSignedGenesisTx(
+			ctx, b.cfg.Batch.BatchKey.PubKey,
+			mintingInternalKey,
+			&b.cfg.Batch.GenesisPacket.FundedPsbt,
+			b.anchorOutputIndex, merkleRoot, tapCommitmentRoot[:],
+			siblingBytes,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("unable to commit genesis "+
+				"tx: %w", err)
+		}
+
+		// With the genesis transaction committed to disk, we'll also
+		// import this public key into the backing wallet, so it
+		// recognizes the de minimis amt sats under out control.
+		//
+		// TODO(roasbeef): should be idempotent along w/ all other
+		// operations above
 		ctx, cancel = b.WithCtxQuit()
 		defer cancel()
 		_, err = b.cfg.Wallet.ImportTaprootOutput(ctx, mintingOutputKey)
@@ -1065,15 +1114,13 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			return 0, fmt.Errorf("unable to import key: %w", err)
 		}
 
-		// If validation failed ambiguously, the transaction might still
-		// have reached the backend. The durable signed transaction and
-		// Broadcast state make an exact retry safe after this caretaker
-		// exits.
+		// If the initial submission failed ambiguously, the transaction
+		// might still have reached the backend. Continue into Broadcast so
+		// the normal retry policy runs and a confirmation watcher is
+		// installed instead of silently leaving the batch unattended.
 		if publishErr != nil {
-			b.cfg.Batch.UpdateState(BatchStateBroadcast)
-
-			return 0, fmt.Errorf("unable to publish transaction: %w",
-				publishErr)
+			log.Warnf("Initial custom anchor publication was ambiguous, "+
+				"retrying from Broadcast: %v", publishErr)
 		}
 
 		log.Infof("BatchCaretaker(%x): transition states: %v -> %v",
@@ -1096,7 +1143,13 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 
 		log.Infof("Cultivator(%x): extracted finalized GenesisTx",
 			b.batchKey[:])
-		log.Tracef("GenesisTx: %v", spew.Sdump(signedTx))
+		if isCustomAnchorPsbt(b.cfg.Batch.GenesisPacket.Pkt) {
+			log.Tracef("Custom GenesisTx: txid=%v, inputs=%d, "+
+				"outputs=%d", signedTx.TxHash(), len(signedTx.TxIn),
+				len(signedTx.TxOut))
+		} else {
+			log.Tracef("GenesisTx: %v", spew.Sdump(signedTx))
+		}
 
 		// The re-org watcher is the sole sensor: the batch registers
 		// its genesis transaction as a speculative anchoring
