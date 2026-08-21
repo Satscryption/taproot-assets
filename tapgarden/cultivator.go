@@ -1263,6 +1263,8 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		var (
 			publishErr       error
 			publishAttempted bool
+			commitPacket     = &b.cfg.Batch.GenesisPacket.FundedPsbt
+			acceptedPacket   *FundedMintAnchorPsbt
 		)
 		if isCustomAnchorPsbt(signedPkt) {
 			renewCtx, renewCancel := b.WithCtxQuit()
@@ -1319,12 +1321,16 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 
 				// A clean WalletKit acceptance distinguishes this batch
 				// from one whose signed bytes might only have been relayed
-				// externally. Clear the durable admission marker before
-				// CommitSignedGenesisTx stores the Broadcast packet.
+				// externally. Clear the marker only on the copy passed to
+				// the atomic Broadcast commit. The live Committed packet
+				// must retain publish-pending until that commit succeeds.
 				if publishStateAtEntry != customAnchorPublishPending {
+					acceptedPacket = b.cfg.Batch.GenesisPacket.Copy()
 					setCustomAnchorPublishState(
-						signedPkt, customAnchorPublishNone,
+						acceptedPacket.Pkt,
+						customAnchorPublishNone,
 					)
+					commitPacket = &acceptedPacket.FundedPsbt
 				}
 			}
 		}
@@ -1335,13 +1341,16 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			TapscriptRoot(nil)
 		err = commitSignedGenesisTx(
 			ctx, b.cfg.Log, b.cfg.Batch, mintingInternalKey,
-			&b.cfg.Batch.GenesisPacket.FundedPsbt,
+			commitPacket,
 			b.anchorOutputIndex, merkleRoot, tapCommitmentRoot[:],
 			siblingBytes,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to commit genesis "+
 				"tx: %w", err)
+		}
+		if acceptedPacket != nil {
+			b.cfg.Batch.GenesisPacket.Pkt = acceptedPacket.Pkt
 		}
 
 		// If the initial submission failed ambiguously, the transaction
