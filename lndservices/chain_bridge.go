@@ -621,6 +621,7 @@ func (l *LndRpcChainBridge) GenProofChainLookup(
 // A compile time assertion to ensure LndRpcChainBridge meets the
 // tapnode.ChainBridge interface.
 var _ tapnode.ChainBridge = (*LndRpcChainBridge)(nil)
+var _ tapnode.DefinitivePublisher = (*LndRpcChainBridge)(nil)
 
 // A compile-time assertion that the chain bridge satisfies the chain
 // sensing contract the re-org watcher pins in its own package.
