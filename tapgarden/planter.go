@@ -628,13 +628,31 @@ func rollbackCustomAnchorOutpoints(ctx context.Context,
 	wallet tapnode.WalletAnchor, leaseID tapnode.CustomAnchorLeaseID,
 	ops []wire.OutPoint) error {
 
-	cleanupCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), DefaultTimeout,
-	)
+	cleanupCtx, cancel := customAnchorCleanupContext(ctx)
 	defer cancel()
 
 	return releaseCustomAnchorOutpoints(
 		cleanupCtx, wallet, leaseID, ops,
+	)
+}
+
+func rollbackCustomAnchorLeases(ctx context.Context,
+	wallet tapnode.WalletAnchor, leaseID tapnode.CustomAnchorLeaseID,
+	funded *FundedMintAnchorPsbt) error {
+
+	cleanupCtx, cancel := customAnchorCleanupContext(ctx)
+	defer cancel()
+
+	return releaseCustomAnchorLeases(
+		cleanupCtx, wallet, leaseID, funded,
+	)
+}
+
+func customAnchorCleanupContext(
+	ctx context.Context) (context.Context, context.CancelFunc) {
+
+	return context.WithTimeout(
+		context.WithoutCancel(ctx), DefaultTimeout,
 	)
 }
 
@@ -3787,7 +3805,7 @@ func (c *ChainPlanter) createFundedBatch(ctx context.Context,
 	}
 
 	if err := c.cfg.Log.CommitMintingBatch(ctx, newBatch); err != nil {
-		releaseErr := releaseCustomAnchorLeases(
+		releaseErr := rollbackCustomAnchorLeases(
 			ctx, c.cfg.Wallet,
 			customAnchorLeaseID(newBatch.BatchKey.PubKey), mintAnchorTx,
 		)
@@ -3851,7 +3869,7 @@ func (c *ChainPlanter) applyFundingToBatch(ctx context.Context,
 		preCommit,
 	)
 	if err != nil {
-		releaseErr := releaseCustomAnchorLeases(
+		releaseErr := rollbackCustomAnchorLeases(
 			ctx, c.cfg.Wallet,
 			customAnchorLeaseID(batch.BatchKey.PubKey), mintAnchorTx,
 		)
@@ -4713,14 +4731,12 @@ func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 			)
 			cancel()
 			if err != nil {
-				ctx, cancel = c.WithCtxQuit()
-				releaseErr := releaseCustomAnchorOutpoints(
+				releaseErr := rollbackCustomAnchorOutpoints(
 					ctx, c.cfg.Wallet,
 					customAnchorLeaseID(
 						c.pendingBatch.BatchKey.PubKey,
 					), newLocks,
 				)
-				cancel()
 				return nil, fmt.Errorf("unable to store externally signed "+
 					"PSBT: %w", errors.Join(err, releaseErr))
 			}
