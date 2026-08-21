@@ -3464,7 +3464,6 @@ func (c *ChainPlanter) gardener() {
 					req.Resolve(caretaker.cfg.Batch)
 
 				case err := <-caretaker.cfg.BroadcastErrChan:
-					req.Error(err)
 					// Stop the failed caretaker directly. Custom
 					// batches remain pending so the same signed
 					// transaction can be retried; legacy batches
@@ -3477,6 +3476,38 @@ func (c *ChainPlanter) gardener() {
 					}
 
 					delete(c.caretakers, batchKeySerial)
+
+					// Cancel the failed batch on disk if
+					// it is still pre-broadcast, so it
+					// isn't left wedged in a state the
+					// migration 000061 singleton index
+					// forbids. Only drop the in-memory
+					// reference if the batch no longer
+					// occupies the singleton slot;
+					// otherwise keep it so a retried
+					// cancel request can still find and
+					// cancel the batch.
+					cancelErr := c.cancelFailedBatch(
+						caretaker.cfg.Batch,
+					)
+					if cancelErr != nil {
+						log.Errorf("%v; retry "+
+							"cancelling the "+
+							"batch, or restart "+
+							"tapd", cancelErr)
+						break
+					}
+
+					if !customBatch {
+						c.pendingBatch = nil
+					}
+
+					// Only release the synchronous caller after the
+					// failed caretaker is stopped and removed. Callers
+					// may immediately retry or cancel after an error,
+					// so returning earlier exposes a dead caretaker in
+					// the exclusive slot.
+					req.Error(err)
 
 				case <-c.Quit:
 					return
