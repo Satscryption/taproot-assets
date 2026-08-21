@@ -145,7 +145,9 @@ type Cultivator struct {
 
 	// statusMu protects the transient custom anchor health fields that are
 	// written by the caretaker and queried by the planter.
-	statusMu sync.RWMutex
+	statusMu                 sync.RWMutex
+	customAnchorLeaseError   string
+	customAnchorPublishError string
 
 	batchKey BatchKey
 
@@ -187,22 +189,35 @@ func (b *BatchCaretaker) setCustomAnchorLeaseError(status string) {
 	b.statusMu.Lock()
 	defer b.statusMu.Unlock()
 
-	b.cfg.Batch.CustomAnchorLeaseError = status
+	b.customAnchorLeaseError = status
 }
 
 func (b *BatchCaretaker) setCustomAnchorPublishError(status string) {
 	b.statusMu.Lock()
 	defer b.statusMu.Unlock()
 
-	b.cfg.Batch.CustomAnchorPublishError = status
+	b.customAnchorPublishError = status
 }
 
 func (b *BatchCaretaker) customAnchorStatus() (string, string) {
 	b.statusMu.RLock()
 	defer b.statusMu.RUnlock()
 
-	return b.cfg.Batch.CustomAnchorLeaseError,
-		b.cfg.Batch.CustomAnchorPublishError
+	return b.customAnchorLeaseError, b.customAnchorPublishError
+}
+
+// batchCopy returns a consistent planter-owned snapshot of the batch and its
+// transient custom-anchor health. The caretaker is the sole writer of the
+// health fields while it is active.
+func (b *BatchCaretaker) batchCopy() *MintingBatch {
+	b.statusMu.RLock()
+	defer b.statusMu.RUnlock()
+
+	batchCopy := b.cfg.Batch.Copy()
+	batchCopy.CustomAnchorLeaseError = b.customAnchorLeaseError
+	batchCopy.CustomAnchorPublishError = b.customAnchorPublishError
+
+	return batchCopy
 }
 
 // NewBatchCaretaker creates a new Taproot Asset caretaker based on the passed
@@ -211,9 +226,11 @@ func (b *BatchCaretaker) customAnchorStatus() (string, string) {
 // TODO(roasbeef): rename to Cultivator?
 func NewBatchCaretaker(cfg *BatchCaretakerConfig) *BatchCaretaker {
 	caretaker := &BatchCaretaker{
-		batchKey:  asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
-		cfg:       cfg,
-		confEvent: make(chan *chainntnfs.TxConfirmation, 1),
+		batchKey:                 asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
+		cfg:                      cfg,
+		customAnchorLeaseError:   cfg.Batch.CustomAnchorLeaseError,
+		customAnchorPublishError: cfg.Batch.CustomAnchorPublishError,
+		confEvent:                make(chan *chainntnfs.TxConfirmation, 1),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),
@@ -649,7 +666,7 @@ func (b *Cultivator) assetCultivator() {
 			// Wallet acceptance remains ambiguous. Protect every recorded
 			// local input before retrying the exact persisted transaction.
 			ctx, cancel := b.WithCtxQuit()
-			err := renewCustomAnchorLeases(
+			err := renewCustomAnchorLeasesReadOnly(
 				ctx, b.cfg.Wallet,
 				customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
 				b.cfg.Batch.GenesisPacket,
@@ -1268,7 +1285,7 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		)
 		if isCustomAnchorPsbt(signedPkt) {
 			renewCtx, renewCancel := b.WithCtxQuit()
-			renewErr := renewCustomAnchorLeases(
+			renewErr := renewCustomAnchorLeasesReadOnly(
 				renewCtx, b.cfg.Wallet,
 				customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
 				b.cfg.Batch.GenesisPacket,
@@ -1420,7 +1437,7 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		if !customAnchor || !b.customAnchorWalletAccepted {
 			if customAnchor {
 				renewCtx, renewCancel := b.WithCtxQuit()
-				renewErr := renewCustomAnchorLeases(
+				renewErr := renewCustomAnchorLeasesReadOnly(
 					renewCtx, b.cfg.Wallet,
 					customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
 					b.cfg.Batch.GenesisPacket,

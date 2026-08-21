@@ -714,6 +714,27 @@ func releaseCustomAnchorLeases(ctx context.Context,
 func renewCustomAnchorLeases(ctx context.Context, wallet tapnode.WalletAnchor,
 	leaseID tapnode.CustomAnchorLeaseID, funded *FundedMintAnchorPsbt) error {
 
+	return renewCustomAnchorLeasesWithMarkerUpdate(
+		ctx, wallet, leaseID, funded, true,
+	)
+}
+
+// renewCustomAnchorLeasesReadOnly renews leases without changing the shared
+// funded packet. Active caretakers use this form because the planter may copy
+// the packet concurrently after a publication result.
+func renewCustomAnchorLeasesReadOnly(ctx context.Context,
+	wallet tapnode.WalletAnchor, leaseID tapnode.CustomAnchorLeaseID,
+	funded *FundedMintAnchorPsbt) error {
+
+	return renewCustomAnchorLeasesWithMarkerUpdate(
+		ctx, wallet, leaseID, funded, false,
+	)
+}
+
+func renewCustomAnchorLeasesWithMarkerUpdate(ctx context.Context,
+	wallet tapnode.WalletAnchor, leaseID tapnode.CustomAnchorLeaseID,
+	funded *FundedMintAnchorPsbt, updateLegacyMarker bool) error {
+
 	if funded == nil {
 		return nil
 	}
@@ -726,6 +747,7 @@ func renewCustomAnchorLeases(ctx context.Context, wallet tapnode.WalletAnchor,
 	if err != nil {
 		return fmt.Errorf("invalid custom anchor lease marker: %w", err)
 	}
+	lockedUTXOs := funded.LockedUTXOs
 	if markerState == customAnchorLeaseMarkerLegacy {
 		locked, err := acquireCustomAnchorLeases(
 			ctx, wallet, leaseID, funded.Pkt, nil,
@@ -735,13 +757,16 @@ func renewCustomAnchorLeases(ctx context.Context, wallet tapnode.WalletAnchor,
 				"leases: %w", err)
 		}
 
-		funded.LockedUTXOs = locked
-		SetCustomAnchorLockedUTXOs(funded.Pkt, locked)
+		if updateLegacyMarker {
+			funded.LockedUTXOs = locked
+			SetCustomAnchorLockedUTXOs(funded.Pkt, locked)
+		}
+
 		return nil
 	} else if markerState == customAnchorLeaseMarkerCurrent {
-		funded.LockedUTXOs = markerOps
+		lockedUTXOs = markerOps
 	}
-	for _, op := range funded.LockedUTXOs {
+	for _, op := range lockedUTXOs {
 		owned, err := leaser.LeaseInput(ctx, leaseID, op)
 		if err != nil {
 			return fmt.Errorf("unable to renew custom anchor input %v: %w",
@@ -3156,11 +3181,10 @@ func (c *ChainPlanter) gardener() {
 						c.pendingBatch.BatchKey.PubKey,
 					) == result.batchKey {
 
-					if customAnchorPublicationPending(
-						caretaker.cfg.Batch,
-					) {
+					batchSnapshot := caretaker.batchCopy()
+					if customAnchorPublicationPending(batchSnapshot) {
 
-						c.pendingBatch = caretaker.cfg.Batch.Copy()
+						c.pendingBatch = batchSnapshot
 					} else {
 						c.pendingBatch = nil
 					}
@@ -3540,16 +3564,15 @@ func (c *ChainPlanter) gardener() {
 					// admission slot until confirmation. A successful
 					// WalletKit acceptance cleared the marker before the
 					// durable Broadcast transition and remains nonblocking.
-					if customAnchorPublicationPending(
-						caretaker.cfg.Batch,
-					) {
+					batchSnapshot := caretaker.batchCopy()
+					if customAnchorPublicationPending(batchSnapshot) {
 
-						c.pendingBatch = caretaker.cfg.Batch.Copy()
+						c.pendingBatch = batchSnapshot
 					} else {
 						c.pendingBatch = nil
 					}
 
-					req.Resolve(caretaker.cfg.Batch)
+					req.Resolve(batchSnapshot)
 
 				case err := <-caretaker.cfg.BroadcastErrChan:
 					// Stop the failed caretaker directly. Custom
