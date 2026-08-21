@@ -196,6 +196,11 @@ type Querier interface {
 	// independent of the size of the subtree beneath the node.
 	FetchChildren(ctx context.Context, arg FetchChildrenParams) ([]MssmtNode, error)
 	FetchChildrenSelfJoin(ctx context.Context, arg FetchChildrenSelfJoinParams) ([]FetchChildrenSelfJoinRow, error)
+	// Return historical mint rows with enough retained information for the
+	// wallet-aware startup audit. The caller must still prove that the packet is a
+	// tapd custom anchor, that the locator derives the committed internal key and
+	// that the backing wallet controls it before attempting a repair.
+	FetchCustomAnchorKeyRepairCandidates(ctx context.Context) ([]FetchCustomAnchorKeyRepairCandidatesRow, error)
 	FetchGenesisByAssetID(ctx context.Context, assetID []byte) (GenesisInfoView, error)
 	FetchGenesisByGroupKey(ctx context.Context, tweakedGroupKey []byte) (GenesisInfoView, error)
 	FetchGenesisByID(ctx context.Context, genAssetID int64) (FetchGenesisByIDRow, error)
@@ -223,7 +228,6 @@ type Querier interface {
 	FetchLiveReorgParentsByCandidate(ctx context.Context, spenderTxid []byte) ([]int64, error)
 	FetchManagedUTXO(ctx context.Context, arg FetchManagedUTXOParams) (FetchManagedUTXORow, error)
 	FetchManagedUTXOs(ctx context.Context) ([]FetchManagedUTXOsRow, error)
-	FetchCustomAnchorKeyRepairCandidates(ctx context.Context) ([]FetchCustomAnchorKeyRepairCandidatesRow, error)
 	// Fetch records from the supply_pre_commits table with optional
 	// filtering.
 	FetchMintSupplyPreCommits(ctx context.Context, arg FetchMintSupplyPreCommitsParams) ([]FetchMintSupplyPreCommitsRow, error)
@@ -482,17 +486,7 @@ type Querier interface {
 	QueryUniverseStats(ctx context.Context) (QueryUniverseStatsRow, error)
 	QueryUniverseSupplyLeaves(ctx context.Context, arg QueryUniverseSupplyLeavesParams) ([]QueryUniverseSupplyLeavesRow, error)
 	ReAnchorPassiveAssets(ctx context.Context, arg ReAnchorPassiveAssetsParams) error
-	RecordReorgDeliveryFailure(ctx context.Context, arg RecordReorgDeliveryFailureParams) error
-	RecordReorgEffectFailure(ctx context.Context, arg RecordReorgEffectFailureParams) error
-	// The receive-side inverse of event completion: the anchor
-	// transaction the events were keyed to was decided against by the
-	// chain, so the events return to the given (pre-completion) status.
-	// Their expected-output rows (addr_event_outputs) stand: they
-	// describe the address's expectation, not materialized state.
-	ResetAddrEventsByAnchorTx(ctx context.Context, arg ResetAddrEventsByAnchorTxParams) (int64, error)
-	// The inverse of ReAnchorPassiveAssets: restore the anchor UTXO and
-	// the spend-template fields that the re-anchor reset.
-	RestoreAssetSpendTemplate(ctx context.Context, arg RestoreAssetSpendTemplateParams) error
+	RepairCustomAnchorInternalKey(ctx context.Context, arg RepairCustomAnchorInternalKeyParams) (int64, error)
 	SetAddrManaged(ctx context.Context, arg SetAddrManagedParams) error
 	SetAssetSpent(ctx context.Context, arg SetAssetSpentParams) (int64, error)
 	// Marks one asset row spent by its primary key. Used by abandonment
@@ -619,8 +613,6 @@ type Querier interface {
 	UpsertGenesisAsset(ctx context.Context, arg UpsertGenesisAssetParams) (int64, error)
 	UpsertGenesisPoint(ctx context.Context, prevOut []byte) (int64, error)
 	UpsertInternalKey(ctx context.Context, arg UpsertInternalKeyParams) (int64, error)
-	UpsertWalletVerifiedInternalKey(ctx context.Context, arg UpsertWalletVerifiedInternalKeyParams) (int64, error)
-	RepairCustomAnchorInternalKey(ctx context.Context, arg RepairCustomAnchorInternalKeyParams) (int64, error)
 	UpsertManagedUTXO(ctx context.Context, arg UpsertManagedUTXOParams) (int64, error)
 	// Upsert a supply pre-commit that is tied to a minting batch.
 	// The batch is resolved from @batch_key
@@ -660,6 +652,7 @@ type Querier interface {
 	UpsertUniverseRoot(ctx context.Context, arg UpsertUniverseRootParams) (int64, error)
 	UpsertUniverseSupplyLeaf(ctx context.Context, arg UpsertUniverseSupplyLeafParams) (int64, error)
 	UpsertUniverseSupplyRoot(ctx context.Context, arg UpsertUniverseSupplyRootParams) (int64, error)
+	UpsertWalletVerifiedInternalKey(ctx context.Context, arg UpsertWalletVerifiedInternalKeyParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)
