@@ -389,8 +389,9 @@ func (l *LndRpcChainBridge) ValidateAndPublishTransaction(ctx context.Context,
 // wrapValidateAndPublishError adds operation context while retaining the
 // definitive marker, gRPC status and original error in the unwrap chain.
 func wrapValidateAndPublishError(err error) error {
-	publishErr := fmt.Errorf("unable to validate and publish transaction: %w",
-		err)
+	publishErr := fmt.Errorf(
+		"unable to validate and publish transaction: %w", err,
+	)
 	if isDefinitivePublishError(err) {
 		return tapnode.NewDefinitivePublishError(publishErr)
 	}
@@ -409,9 +410,9 @@ func isDefinitivePublishError(err error) bool {
 		return false
 	}
 
-	// The pinned WalletKit implementation returns mapped backend publication
-	// errors as Unknown. Do not infer equivalent semantics for any other gRPC
-	// code: even policy-looking text is ambiguous there.
+	// The pinned WalletKit implementation returns mapped backend
+	// publication errors as Unknown. Do not infer equivalent semantics for
+	// any other gRPC code: even policy-looking text is ambiguous there.
 	if rpcStatus.Code() != codes.Unknown {
 		return false
 	}
@@ -469,8 +470,8 @@ func isDefinitiveRejectReason(tokens []string) bool {
 	}
 
 	// Some backends add a small amount of explicit framing around the raw
-	// reject reason. Strip only known frames; arbitrary leading text must not
-	// turn a policy word into a definitive result.
+	// reject reason. Strip only known frames; arbitrary leading text must
+	// not turn a policy word into a definitive result.
 	rejectFrames := [][]string{
 		{"transaction", "rejected", "by", "the", "mempool"},
 		{"transaction", "rejected", "by", "mempool"},
