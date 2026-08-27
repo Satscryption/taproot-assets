@@ -3183,7 +3183,6 @@ func (c *ChainPlanter) gardener() {
 
 					batchSnapshot := caretaker.batchCopy()
 					if customAnchorPublicationPending(batchSnapshot) {
-
 						c.pendingBatch = batchSnapshot
 					} else {
 						c.pendingBatch = nil
@@ -5600,33 +5599,14 @@ func (f *FundedMintAnchorPsbt) Copy() (*FundedMintAnchorPsbt, error) {
 	return newMintAnchorPsbt, nil
 }
 
-func copyMalformedPsbt(pkt *psbt.Packet) *psbt.Packet {
-	copyUnknowns := func(src []*psbt.Unknown) []*psbt.Unknown {
-		if src == nil {
-			return nil
-		}
-		dst := make([]*psbt.Unknown, len(src))
-		for idx, unknown := range src {
-			if unknown == nil {
-				continue
-			}
-			dst[idx] = &psbt.Unknown{
-				Key:   fn.CopySlice(unknown.Key),
-				Value: fn.CopySlice(unknown.Value),
-			}
-		}
-		return dst
-	}
-
-	var txCopy *wire.MsgTx
-	if pkt.UnsignedTx != nil {
-		txCopy = pkt.UnsignedTx.Copy()
-	}
-	return &psbt.Packet{
-		UnsignedTx: txCopy,
-		Inputs:     fn.CopySlice(pkt.Inputs),
-		Outputs:    fn.CopySlice(pkt.Outputs),
-		XPubs:      fn.CopySlice(pkt.XPubs),
-		Unknowns:   copyUnknowns(pkt.Unknowns),
+// Copy returns a deep copy of PreCommitmentOutput. InternalKey (a
+// keychain.KeyDescriptor alias) is rebuilt with a fresh PubKey
+// pointer; GroupPubKey is a value-typed PublicKey wrapped in an
+// Option, so an assignment copies it whole.
+func (p PreCommitmentOutput) Copy() PreCommitmentOutput {
+	return PreCommitmentOutput{
+		OutIdx:      p.OutIdx,
+		InternalKey: asset.CopyKeyDescriptor(p.InternalKey),
+		GroupPubKey: p.GroupPubKey,
 	}
 }

@@ -1392,10 +1392,20 @@ func TestIssue721ImportRestartLeaseFailurePauses(t *testing.T) {
 	h.wallet.SetImportError(nil)
 	h.wallet.SetLeaseError(op, fmt.Errorf("lease no longer available"))
 	h.refreshChainPlanter()
-	pending, err := h.planter.PendingBatch()
+	_, err = fn.RecvOrTimeout(h.wallet.ImportPubKeySignal, defaultTimeout)
 	require.NoError(t, err)
-	require.Equal(t, tapgarden.BatchStateCommitted, pending.State())
-	h.assertNumCaretakersActive(0)
+	_, err = fn.RecvOrTimeout(h.chain.ConfReqSignal, defaultTimeout)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return h.fetchSingleBatch(prepared.BatchKey.PubKey).State() ==
+			tapgarden.BatchStateBroadcast
+	}, defaultTimeout, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		pending, err := h.planter.PendingBatch()
+		return err == nil &&
+			pending.State() == tapgarden.BatchStateBroadcast
+	}, defaultTimeout, 10*time.Millisecond)
+	h.assertNumCultivatorsActive(1)
 	batches, err := h.planter.ListBatches(tapgarden.ListBatchesParams{
 		BatchKey: prepared.BatchKey.PubKey,
 	})
