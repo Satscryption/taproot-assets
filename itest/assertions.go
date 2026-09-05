@@ -2220,7 +2220,7 @@ func AssertAssetsMintedAtOutpoint(t *testing.T,
 			t, confirmedAssets, assetRequest.Asset.Name,
 			metaHash[:],
 			AssetAnchorOutpointCheck(mintOutpoint, blockHash),
-			AssetScriptKeyIsLocalCheck(true),
+			scriptKeyLocalCheck,
 			AssetVersionCheck(assetRequest.Asset.AssetVersion),
 			func(a *taprpc.Asset) error {
 				anchor := a.ChainAnchor

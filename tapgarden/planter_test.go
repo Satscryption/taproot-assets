@@ -97,7 +97,7 @@ type mintingTestHarness struct {
 
 	chain *tapnodemock.ChainBridge
 
-	store *tapdb.AssetMintingStore
+	store testMintingStore
 
 	treeStore *tapgarden.FallibleTapscriptTreeMgr
 
@@ -136,18 +136,18 @@ type mintingTestHarness struct {
 	errChan chan error
 
 	leaseRenewalInterval time.Duration
+}
 
-	// pendingConfReq records the watcher that is installed before the
-	// transaction is published. The production caretaker deliberately uses
-	// watcher-first ordering so an ambiguous earlier publication cannot race
-	// confirmation tracking.
-	pendingConfReq *int
+type testMintingStore interface {
+	tapgarden.BatchStore
+	tapgarden.MintingRefReader
+	asset.TapscriptTreeManager
 }
 
 // newMintingTestHarness creates a new test harness from an active minting
 // store and an existing testing context.
 func newMintingTestHarness(t testing.TB,
-	store *tapdb.AssetMintingStore) *mintingTestHarness {
+	store testMintingStore) *mintingTestHarness {
 
 	keyRing := tapnodemock.NewKeyRing()
 	genSigner := tapgarden.NewMockGenSigner(keyRing)
@@ -527,14 +527,12 @@ func (t *mintingTestHarness) progressCaretaker(isFunded bool,
 	// sign this PSBT packet generated above.
 	t.assertGenesisPsbtFinalized(batchSibling)
 
-	// With the PSBT packet finalized for the caretaker, we should now
-	// receive a request to publish a transaction followed by a
-	// confirmation request.
+	// Registration completes before the unbuffered publish, so accepting
+	// the publish proves the anchoring was staked first.
 	tx := t.assertTxPublished()
 
-	// With the transaction published, we should now receive a confirmation
-	// request. To ensure the file proof is constructed properly, we'll
-	// also make a "fake" block that includes our transaction.
+	// Build a block that includes the genesis transaction so the
+	// confirmation closure can witness the anchoring.
 	merkleTree := blockchain.BuildMerkleTreeStore(
 		[]*btcutil.Tx{btcutil.NewTx(tx)}, false,
 	)
@@ -1163,21 +1161,6 @@ func (t *mintingTestHarness) assertGenesisPsbtFinalized(
 func (t *mintingTestHarness) assertTxPublished() *wire.MsgTx {
 	t.Helper()
 
-	// Most callers haven't consumed the watcher request yet, so accepting it
-	// here unblocks the production watcher-first ordering. A few security tests
-	// intentionally consume the watcher themselves before allowing a later
-	// retry; in that case the publication can arrive directly.
-	select {
-	case tx := <-t.chain.PublishReq:
-		return tx
-
-	case reqNo := <-t.chain.ConfReqSignal:
-		t.pendingConfReq = &reqNo
-
-	case <-time.After(defaultTimeout):
-		t.Fatal("transaction publication request not sent")
-	}
-
 	tx, err := fn.RecvOrTimeout(t.chain.PublishReq, defaultTimeout)
 	require.NoError(t, err)
 
@@ -1190,15 +1173,17 @@ func (t *mintingTestHarness) assertTxPublished() *wire.MsgTx {
 func (t *mintingTestHarness) mintAnchorings(
 	tx *wire.MsgTx) []tapreorg.AnchoringID {
 
-	reqNo := t.pendingConfReq
-	if reqNo == nil {
-		var err error
-		reqNo, err = fn.RecvOrTimeout(
-			t.chain.ConfReqSignal, defaultTimeout,
-		)
-		require.NoError(t, err)
+	t.Helper()
+
+	spent := make(map[wire.OutPoint]struct{}, len(tx.TxIn))
+	for _, txIn := range tx.TxIn {
+		spent[txIn.PreviousOutPoint] = struct{}{}
 	}
-	t.pendingConfReq = nil
+
+	anchorings, err := t.registrar.AllAnchorings(
+		context.Background(), tapgarden.MintSiteID,
+	)
+	require.NoError(t, err)
 
 	var ids []tapreorg.AnchoringID
 	for _, anchoring := range anchorings {
@@ -1221,6 +1206,11 @@ func (t *mintingTestHarness) assertAnchoringRegistered(tx *wire.MsgTx) {
 	require.Eventually(t, func() bool {
 		return len(t.mintAnchorings(tx)) > 0
 	}, defaultTimeout, 10*time.Millisecond)
+
+	// The re-org watcher replaced the cultivator's confirmation
+	// subscription. A non-zero request count means the legacy
+	// RegisterConfirmationsNtfn path ran.
+	require.Zero(t, t.chain.ReqCount.Load())
 }
 
 // confirmAnchoring flips the anchoring's delivered phase to witnessed
@@ -2063,6 +2053,12 @@ func testFundFailureReleasesWalletLeases(t *mintingTestHarness) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, funded.LockedUTXOs[0], *unlocked)
+	select {
+	case released := <-t.wallet.ReleaseInputSignal:
+		t.Fatalf("wallet-funded input used custom release path: %v",
+			released)
+	default:
+	}
 }
 
 // testCancelFundedBatchReleasesLeases verifies that cancelling a funded

@@ -113,20 +113,11 @@ func (m *MintingBatch) BatchKeyBytes() []byte {
 	return m.BatchKey.PubKey.SerializeCompressed()
 }
 
-// Copy creates a deep copy of the batch.
-func (m *MintingBatch) Copy() *MintingBatch {
-	batchCopy := &MintingBatch{
-		CreationTime: m.CreationTime,
-		HeightHint:   m.HeightHint,
-		// The following values are expected to not change once they are
-		// set, so a shallow copy is sufficient.
-		BatchKey:                 m.BatchKey,
-		RootAssetCommitment:      m.RootAssetCommitment,
-		SupplyCommitments:        m.SupplyCommitments,
-		tapSibling:               m.tapSibling,
-		CustomAnchorLeaseError:   m.CustomAnchorLeaseError,
-		CustomAnchorPublishError: m.CustomAnchorPublishError,
-		CustomAnchorKeyError:     m.CustomAnchorKeyError,
+// copyAssetMetas returns a deep copy of an AssetMetas map. Both the map
+// and each *MetaReveal value are duplicated.
+func copyAssetMetas(am AssetMetas) AssetMetas {
+	if am == nil {
+		return nil
 	}
 	out := make(AssetMetas, len(am))
 	for k, v := range am {
@@ -173,12 +164,15 @@ func (m *MintingBatch) Copy() (*MintingBatch, error) {
 	}
 
 	batchCopy := &MintingBatch{
-		CreationTime:      m.CreationTime,
-		HeightHint:        m.HeightHint,
-		BatchKey:          asset.CopyKeyDescriptor(m.BatchKey),
-		SupplyCommitments: m.SupplyCommitments,
-		Seedlings:         copySeedlings(m.Seedlings),
-		AssetMetas:        copyAssetMetas(m.AssetMetas),
+		CreationTime:             m.CreationTime,
+		HeightHint:               m.HeightHint,
+		BatchKey:                 asset.CopyKeyDescriptor(m.BatchKey),
+		SupplyCommitments:        m.SupplyCommitments,
+		Seedlings:                copySeedlings(m.Seedlings),
+		AssetMetas:               copyAssetMetas(m.AssetMetas),
+		CustomAnchorLeaseError:   m.CustomAnchorLeaseError,
+		CustomAnchorPublishError: m.CustomAnchorPublishError,
+		CustomAnchorKeyError:     m.CustomAnchorKeyError,
 	}
 	batchCopy.setState(m.State())
 

@@ -1015,7 +1015,7 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 	if req.PreCommitOutputIndex != nil {
 		preCommitIdx = fn.Some(req.GetPreCommitOutputIndex())
 	}
-	fundBatchResp, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
+	verboseBatch, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
 		FeeRate:              feeRateOpt,
 		SiblingTapTree:       tapTreeOpt,
 		AnchorPsbt:           anchorPsbt,
@@ -1050,13 +1050,7 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 func (r *RPCServer) PrepareBatch(_ context.Context,
 	req *mintrpc.PrepareBatchRequest) (*mintrpc.PrepareBatchResponse, error) {
 
-	preparer, ok := r.cfg.AssetMinter.(tapgarden.BatchPreparer)
-	if !ok {
-		return nil, fmt.Errorf("asset minter does not support caller-funded " +
-			"batch preparation")
-	}
-
-	batch, err := preparer.PrepareBatch()
+	batch, err := r.cfg.AssetMinter.PrepareBatch()
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare batch: %w", err)
 	}

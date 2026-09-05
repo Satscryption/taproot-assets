@@ -486,7 +486,18 @@ type Querier interface {
 	QueryUniverseStats(ctx context.Context) (QueryUniverseStatsRow, error)
 	QueryUniverseSupplyLeaves(ctx context.Context, arg QueryUniverseSupplyLeavesParams) ([]QueryUniverseSupplyLeavesRow, error)
 	ReAnchorPassiveAssets(ctx context.Context, arg ReAnchorPassiveAssetsParams) error
+	RecordReorgDeliveryFailure(ctx context.Context, arg RecordReorgDeliveryFailureParams) error
+	RecordReorgEffectFailure(ctx context.Context, arg RecordReorgEffectFailureParams) error
 	RepairCustomAnchorInternalKey(ctx context.Context, arg RepairCustomAnchorInternalKeyParams) (int64, error)
+	// The receive-side inverse of event completion: the anchor
+	// transaction the events were keyed to was decided against by the
+	// chain, so the events return to the given (pre-completion) status.
+	// Their expected-output rows (addr_event_outputs) stand: they
+	// describe the address's expectation, not materialized state.
+	ResetAddrEventsByAnchorTx(ctx context.Context, arg ResetAddrEventsByAnchorTxParams) (int64, error)
+	// The inverse of ReAnchorPassiveAssets: restore the anchor UTXO and
+	// the spend-template fields that the re-anchor reset.
+	RestoreAssetSpendTemplate(ctx context.Context, arg RestoreAssetSpendTemplateParams) error
 	SetAddrManaged(ctx context.Context, arg SetAddrManagedParams) error
 	SetAssetSpent(ctx context.Context, arg SetAssetSpentParams) (int64, error)
 	// Marks one asset row spent by its primary key. Used by abandonment

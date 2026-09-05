@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	btcaddr "github.com/btcsuite/btcd/address/v2"
@@ -47,6 +48,8 @@ type WalletAnchor struct {
 	LeaseErrors   map[wire.OutPoint]error
 	ReleaseErrors map[wire.OutPoint]error
 	ImportErr     error
+
+	failSignPsbt atomic.Bool
 }
 
 // SetOwnedInput updates whether an input is controlled by the mock wallet.
@@ -89,6 +92,12 @@ func (m *WalletAnchor) SetImportError(err error) {
 	defer m.mu.Unlock()
 
 	m.ImportErr = err
+}
+
+// FailSignPsbtOnce arms the next call to SignAndFinalizePsbt to return
+// an error. The failing call does not send on SignPsbtSignal.
+func (m *WalletAnchor) FailSignPsbtOnce() {
+	m.failSignPsbt.Store(true)
 }
 
 // NewWalletAnchor returns a freshly-initialised mock WalletAnchor.

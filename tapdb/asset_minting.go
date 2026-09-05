@@ -2009,7 +2009,7 @@ func (a *AssetMintingStore) CommitSignedGenesisTxWithKey(ctx context.Context,
 	}
 
 	var writeTxOpts AssetStoreTxOptions
-	return a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
+	err = a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
 		repairQueries, ok := q.(customAnchorKeyRepairQueries)
 		if !ok {
 			return fmt.Errorf(
@@ -2426,9 +2426,15 @@ func (a *AssetMintingStore) DeleteTapscriptTree(ctx context.Context,
 	})
 }
 
-// A compile-time assertion to ensure that AssetMintingStore meets the
-// tapgarden.MintingStore interface.
-var _ tapgarden.MintingStore = (*AssetMintingStore)(nil)
-var _ tapgarden.SignedGenesisPsbtStore = (*AssetMintingStore)(nil)
-var _ tapgarden.MintingInternalKeyStore = (*AssetMintingStore)(nil)
-var _ asset.TapscriptTreeManager = (*AssetMintingStore)(nil)
+// Compile-time assertions: AssetMintingStore is the single concrete
+// store that satisfies both the BatchStore (batch lifecycle) and the
+// MintingRefReader (reference lookups) views the planter and
+// cultivator consume separately, as well as the TapscriptTreeManager
+// used for batch tap siblings.
+var (
+	_ tapgarden.BatchStore              = (*AssetMintingStore)(nil)
+	_ tapgarden.MintingRefReader        = (*AssetMintingStore)(nil)
+	_ tapgarden.SignedGenesisPsbtStore  = (*AssetMintingStore)(nil)
+	_ tapgarden.MintingInternalKeyStore = (*AssetMintingStore)(nil)
+	_ asset.TapscriptTreeManager        = (*AssetMintingStore)(nil)
+)

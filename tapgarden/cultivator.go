@@ -21,6 +21,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapnode"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -134,6 +135,11 @@ type CultivatorConfig struct {
 	// CustomAnchorLeaseRenewalInterval controls publication retry and lease
 	// renewal while wallet acceptance of a custom anchor remains ambiguous.
 	CustomAnchorLeaseRenewalInterval time.Duration
+
+	// AnchoringWaiters is the planter's waiter set, which its delivery
+	// listener nudges; the cultivator's wait on its anchoring blocks
+	// on it. Required whenever AnchoringWatcher is set.
+	AnchoringWaiters *tapreorg.DeliveryWaiters
 }
 
 // Cultivator is the cultivator for a MintingBatch. It'll handle validating
@@ -159,6 +165,15 @@ type Cultivator struct {
 	// confInfo is used to store a delivered confirmation event.
 	confInfo *chainntnfs.TxConfirmation
 
+	// anchorOutputIndex is the index in the anchor output that commits to
+	// the Taproot Asset commitment.
+	anchorOutputIndex uint32
+
+	// customAnchorWalletAccepted is true once WalletKit has returned success
+	// for the exact custom transaction. Until then the caretaker keeps a
+	// confirmation watcher installed, renews local leases and retries the same
+	// bytes.
+	customAnchorWalletAccepted bool
 	// abandonEvent reports that the anchoring watcher abandoned the
 	// batch's genesis transaction: a conflicting spend of its inputs
 	// was buried, and the mint site's compensation has already
@@ -174,32 +189,26 @@ type Cultivator struct {
 	// channel.
 	done chan struct{}
 
-	// customAnchorWalletAccepted is true once WalletKit has returned success
-	// for the exact custom transaction. Until then the caretaker keeps a
-	// confirmation watcher installed, renews local leases and retries the same
-	// bytes.
-	customAnchorWalletAccepted bool
-
 	// ContextGuard provides a wait group and main quit channel that can be
 	// used to create guarded contexts.
 	*fn.ContextGuard
 }
 
-func (b *BatchCaretaker) setCustomAnchorLeaseError(status string) {
+func (b *Cultivator) setCustomAnchorLeaseError(status string) {
 	b.statusMu.Lock()
 	defer b.statusMu.Unlock()
 
 	b.customAnchorLeaseError = status
 }
 
-func (b *BatchCaretaker) setCustomAnchorPublishError(status string) {
+func (b *Cultivator) setCustomAnchorPublishError(status string) {
 	b.statusMu.Lock()
 	defer b.statusMu.Unlock()
 
 	b.customAnchorPublishError = status
 }
 
-func (b *BatchCaretaker) customAnchorStatus() (string, string) {
+func (b *Cultivator) customAnchorStatus() (string, string) {
 	b.statusMu.RLock()
 	defer b.statusMu.RUnlock()
 
@@ -207,47 +216,60 @@ func (b *BatchCaretaker) customAnchorStatus() (string, string) {
 }
 
 // batchCopy returns a consistent planter-owned snapshot of the batch and its
-// transient custom-anchor health. The caretaker is the sole writer of the
+// transient custom-anchor health. The cultivator is the sole writer of the
 // health fields while it is active.
-func (b *BatchCaretaker) batchCopy() *MintingBatch {
+func (b *Cultivator) batchCopy() (*MintingBatch, error) {
 	b.statusMu.RLock()
 	defer b.statusMu.RUnlock()
 
-	batchCopy := b.cfg.Batch.Copy()
+	batchCopy, err := b.cfg.Batch.Copy()
+	if err != nil {
+		return nil, err
+	}
 	batchCopy.CustomAnchorLeaseError = b.customAnchorLeaseError
 	batchCopy.CustomAnchorPublishError = b.customAnchorPublishError
 
-	return batchCopy
+	return batchCopy, nil
 }
 
-// NewBatchCaretaker creates a new Taproot Asset caretaker based on the passed
+// augmenter returns the GenesisTxAugmenter from the embedded
+// GardenKit, or a NoOpAugmenter when none was wired. Call sites
+// can invoke augmenter methods without nil-checking.
+func (b *Cultivator) augmenter() GenesisTxAugmenter {
+	if b.cfg.GenesisTxAugmenter == nil {
+		return NoOpAugmenter{}
+	}
+	return b.cfg.GenesisTxAugmenter
+}
+
+// NewCultivator creates a new Taproot Asset cultivator based on the passed
 // config.
-//
-// TODO(roasbeef): rename to Cultivator?
-func NewBatchCaretaker(cfg *BatchCaretakerConfig) *BatchCaretaker {
-	caretaker := &BatchCaretaker{
+func NewCultivator(cfg *CultivatorConfig) *Cultivator {
+	cultivator := &Cultivator{
 		batchKey:                 asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
 		cfg:                      cfg,
 		customAnchorLeaseError:   cfg.Batch.CustomAnchorLeaseError,
 		customAnchorPublishError: cfg.Batch.CustomAnchorPublishError,
 		confEvent:                make(chan *chainntnfs.TxConfirmation, 1),
+		done:                     make(chan struct{}),
+		abandonEvent:             make(chan struct{}, 1),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),
 		},
 	}
 	if cfg.Batch.GenesisPacket != nil {
-		caretaker.anchorOutputIndex = cfg.Batch.GenesisPacket.
+		cultivator.anchorOutputIndex = cfg.Batch.GenesisPacket.
 			AssetAnchorOutIdx
 	}
 
-	return caretaker
+	return cultivator
 }
 
 // mintingInternalKeyDescriptor resolves and proves the wallet-owned descriptor
 // that will be persisted for the managed mint output. This preflight must run
 // before importing or publishing a custom transaction.
-func (b *BatchCaretaker) mintingInternalKeyDescriptor(ctx context.Context,
+func (b *Cultivator) mintingInternalKeyDescriptor(ctx context.Context,
 	pkt *psbt.Packet) (keychain.KeyDescriptor, error) {
 
 	if !isCustomAnchorPsbt(pkt) {
@@ -300,8 +322,17 @@ func customAnchorMintingKeyDescriptor(ctx context.Context,
 	return desc, nil
 }
 
-// Start attempts to start a new batch caretaker.
-func (b *BatchCaretaker) Start() error {
+// Done returns a channel that is closed once the cultivator's main
+// goroutine has exited. Callers waiting on a per-request reply channel
+// from the cultivator should also select on Done to avoid deadlocking
+// when the cultivator has already finished and cannot service the
+// request.
+func (b *Cultivator) Done() <-chan struct{} {
+	return b.done
+}
+
+// Start attempts to start a new batch cultivator.
+func (b *Cultivator) Start() error {
 	var startErr error
 	b.startOnce.Do(func() {
 		b.Wg.Add(1)
@@ -374,7 +405,7 @@ func (b *Cultivator) Cancel(respCh chan<- CancelResp) error {
 	case BatchStateCommitted:
 		if customAnchorPublicationPending(b.cfg.Batch) {
 			err := fmt.Errorf(
-				"BatchCaretaker(%x), custom anchor publication "+
+				"Cultivator(%x), custom anchor publication "+
 					"status is ambiguous and is not cancellable",
 				batchKey,
 			)
@@ -382,8 +413,8 @@ func (b *Cultivator) Cancel(respCh chan<- CancelResp) error {
 			break
 		}
 
-		err := b.cfg.Log.UpdateBatchState(
-			ctx, b.cfg.Batch.BatchKey.PubKey,
+		err := b.cfg.BatchStore.UpdateBatchState(
+			ctx, b.cfg.Batch,
 			BatchStateSproutCancelled,
 		)
 		if err != nil {
@@ -396,28 +427,15 @@ func (b *Cultivator) Cancel(respCh chan<- CancelResp) error {
 			)
 		}
 
-		// A custom batch can hold wallet input leases while it waits for
-		// external signatures. Release those leases only after cancellation
-		// is durable. A wallet RPC failure is best effort because retaining
-		// the active planter slot after the durable state transition would
-		// leave memory and disk inconsistent.
-		if err == nil && b.cfg.Batch.GenesisPacket != nil &&
-			isCustomAnchorPsbt(b.cfg.Batch.GenesisPacket.Pkt) {
-
-			releaseErr := releaseCustomAnchorLeases(
-				ctx, b.cfg.Wallet,
-				customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
-				b.cfg.Batch.GenesisPacket,
+		// The batch is now cancelled on disk, so any wallet inputs
+		// leased when it was funded can be released.
+		if err == nil {
+			releaseBatchFundingInputs(
+				ctx, b.cfg.Wallet, b.cfg.Batch,
 			)
-			if releaseErr != nil {
-				log.Warnf("Unable to release one or more cancelled "+
-					"custom anchor input leases: %v", releaseErr)
-			}
 		}
 
-		b.cfg.PublishMintEvent(newAssetMintEvent(
-			BatchStateSproutCancelled, b.cfg.Batch,
-		))
+		b.publishMintEvent(BatchStateSproutCancelled)
 
 		cancelResp = CancelResp{true, err}
 
@@ -676,9 +694,7 @@ func (b *Cultivator) assetCultivator() {
 				statusErr := fmt.Errorf("custom anchor lease renewal "+
 					"during publish retry failed: %w", err)
 				b.setCustomAnchorLeaseError(statusErr.Error())
-				b.cfg.PublishMintEvent(newAssetMintErrorEvent(
-					statusErr, BatchStateBroadcast, b.cfg.Batch,
-				))
+				b.publishMintErrorEvent(statusErr, BatchStateBroadcast)
 				continue
 			}
 			b.setCustomAnchorLeaseError("")
@@ -692,9 +708,7 @@ func (b *Cultivator) assetCultivator() {
 						"retry transaction: %w", err,
 				)
 				b.setCustomAnchorPublishError(statusErr.Error())
-				b.cfg.PublishMintEvent(newAssetMintErrorEvent(
-					statusErr, BatchStateBroadcast, b.cfg.Batch,
-				))
+				b.publishMintErrorEvent(statusErr, BatchStateBroadcast)
 				continue
 			}
 
@@ -707,17 +721,13 @@ func (b *Cultivator) assetCultivator() {
 				statusErr := fmt.Errorf("custom anchor publish remains "+
 					"ambiguous: %w", err)
 				b.setCustomAnchorPublishError(statusErr.Error())
-				b.cfg.PublishMintEvent(newAssetMintErrorEvent(
-					statusErr, BatchStateBroadcast, b.cfg.Batch,
-				))
+				b.publishMintErrorEvent(statusErr, BatchStateBroadcast)
 				continue
 			}
 
 			b.customAnchorWalletAccepted = true
 			b.setCustomAnchorPublishError("")
-			b.cfg.PublishMintEvent(newAssetMintEvent(
-				BatchStateBroadcast, b.cfg.Batch,
-			))
+			b.publishMintEvent(BatchStateBroadcast)
 
 		// We've received the confirmation notification, so we can
 		// advance our state machine through the final two phases.
@@ -761,6 +771,23 @@ func (b *Cultivator) assetCultivator() {
 				"abandoned, its inputs were claimed by a "+
 				"buried conflicting transaction; batch "+
 				"cancelled", b.batchKey[:])
+
+			// The watcher has committed abandonment on disk. Release
+			// only this custom batch's recorded wallet leases; keep
+			// the shared signed packet immutable for concurrent reads.
+			if isCustomAnchorPsbt(b.cfg.Batch.GenesisPacket.Pkt) {
+				ctx, cancel := b.WithCtxQuit()
+				err := releaseCustomAnchorOutpoints(
+					ctx, b.cfg.Wallet,
+					customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
+					b.cfg.Batch.GenesisPacket.LockedUTXOs,
+				)
+				cancel()
+				if err != nil {
+					log.Warnf("Unable to release abandoned custom "+
+						"anchor leases: %v", err)
+				}
+			}
 
 			b.cfg.Batch.setState(BatchStateSproutCancelled)
 			b.publishMintEvent(BatchStateSproutCancelled)
@@ -896,6 +923,78 @@ func (b *Cultivator) seedlingsToAssetSprouts(ctx context.Context,
 	return commitment.FromAssets(
 		fn.Ptr(commitment.TapCommitmentV2), newAssets...,
 	)
+}
+
+// publishBroadcast retries the persisted transaction after its confirmation
+// sensor has been installed. Custom anchors retain their batch-scoped leases
+// and remain watched even when wallet acceptance is ambiguous.
+func (b *Cultivator) publishBroadcast(signedTx *wire.MsgTx) error {
+	customAnchor := isCustomAnchorPsbt(
+		b.cfg.Batch.GenesisPacket.Pkt,
+	)
+	if !customAnchor || !b.customAnchorWalletAccepted {
+		if customAnchor {
+			renewCtx, renewCancel := b.WithCtxQuit()
+			renewErr := renewCustomAnchorLeasesReadOnly(
+				renewCtx, b.cfg.Wallet,
+				customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
+				b.cfg.Batch.GenesisPacket,
+			)
+			renewCancel()
+			if renewErr != nil {
+				b.setCustomAnchorLeaseError(renewErr.Error())
+				renewStatusErr := fmt.Errorf(
+					"custom anchor lease renewal "+
+						"before publish retry failed: %w",
+					renewErr,
+				)
+				b.publishMintErrorEvent(
+					renewStatusErr, BatchStateBroadcast,
+				)
+			} else {
+				b.setCustomAnchorLeaseError("")
+			}
+		}
+
+		leaseErr, _ := b.customAnchorStatus()
+		if !customAnchor || leaseErr == "" {
+			publishCtx, publishCancel := b.WithCtxQuit()
+			err := b.cfg.ChainBridge.PublishTransaction(
+				publishCtx, signedTx, IssuanceTxLabel,
+			)
+			publishCancel()
+			if err != nil && !customAnchor {
+				return fmt.Errorf("unable to publish "+
+					"transaction: %w", err)
+			}
+			if customAnchor {
+				b.customAnchorWalletAccepted = err == nil
+				if err != nil {
+					publishErrText := err.Error()
+					b.setCustomAnchorPublishError(
+						publishErrText,
+					)
+					publishStatusErr := fmt.Errorf(
+						"custom anchor publish remains "+
+							"ambiguous: %w", err,
+					)
+					b.publishMintErrorEvent(
+						publishStatusErr,
+						BatchStateBroadcast,
+					)
+				} else {
+					// Keep any initial-failure admission marker until
+					// confirmation. A later retry success cannot prove
+					// whether the caller independently relayed the first
+					// attempt, so releasing the slot here would re-open
+					// amplification before an on-chain outcome.
+					b.setCustomAnchorPublishError("")
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // stateStep attempts to transition the state machine from one state to
@@ -1236,6 +1335,19 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			return 0, fmt.Errorf("unable to import key: %w", err)
 		}
 
+		changeIdx := b.cfg.Batch.GenesisPacket.ChangeOutputIndex
+		// Start from the funded packet so custom lease ownership survives
+		// the signed-genesis commit. Replace only the signed transaction and
+		// newly known fee fields; copy the slice to avoid aliasing caretaker
+		// and store state.
+		signedFundedPsbt := b.cfg.Batch.GenesisPacket.FundedPsbt
+		signedFundedPsbt.Pkt = signedPkt
+		signedFundedPsbt.ChangeOutputIndex = changeIdx
+		signedFundedPsbt.ChainFees = int64(chainFees)
+		signedFundedPsbt.LockedUTXOs = fn.CopySlice(
+			b.cfg.Batch.GenesisPacket.LockedUTXOs,
+		)
+
 		// Only after import succeeds do we cross the durable publication
 		// boundary. Work on a copy so a failed store leaves both memory and
 		// disk at the signed-but-not-publishing Committed state.
@@ -1255,11 +1367,11 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			setCustomAnchorPublishState(
 				publishPkt, customAnchorPublishPending,
 			)
-			publishFunded := b.cfg.Batch.GenesisPacket.FundedPsbt
+			publishFunded := signedFundedPsbt
 			publishFunded.Pkt = publishPkt
 			storeCtx, storeCancel := b.WithCtxQuit()
 			err = storeSignedGenesisPsbt(
-				storeCtx, b.cfg.Log, b.cfg.Batch.BatchKey.PubKey,
+				storeCtx, b.cfg.BatchStore, b.cfg.Batch.BatchKey.PubKey,
 				&publishFunded,
 			)
 			storeCancel()
@@ -1269,6 +1381,7 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			}
 
 			signedPkt = publishPkt
+			signedFundedPsbt.Pkt = publishPkt
 			b.cfg.Batch.GenesisPacket.Pkt = publishPkt
 		}
 
@@ -1280,7 +1393,7 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		var (
 			publishErr       error
 			publishAttempted bool
-			commitPacket     = &b.cfg.Batch.GenesisPacket.FundedPsbt
+			commitPacket     = &signedFundedPsbt
 			acceptedPacket   *FundedMintAnchorPsbt
 		)
 		if isCustomAnchorPsbt(signedPkt) {
@@ -1296,14 +1409,11 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 					"leases before publication: %w", renewErr)
 				b.setCustomAnchorLeaseError(statusErr.Error())
 
-				// A retained publish-pending marker means an earlier
-				// process may already have handed these exact bytes to
-				// WalletKit. Cross into durable Broadcast so the watcher
-				// is installed, but don't actively republish until the
+				// Import-pending and publish-pending both retain fully
+				// signed bytes the external signer can independently
+				// relay. Cross into durable Broadcast so the watcher is
+				// installed, but don't actively republish until the
 				// recorded local leases are reacquired.
-				if publishStateAtEntry != customAnchorPublishPending {
-					return 0, statusErr
-				}
 			} else {
 				b.setCustomAnchorLeaseError("")
 			}
@@ -1342,7 +1452,21 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 				// the atomic Broadcast commit. The live Committed packet
 				// must retain publish-pending until that commit succeeds.
 				if publishStateAtEntry != customAnchorPublishPending {
-					acceptedPacket = b.cfg.Batch.GenesisPacket.Copy()
+					acceptedPacket, err = b.cfg.Batch.GenesisPacket.Copy()
+					if err != nil {
+						return 0, fmt.Errorf("unable to copy accepted custom "+
+							"anchor packet: %w", err)
+					}
+					// Preserve the deep-copied packet. Assigning the whole
+					// FundedPsbt here would alias publishPkt and clearing the
+					// accepted marker below would also make the live Committed
+					// batch cancellable before the DB commit succeeds.
+					acceptedPacket.ChangeOutputIndex =
+						signedFundedPsbt.ChangeOutputIndex
+					acceptedPacket.ChainFees = signedFundedPsbt.ChainFees
+					acceptedPacket.LockedUTXOs = fn.CopySlice(
+						signedFundedPsbt.LockedUTXOs,
+					)
 					setCustomAnchorPublishState(
 						acceptedPacket.Pkt,
 						customAnchorPublishNone,
@@ -1356,20 +1480,17 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 		// Taproot Asset commitment root and batch tapscript sibling.
 		tapCommitmentRoot := b.cfg.Batch.RootAssetCommitment.
 			TapscriptRoot(nil)
+
 		err = commitSignedGenesisTx(
-			ctx, b.cfg.Log, b.cfg.Batch, mintingInternalKey,
-			commitPacket,
-			b.anchorOutputIndex, merkleRoot, tapCommitmentRoot[:],
+			ctx, b.cfg.BatchStore, b.cfg.Batch, mintingInternalKey,
+			commitPacket, b.anchorOutputIndex, merkleRoot,
+			tapCommitmentRoot[:],
 			siblingBytes,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to commit genesis "+
 				"tx: %w", err)
 		}
-		if acceptedPacket != nil {
-			b.cfg.Batch.GenesisPacket.Pkt = acceptedPacket.Pkt
-		}
-
 		// If the initial submission failed ambiguously, the transaction
 		// might still have reached the backend. Continue into Broadcast so
 		// the normal retry policy runs and a confirmation watcher is
@@ -1379,7 +1500,15 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 				"retrying from Broadcast: %v", publishErr)
 		}
 
-		log.Infof("BatchCaretaker(%x): transition states: %v -> %v",
+		// DB write succeeded; sync in-memory batch with disk.
+		if acceptedPacket != nil {
+			b.cfg.Batch.GenesisPacket.Pkt = acceptedPacket.Pkt
+		} else {
+			b.cfg.Batch.GenesisPacket.Pkt = signedPkt
+		}
+		b.cfg.Batch.GenesisPacket.ChainFees = int64(chainFees)
+
+		log.Infof("Cultivator(%x): transition states: %v -> %v",
 			b.batchKey[:], BatchStateCommitted, BatchStateBroadcast)
 
 		return BatchStateBroadcast, nil
@@ -1401,110 +1530,41 @@ func (b *Cultivator) stateStep(currentState BatchState) (BatchState, error) {
 			b.batchKey[:])
 		if isCustomAnchorPsbt(b.cfg.Batch.GenesisPacket.Pkt) {
 			log.Tracef("Custom GenesisTx: txid=%v, inputs=%d, "+
-				"outputs=%d", signedTx.TxHash(), len(signedTx.TxIn),
-				len(signedTx.TxOut))
+				"outputs=%d", signedTx.TxHash(),
+				len(signedTx.TxIn), len(signedTx.TxOut))
 		} else {
 			log.Tracef("GenesisTx: %v", spew.Sdump(signedTx))
 		}
 
-		// Install the confirmation watcher before any retry publication. An
-		// earlier ambiguous submission may already have relayed the exact
-		// transaction, so a later publication error must never create a gap in
-		// confirmation tracking or return the batch to a mutable state.
-		// Now we'll wait for a confirmation as we reach our terminal
-		// state that requires an on-chain event to shift from. We make
-		// sure to request that the block is included as well, since we
-		// need this to construct the proof files for each of the
-		// assets later.
+		// The re-org watcher is the sole sensor: the batch registers
+		// its genesis transaction as a speculative anchoring
+		// (idempotently) before the Broadcast publish — the stake
+		// exists before the act it senses — and a goroutine waits on
+		// the registry's delivered phase. There is no cultivator-owned
+		// confirmation subscription.
 		//
-		// TODO(roasbeef): eventually want to be able to RBF the bump
-		heightHint := b.cfg.Batch.HeightHint
-		txHash := signedTx.TxHash()
-		confCtx, confCancel := b.WithCtxQuitNoTimeout()
-		confNtfn, errChan, err := b.cfg.ChainBridge.RegisterConfirmationsNtfn(
-			confCtx, &txHash,
-			signedTx.TxOut[b.anchorOutputIndex].PkScript, 1,
-			heightHint, true, nil,
-		)
+		// An earlier ambiguous submission (the Committed-state custom
+		// publish) may already have relayed the exact transaction, so
+		// a later publication error must never create a gap in
+		// confirmation tracking. publishBroadcast keeps a custom
+		// anchor watched when wallet acceptance is still ambiguous.
+		regCtx, regCancel := b.WithCtxQuitNoTimeout()
+
+		err = b.registerMintAnchoring(regCtx, signedTx)
 		if err != nil {
-			return 0, fmt.Errorf("unable to register for "+
-				"minting tx conf: %w", err)
+			regCancel()
+
+			return 0, fmt.Errorf("unable to register mint "+
+				"anchoring: %w", err)
 		}
 
-		customAnchor := isCustomAnchorPsbt(
-			b.cfg.Batch.GenesisPacket.Pkt,
-		)
-		if !customAnchor || !b.customAnchorWalletAccepted {
-			if customAnchor {
-				renewCtx, renewCancel := b.WithCtxQuit()
-				renewErr := renewCustomAnchorLeasesReadOnly(
-					renewCtx, b.cfg.Wallet,
-					customAnchorLeaseID(b.cfg.Batch.BatchKey.PubKey),
-					b.cfg.Batch.GenesisPacket,
-				)
-				renewCancel()
-				if renewErr != nil {
-					b.setCustomAnchorLeaseError(renewErr.Error())
-					renewStatusErr := fmt.Errorf(
-						"custom anchor lease renewal "+
-							"before publish retry failed: %w",
-						renewErr,
-					)
-					b.cfg.PublishMintEvent(newAssetMintErrorEvent(
-						renewStatusErr,
-						BatchStateBroadcast, b.cfg.Batch,
-					))
-				} else {
-					b.setCustomAnchorLeaseError("")
-				}
-			}
+		if err := b.publishBroadcast(signedTx); err != nil {
+			regCancel()
 
-			leaseErr, _ := b.customAnchorStatus()
-			if !customAnchor || leaseErr == "" {
-				publishCtx, publishCancel := b.WithCtxQuit()
-				err = b.cfg.ChainBridge.PublishTransaction(
-					publishCtx, signedTx, IssuanceTxLabel,
-				)
-				publishCancel()
-				if err != nil && !customAnchor {
-					confNtfn.Cancel()
-					return 0, fmt.Errorf("unable to publish "+
-						"transaction: %w", err)
-				}
-				if customAnchor {
-					b.customAnchorWalletAccepted = err == nil
-					if err != nil {
-						publishErrText := err.Error()
-						b.setCustomAnchorPublishError(
-							publishErrText,
-						)
-						publishStatusErr := fmt.Errorf(
-							"custom anchor publish remains "+
-								"ambiguous: %w", err,
-						)
-						b.cfg.PublishMintEvent(
-							newAssetMintErrorEvent(
-								publishStatusErr,
-								BatchStateBroadcast,
-								b.cfg.Batch,
-							),
-						)
-					} else {
-						// Keep any initial-failure admission marker until
-						// confirmation. A later retry success cannot prove
-						// whether the caller independently relayed the first
-						// attempt, so releasing the slot here would re-open
-						// amplification before an on-chain outcome.
-						b.setCustomAnchorPublishError("")
-					}
-				}
-			}
+			return 0, err
 		}
 
-		// Launch a goroutine that'll notify us when the transaction
-		// confirms.
-		//
-		// TODO(roasbeef): make blocking here?
+		txHash := signedTx.TxHash()
 		b.Wg.Add(1)
 		go func() {
 			defer regCancel()

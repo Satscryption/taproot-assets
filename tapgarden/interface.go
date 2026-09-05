@@ -23,69 +23,6 @@ const (
 	IssuanceTxLabel = "tapd-asset-issuance"
 )
 
-// FundBatchResp is the response returned from the FundBatch method.
-type FundBatchResp struct {
-	// Batch is the batch that was funded.
-	Batch *VerboseBatch
-}
-
-// Planter is responsible for batching a set of seedlings into a minting batch
-// that will eventually be confirmed on chain.
-type Planter interface {
-	// QueueNewSeedling attempts to queue a new seedling request (the
-	// intent for New asset creation or ongoing issuance) to the Planter.
-	// A channel is returned where future updates will be sent over. If an
-	// error is returned no issuance operation was possible.
-	QueueNewSeedling(req *Seedling) (SeedlingUpdates, error)
-
-	// ListBatches lists the set of batches submitted for minting, or the
-	// details of a specific batch.
-	ListBatches(params ListBatchesParams) ([]*VerboseBatch, error)
-
-	// CancelSeedling attempts to cancel the creation of a new asset
-	// identified by its name. If the seedling has already progressed to a
-	// point where the genesis PSBT has been broadcasted, an error is
-	// returned.
-	CancelSeedling() error
-
-	// FundBatch attempts to provide a genesis point for the current batch,
-	// or create a new funded batch.
-	FundBatch(params FundParams) (*FundBatchResp, error)
-
-	// SealBatch attempts to seal the current batch, by providing or
-	// deriving all witnesses necessary to create the final genesis TX.
-	SealBatch(params SealParams) (*MintingBatch, error)
-
-	// FinalizeBatch signals that the asset minter should finalize
-	// the current batch, if one exists.
-	FinalizeBatch(params FinalizeParams) (*MintingBatch, error)
-
-	// CancelBatch signals that the asset minter should cancel the
-	// current batch, if one exists.
-	CancelBatch() (*btcec.PublicKey, error)
-
-	// Start signals that the asset minter should being operations.
-	Start() error
-
-	// Stop signals that the asset minter should attempt a graceful
-	// shutdown.
-	Stop() error
-
-	// EventPublisher is a subscription interface that allows callers to
-	// subscribe to events that are relevant to the Planter.
-	fn.EventPublisher[fn.Event, bool]
-}
-
-// BatchPreparer is an optional Planter extension for caller-funded batches.
-// Keeping this operation separate allows existing Planter implementations to
-// remain source compatible when custom anchor support isn't required.
-type BatchPreparer interface {
-	// PrepareBatch freezes a caller-funded batch and commits the asset tree
-	// into its selected anchor output. The returned PSBT is ready for external
-	// signing.
-	PrepareBatch() (*MintingBatch, error)
-}
-
 // BatchState an enum that represents the various stages of a minting batch.
 type BatchState uint8
 
@@ -371,14 +308,14 @@ type MintingRefReader interface {
 		error)
 }
 
-// SignedGenesisPsbtStore is an optional MintingStore extension that durably
+// SignedGenesisPsbtStore is an optional BatchStore extension that durably
 // records a signed custom genesis packet before publication is attempted.
 type SignedGenesisPsbtStore interface {
 	StoreSignedGenesisPsbt(ctx context.Context, batchKey *btcec.PublicKey,
 		genesisTx *tapsend.FundedPsbt) error
 }
 
-// MintingInternalKeyStore is an optional MintingStore extension that persists
+// MintingInternalKeyStore is an optional BatchStore extension that persists
 // the wallet-proven internal key for a mint anchor. Custom anchors require this
 // capability because their internal key can differ from the batch key.
 type MintingInternalKeyStore interface {
@@ -388,7 +325,7 @@ type MintingInternalKeyStore interface {
 		merkleRoot, tapTreeRoot, tapSibling []byte) error
 }
 
-func storeSignedGenesisPsbt(ctx context.Context, store MintingStore,
+func storeSignedGenesisPsbt(ctx context.Context, store BatchStore,
 	batchKey *btcec.PublicKey, genesisTx *tapsend.FundedPsbt) error {
 
 	signedStore, ok := store.(SignedGenesisPsbtStore)
@@ -408,7 +345,7 @@ func storeSignedGenesisPsbt(ctx context.Context, store MintingStore,
 	)
 }
 
-func commitSignedGenesisTx(ctx context.Context, store MintingStore,
+func commitSignedGenesisTx(ctx context.Context, store BatchStore,
 	batch *MintingBatch, mintingInternalKey keychain.KeyDescriptor,
 	genesisTx *tapsend.FundedPsbt, anchorOutputIndex uint32,
 	merkleRoot, tapTreeRoot, tapSibling []byte) error {

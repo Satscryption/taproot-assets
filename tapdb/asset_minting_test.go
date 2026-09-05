@@ -27,6 +27,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapscript"
 	"github.com/lightninglabs/taproot-assets/tapsend"
@@ -1099,8 +1100,13 @@ func TestCommitBatchChainActions(t *testing.T) {
 		randAssetCtx.tapSiblingBytes,
 	))
 	require.ErrorContains(t, assetStore.StoreSignedGenesisPsbt(
-		ctx, randAssetCtx.batchKey, randAssetCtx.genesisPkt,
+		ctx, randAssetCtx.mintingBatch.BatchKey.PubKey,
+		randAssetCtx.genesisPkt,
 	), "batch in state BatchStateBroadcast")
+	require.Equal(
+		t, tapgarden.BatchStateBroadcast,
+		randAssetCtx.mintingBatch.State(),
+	)
 
 	// The batch updated above should be found, with the batch state
 	// updated, and also the genesis transaction updated to match what we
@@ -1364,7 +1370,7 @@ func TestCommitSignedGenesisTxConflictingLocatorRollback(t *testing.T) {
 	require.Equal(t, conflicting.KeyFamily, locator.KeyFamily)
 	require.Equal(t, conflicting.KeyIndex, locator.KeyIndex)
 	persisted, err := assetStore.FetchMintingBatch(
-		ctx, randAssetCtx.batchKey,
+		ctx, randAssetCtx.mintingBatch.BatchKey.PubKey,
 	)
 	require.NoError(t, err)
 	require.Equal(t, tapgarden.BatchStateCommitted, persisted.State())

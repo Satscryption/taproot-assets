@@ -177,6 +177,50 @@
   including a prepare/finalize signing boundary, durable restart recovery,
   and wallet-input lease management.
 
+* [PR#2266](https://github.com/lightninglabs/taproot-assets/pull/2266)
+  adds the 'watcher': a daemon-wide service that records each
+  act of staking local state on a chain outcome as a durable
+  "anchoring", senses the chain into per-anchoring evidence, derives
+  phases from that evidence, and converges the owning subsystem
+  through handlers that run atomically with the registry advance.
+
+* [PR#2287](https://github.com/lightninglabs/taproot-assets/pull/2287)
+  moves the transfer, receive, minting, auxiliary-sweep, and
+  supply-commit paths onto the watcher: each registers its
+  chain-dependent state as an anchoring and converges it from the
+  phases the watcher delivers.
+  When a shallow re-org removes a transaction, the watcher withdraws
+  its confirmation state and refreshes the stored chain and proof
+  context when it reconfirms. If a competing transaction reaches the
+  configured re-org-safe depth, the watcher abandons the original
+  anchoring and compensates the local state tied to the losing
+  transaction.
+
+  A received proof is imported and registered with the watcher in one
+  transaction, so the receiver never holds an asset the watcher does
+  not: a registration that fails rolls the import back with it. The
+  receive's triggers are derived from the anchor transaction's own
+  inputs, so a verified proof file cannot be refused, and a file that
+  cannot be watched at all is rejected rather than imported.
+
+  Irreversible effects now wait until the winning transaction reaches
+  `--reorgsafedepth`. These include mint universe publication, mint
+  and burn supply-update events, and supply-commit finalization and
+  publication. The default is six confirmations, or 120 on testnet
+  unless overridden. Operators should therefore expect new issuance
+  and supply updates to become externally visible only after that
+  threshold; lowering it reduces the corresponding re-org protection.
+
+- [`tapd` now keeps an encrypted asset wallet backup
+  file](https://github.com/lightninglabs/taproot-assets/pull/2277)
+  (`assets.backup`, see [backup-file.md](../backup-file.md)) on disk that is updated
+  whenever the wallet state changes, in the same spirit as lnd's
+  `channel.backup`. The file holds a compact backup of every confirmed,
+  unspent asset and is encrypted with a key derived from the connected lnd
+  wallet. `ImportAssetsFromBackup` accepts the encrypted file directly, so a
+  fresh `tapd` connected to an lnd restored from the same seed can recover
+  its assets with `tapcli assets backup import`.
+
 ## RPC Additions
 
 * [PR#2266](https://github.com/lightninglabs/taproot-assets/pull/2266)
