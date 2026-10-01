@@ -41,7 +41,38 @@ const (
 	// and avoids the same UTXO being used in another transaction if the
 	// confirmation of the first transaction takes a long time.
 	defaultBroadcastCoinLeaseDuration = 365 * 24 * time.Hour
+
+	// coinReleaseTimeout is the upper bound for the compensating release of
+	// leased coins on an error path. The release must not depend on the
+	// (likely canceled) caller context, but must still be bounded.
+	coinReleaseTimeout = 30 * time.Second
 )
+
+// coinReleaser is the subset of the CoinSelector needed to release coins.
+type coinReleaser interface {
+	// ReleaseCoins releases/unlocks coins that were previously leased and
+	// makes them available for coin selection again.
+	ReleaseCoins(ctx context.Context, utxoOutpoints ...wire.OutPoint) error
+}
+
+// releaseCoinsDetached releases the given leased coins on a context that keeps
+// the values of the parent but not its cancellation, bounded by
+// coinReleaseTimeout. It is meant for deferred cleanup paths that commonly run
+// because the caller's context was canceled, in which case releasing on that
+// context would fail immediately and leak the leases (taproot-assets#2206).
+func releaseCoinsDetached(parent context.Context, releaser coinReleaser,
+	outpoints []wire.OutPoint) {
+
+	ctx, cancel := context.WithTimeout(
+		context.WithoutCancel(parent), coinReleaseTimeout,
+	)
+	defer cancel()
+
+	err := releaser.ReleaseCoins(ctx, outpoints...)
+	if err != nil {
+		log.Errorf("Unable to release coins: %v", err)
+	}
+}
 
 var (
 	// defaultWalletLeaseIdentifier is the binary representation of the
@@ -690,12 +721,9 @@ func (f *AssetWallet) FundPacket(ctx context.Context,
 			)
 			outpoints = append(outpoints, zeroValueOutpoints...)
 
-			err := f.cfg.CoinSelector.ReleaseCoins(
-				ctx, outpoints...,
+			releaseCoinsDetached(
+				ctx, f.cfg.CoinSelector, outpoints,
 			)
-			if err != nil {
-				log.Errorf("Unable to release coins: %v", err)
-			}
 		}
 	}()
 
@@ -771,12 +799,9 @@ func (f *AssetWallet) FundBurn(ctx context.Context,
 			)
 			outpoints = append(outpoints, zeroValueOutpoints...)
 
-			err := f.cfg.CoinSelector.ReleaseCoins(
-				ctx, outpoints...,
+			releaseCoinsDetached(
+				ctx, f.cfg.CoinSelector, outpoints,
 			)
-			if err != nil {
-				log.Errorf("Unable to release coins: %v", err)
-			}
 		}
 	}()
 

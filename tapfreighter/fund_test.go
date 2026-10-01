@@ -822,3 +822,90 @@ func TestFundPacket(t *testing.T) {
 		})
 	}
 }
+
+// fetchOnlyArchiver adapts mockExporter to the Archiver interface. FundPacket
+// only fetches the input proof on the success path exercised below.
+type fetchOnlyArchiver struct {
+	*mockExporter
+}
+
+func (f *fetchOnlyArchiver) FetchIssuanceProof(context.Context, asset.ID,
+	wire.OutPoint) (proof.Blob, error) {
+
+	return nil, proof.ErrProofNotFound
+}
+
+func (f *fetchOnlyArchiver) HasProof(context.Context, proof.Locator) (bool,
+	error) {
+
+	return false, nil
+}
+
+func (f *fetchOnlyArchiver) FetchProofs(context.Context,
+	asset.ID) ([]*proof.AnnotatedProof, error) {
+
+	return nil, nil
+}
+
+func (f *fetchOnlyArchiver) ImportProofs(context.Context, proof.VerifierCtx,
+	bool, ...*proof.AnnotatedProof) error {
+
+	return nil
+}
+
+// TestFundPacketSuccessKeepsLease makes sure a funded packet does not release
+// the coins it just selected. Releasing on the success path would undo the
+// lease the caller is about to spend.
+func TestFundPacketSuccessKeepsLease(t *testing.T) {
+	ctx := context.Background()
+
+	internalKey, _ := test.RandKeyDesc(t)
+	scriptKey := asset.RandScriptKey(t)
+
+	const mintAmount = 500
+	inputProof := randProof(t, mintAmount, internalKey, nil)
+	inputAsset := inputProof.Asset
+	inputCommitment, err := commitment.FromAssets(nil, &inputProof.Asset)
+	require.NoError(t, err)
+
+	sel := &recordingSelector{
+		selected: []*AnchoredCommitment{{
+			AnchorPoint: inputProof.OutPoint(),
+			InternalKey: internalKey,
+			Commitment:  inputCommitment,
+			Asset:       &inputAsset,
+		}},
+	}
+	wallet := NewAssetWallet(&WalletConfig{
+		CoinSelector: sel,
+		AssetProofs: &fetchOnlyArchiver{
+			mockExporter: &mockExporter{
+				proofs: []*proof.Proof{&inputProof},
+			},
+		},
+		AddrBook:                &mockAddrBook{},
+		KeyRing:                 tapnodemock.NewKeyRing(),
+		ChainParams:             testParams,
+		DisableSweepOrphanUtxos: true,
+	})
+
+	funded, err := wallet.FundPacket(
+		ctx, &tapsend.FundingDescriptor{
+			AssetSpecifier: asset.NewSpecifierFromId(
+				inputAsset.ID(),
+			),
+			Amount: 20,
+		},
+		&tappsbt.VPacket{
+			ChainParams: testParams,
+			Outputs: []*tappsbt.VOutput{{
+				Amount:      20,
+				ScriptKey:   scriptKey,
+				Interactive: false,
+			}},
+		},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, funded)
+	require.Zero(t, sel.releaseHits)
+}
