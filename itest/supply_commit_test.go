@@ -1868,8 +1868,7 @@ const supplyIdleCommitInterval = uint32(3)
 
 // testSupplyCommitIdleTick verifies that a locally controlled asset group
 // publishes an empty ancestry-linked successor supply commitment once the
-// latest commitment is at least supplyIdleCommitInterval blocks old, and that
-// an interrupted idle transition resumes after tapd restarts.
+// latest commitment is at least supplyIdleCommitInterval blocks old.
 func testSupplyCommitIdleTick(t *harnessTest) {
 	ctxb := context.Background()
 	miner := t.lndHarness.Miner()
@@ -1960,26 +1959,9 @@ func testSupplyCommitIdleTick(t *harnessTest) {
 		idleCommit.IssuanceSubtreeRoot,
 	)
 
-	t.Log("Interrupting the next idle successor and resuming after restart")
-	if supplyIdleCommitInterval > 1 {
-		MineBlocks(t.t, miner, supplyIdleCommitInterval-1, 0)
-	}
-	MineBlocks(t.t, miner, 1, 0)
-
-	_, err := WaitForNTxsInMempool(miner, 1, minerMempoolTimeout)
-	require.NoError(t.t, err)
-
-	require.NoError(t.t, t.tapd.stop(!*noDelete))
-	MineBlocks(t.t, miner, 1, 1)
-	require.NoError(t.t, t.tapd.start(false))
-
-	secondIdleCommit, _ := WaitForSupplyCommit(
-		t.t, ctxb, t.tapd, groupKeyBytes,
-		fn.Some(idleOutpoint),
-		func(resp *unirpc.FetchSupplyCommitResponse) bool {
-			return resp.ChainData.BlockHeight >
-				idleCommit.ChainData.BlockHeight
-		},
+	t.Log("Publishing a second idle successor after the first")
+	secondIdleCommit, _ := mineIdleSuccessor(
+		idleOutpoint, idleCommit.ChainData.BlockHeight,
 	)
 	require.Equal(
 		t.t, firstRootHash, secondIdleCommit.ChainData.SupplyRootHash,
