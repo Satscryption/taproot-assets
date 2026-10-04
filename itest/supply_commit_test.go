@@ -954,6 +954,39 @@ func testSupplyCommitMintBurn(t *harnessTest) {
 		fetchResp.BurnSubtreeRoot,
 	)
 
+	// The universe server verifies every supply commitment pushed
+	// to it, including the burn leaf proofs. Those proofs must
+	// carry the provenance of the burnt input, otherwise the server
+	// rejects the commitment with "missing asset input(s)"
+	// (lightninglabs/taproot-assets#2285).
+	t.Log("Verifying the universe server accepted the burn " +
+		"commitment")
+	uniBurnPred := func(resp *unirpc.FetchSupplyCommitResponse) error {
+		if resp.BurnSubtreeRoot == nil {
+			return fmt.Errorf("BurnSubtreeRoot is nil")
+		}
+
+		actualSum := resp.BurnSubtreeRoot.RootNode.RootSum
+		if actualSum != int64(burnAmt) {
+			return fmt.Errorf("expected burn RootSum %d, got %d",
+				burnAmt, actualSum)
+		}
+
+		return nil
+	}
+	uniBurnReq := unirpc.FetchSupplyCommitRequest{
+		GroupKey: &unirpc.FetchSupplyCommitRequest_GroupKeyBytes{
+			GroupKeyBytes: groupKeyBytes,
+		},
+		Locator: &unirpc.FetchSupplyCommitRequest_SpentCommitOutpoint{
+			SpentCommitOutpoint: fetchResp.SpentCommitmentOutpoint,
+		},
+	}
+	uniBurnResp := rpcassert.FetchSupplyCommitRPC(
+		t.t, ctxb, t.universeServer.service, uniBurnPred, &uniBurnReq,
+	)
+	assertFetchCommitResponse(t, fetchResp, uniBurnResp)
+
 	t.Log("Fetching supply leaves for detailed verification")
 
 	// Fetch supply leaves to verify individual entries have all been
