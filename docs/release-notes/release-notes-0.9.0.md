@@ -241,6 +241,18 @@
 
 ## Functional Updates
 
+- The supply syncer retries universe dials and supply-commitment fetches
+  and inserts with capped exponential backoff (10 retries, 100ms
+  initial delay, doubling up to 5s) and stops when its context is
+  cancelled. A fetch that finds no commitment is not retried.
+  `FetchSupplyCommit` reports that miss as `NotFound`. When
+  `InsertSupplyCommit` rejects a commitment because the server has not
+  seen the spent supply commitment, it reports `FailedPrecondition`.
+  The syncer maps that status back to a typed error, inserts the missing
+  earlier commitments from local history oldest-first (at most 256),
+  and then retries the original insert
+  ([#1808](https://github.com/lightninglabs/taproot-assets/issues/1808)).
+
 - [PR#2278](https://github.com/lightninglabs/taproot-assets/pull/2278)
   derives the initial (height zero) commitment of an asset channel from
   the negotiated local and remote channel configs (dust limit, CSV
