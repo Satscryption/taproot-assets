@@ -609,6 +609,40 @@ func (v *Verifier) verifyIgnoreLeaf(ctx context.Context,
 	return nil
 }
 
+// checkBurnLeafInputs fails closed on embedded burn-input files that
+// are empty or that prove the same previous asset more than once.
+// Inputs that are absent entirely are left to proof verification,
+// which reports the missing witness prev ID.
+func checkBurnLeafInputs(burnProof *proof.Proof) error {
+	if len(burnProof.AdditionalInputs) == 0 {
+		return nil
+	}
+
+	seen := make(map[asset.PrevID]struct{}, len(burnProof.AdditionalInputs))
+	for idx := range burnProof.AdditionalInputs {
+		inputFile := &burnProof.AdditionalInputs[idx]
+		last, err := inputFile.LastProof()
+		if err != nil {
+			return fmt.Errorf("burn input %d: %w", idx, err)
+		}
+
+		prevID := asset.PrevID{
+			OutPoint: last.OutPoint(),
+			ID:       last.Asset.ID(),
+			ScriptKey: asset.ToSerialized(
+				last.Asset.ScriptKey.PubKey,
+			),
+		}
+		if _, ok := seen[prevID]; ok {
+			return fmt.Errorf("duplicate burn input %v",
+				prevID.OutPoint)
+		}
+		seen[prevID] = struct{}{}
+	}
+
+	return nil
+}
+
 // verifyBurnLeaf verifies a single burn leaf entry.
 func (v *Verifier) verifyBurnLeaf(ctx context.Context,
 	assetSpec asset.Specifier, burnEntry supplycommit.NewBurnEvent) error {
@@ -626,6 +660,18 @@ func (v *Verifier) verifyBurnLeaf(ctx context.Context,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to generate proof chain lookup: %w",
+			err)
+	}
+
+	// Reject embedded inputs that are unusable or repeated before
+	// proof verification. proof.Verify keeps the last file when two
+	// inputs resolve to the same prev ID, so a duplicate would
+	// otherwise hide a conflicting copy. A bare pre-fix leaf has no
+	// embedded inputs and falls through to the state-transition
+	// check, which still fails closed on the missing input.
+	err = checkBurnLeafInputs(burnProof)
+	if err != nil {
+		return fmt.Errorf("burn leaf proof failed verification: %w",
 			err)
 	}
 
