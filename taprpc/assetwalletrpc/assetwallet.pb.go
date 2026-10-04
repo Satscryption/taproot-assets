@@ -135,7 +135,9 @@ const (
 	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN CommitVirtualPsbtsStatus = 0
 	// The call has been claimed and has not yet recorded a final response.
 	// Leased outpoints are present only after funding has returned. A repeat
-	// of CommitVirtualPsbts will not fund again.
+	// of CommitVirtualPsbts does not fund again while the call is in progress
+	// or while lnd still holds its leases. After those leases expire, the
+	// same request funds again.
 	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_PENDING CommitVirtualPsbtsStatus = 1
 	// The call completed. Repeating CommitVirtualPsbts with the same request
 	// returns the stored response.
@@ -749,9 +751,10 @@ type CommitVirtualPsbtsRequest struct {
 	// outcome under this key. A later call with the same key and the same
 	// request returns that stored response and does not fund again. The same
 	// key with a different request is rejected. A repeat while the first call
-	// is still running, or before its outcome was recorded, is rejected; use
-	// GetCommitVirtualPsbtsStatus to read the lock ID and leased outpoints.
-	// If custom_lock_id is empty, tapd derives a 32-byte lock ID as
+	// is still running, or while lnd still holds its input leases, is
+	// rejected; use GetCommitVirtualPsbtsStatus to read the lock ID and
+	// leased outpoints. After those leases expire, the same request funds
+	// again. If custom_lock_id is empty, tapd derives a 32-byte lock ID as
 	// SHA-256(request_id) and uses that for the lnd lease.
 	RequestId     []byte `protobuf:"bytes,12,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
