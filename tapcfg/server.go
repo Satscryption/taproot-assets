@@ -717,6 +717,10 @@ func genServerConfig(ctx context.Context, cfg *Config,
 			StateLog:           supplyCommitStore,
 			ChainParams:        *tapChainParams.Params,
 			IgnoreCheckerCache: ignoreChecker,
+			IdleCommitInterval: cfg.Universe.
+				SupplyIdleCommitInterval,
+			AutoPublishPending: cfg.Universe.
+				SupplyAutoPublishPending,
 		},
 	)
 

@@ -322,6 +322,23 @@
   Nodes configured above 144 will refuse to start; lower the value
   before upgrading.
 
+- [#1781](https://github.com/lightninglabs/taproot-assets/issues/1781)
+  and [#1807](https://github.com/lightninglabs/taproot-assets/issues/1807):
+  adds `universe.supply-idle-commit-interval` (blocks, 0 disables,
+  default off) which makes the supply commitment state machine start an
+  empty successor once the latest confirmed commitment is that many
+  blocks old, inclusive of the due height, and
+  `universe.supply-auto-publish-pending` which publishes staged supply
+  updates on the next block. Both default off, so a manual
+  `UpdateSupplyCommit` is unchanged. The successor runs the normal
+  commitment cycle and is staked on the re-org watcher: it is not
+  finalized until buried, and a tick while it is in flight does not
+  publish a second one. With `supply-auto-publish-pending` enabled,
+  pending updates may be broadcast before a manual `UpdateSupplyCommit`
+  call; integration tests that assert an empty mempool immediately after
+  staging ignores (for example `supply_commit_ignore_asset`) assume
+  auto-publish is off.
+
 ## Code Health
 
 * [PR#2245](https://github.com/lightninglabs/taproot-assets/pull/2245)

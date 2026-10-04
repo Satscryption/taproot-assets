@@ -493,6 +493,12 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		args = append(args, "--experimental.rfq.sendpricehint")
 	}
 
+	// Optional extra tapd flags for integration test matrix runs (for
+	// example supply idle tick regression).
+	if extra := os.Getenv("ITEST_TAPD_EXTRA_ARGS"); extra != "" {
+		args = append(args, strings.Fields(extra)...)
+	}
+
 	// Compute the expected TLS cert path and macaroon path based on
 	// the tapd directory structure that the tapd process will create.
 	tlsCertPath := filepath.Join(cfg.BaseDir, "tls.cert")

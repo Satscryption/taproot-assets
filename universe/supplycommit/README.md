@@ -81,6 +81,18 @@ once the commitment transaction is buried, then nudges the machine, which
 re-derives its position from the durable record on the next `CommitTickEvent`
 and returns to the `DefaultState` or starts the next cycle.
 
+**Idle ticks:** when `universe.supply-idle-commit-interval` is non-zero, the
+manager sends an `IdleTickEvent{BlockHeight}` to the state machine of every
+locally controlled supply commitment on each new block. In `DefaultState`, if
+the latest commitment is confirmed and at least `interval` blocks old, the
+machine begins a frozen transition that spends the latest commitment (binding
+any dangling updates) and runs the normal commitment cycle, even with no
+updates. This keeps the on-chain commitment fresh. In `UpdatesPendingState` the
+event publishes staged updates when `universe.supply-auto-publish-pending` is
+set, or resumes an interrupted empty transition. A tick during an in-flight
+cycle, including while the commitment waits to be buried by the re-org
+watcher, is ignored, so that window cannot publish a second successor.
+
 ### States and Transitions
 
 ```mermaid
@@ -90,6 +102,7 @@ stateDiagram-v2
     [*] --> DefaultState: Initialize
 
     DefaultState --> UpdatesPendingState: SupplyUpdateEvent
+    DefaultState --> CommitTreeCreateState: IdleTickEvent (due)
     UpdatesPendingState --> CommitTreeCreateState: CommitTickEvent
     
     state CommitmentCycle {
