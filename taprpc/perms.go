@@ -127,6 +127,10 @@ var (
 			Entity: "assets",
 			Action: "write",
 		}},
+		"/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus": {{
+			Entity: "assets",
+			Action: "read",
+		}},
 		"/assetwalletrpc.AssetWallet/PublishAndLogTransfer": {{
 			Entity: "assets",
 			Action: "write",

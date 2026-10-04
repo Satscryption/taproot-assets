@@ -44,6 +44,17 @@ service AssetWallet {
         returns (CommitVirtualPsbtsResponse);
 
     /*
+    GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts
+    call made with a request_id. It says whether that call is still in
+    progress or completed, and lists the lnd lock ID and locked outpoints
+    recorded for it. An unknown request_id is reported as unknown rather
+    than an error. The funded PSBTs themselves are returned by repeating
+    CommitVirtualPsbts with the same request.
+    */
+    rpc GetCommitVirtualPsbtsStatus (GetCommitVirtualPsbtsStatusRequest)
+        returns (GetCommitVirtualPsbtsStatusResponse);
+
+    /*
     PublishAndLogTransfer accepts a fully committed and signed anchor
     transaction and publishes it to the Bitcoin network. It also logs the
     transfer of the given active and passive assets in the database and ships
@@ -393,6 +404,19 @@ message CommitVirtualPsbtsRequest {
     If unset, the daemon's default proof version is used.
     */
     TransitionProofVersion transition_proof_version = 11;
+
+    /*
+    Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the
+    RPC is unchanged and nothing is stored. When set, tapd records the
+    outcome under this key. A later call with the same key and the same
+    request returns that stored response and does not fund again. The same
+    key with a different request is rejected. A repeat while the first call
+    is still running, or before its outcome was recorded, is rejected; use
+    GetCommitVirtualPsbtsStatus to read the lock ID and leased outpoints.
+    If custom_lock_id is empty, tapd derives a 32-byte lock ID as
+    SHA-256(request_id) and uses that for the lnd lease.
+    */
+    bytes request_id = 12;
 }
 
 message CommitVirtualPsbtsResponse {
@@ -433,6 +457,53 @@ message CommitVirtualPsbtsResponse {
     inputs that were already present in the PSBT are not locked.
     */
     repeated taprpc.OutPoint lnd_locked_utxos = 6;
+}
+
+enum CommitVirtualPsbtsStatus {
+    /*
+    No CommitVirtualPsbts call with this request_id has been recorded.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN = 0;
+
+    /*
+    The call has been claimed and has not yet recorded a final response.
+    Leased outpoints are present only after funding has returned. A repeat
+    of CommitVirtualPsbts will not fund again.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_PENDING = 1;
+
+    /*
+    The call completed. Repeating CommitVirtualPsbts with the same request
+    returns the stored response.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED = 2;
+}
+
+message GetCommitVirtualPsbtsStatusRequest {
+    /*
+    The request_id passed to CommitVirtualPsbts. Required, 1 to 64 bytes.
+    */
+    bytes request_id = 1;
+}
+
+message GetCommitVirtualPsbtsStatusResponse {
+    /*
+    Whether the commit is unknown, still in progress, or completed.
+    */
+    CommitVirtualPsbtsStatus status = 1;
+
+    /*
+    The lnd lock ID for the leases, when known. This is the request's
+    custom_lock_id (or the ID derived from request_id) until funding
+    returns, then the lock ID reported by lnd.
+    */
+    bytes lock_id = 2;
+
+    /*
+    Outpoints leased for this commit. Empty until funding has returned.
+    Only inputs added by CommitVirtualPsbts are included.
+    */
+    repeated taprpc.OutPoint lnd_locked_utxos = 3;
 }
 
 message PublishAndLogRequest {
