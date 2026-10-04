@@ -278,6 +278,19 @@
   lets `CommitVirtualPsbts` select the transition proof version and adds
   BIP-371 tapscript sibling exclusion proofs for version 1 proofs.
 
+* [Issue #2208](https://github.com/lightninglabs/taproot-assets/issues/2208)
+  makes `PublishAndLogTransfer` safe to retry after a lost response.
+  The request takes an optional `request_id`. A repeat call whose final
+  anchor transaction is already logged returns that transfer and does
+  not insert a second `asset_transfers` row or publish the anchor
+  again. A logged transfer whose broadcast failed with a double spend
+  is not returned as a successful publish. Callers can also reconcile
+  with `ListTransfers` filtered by the anchor txid. Reusing a
+  `request_id` for a different anchor transaction is rejected while
+  that publish is in flight. The binding is process-local and in-flight only.
+  It is released when the publish completes or fails and is not kept
+  across a daemon restart.
+
 * [PR#2287](https://github.com/lightninglabs/taproot-assets/pull/2287)
   makes `RegisterTransfer` safe to retry. It previously failed with
   "proof already exists for this transfer" when the proof was already

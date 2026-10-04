@@ -448,6 +448,7 @@
     "/v1/taproot-assets/wallet/virtual-psbt/log-transfer": {
       "post": {
         "summary": "PublishAndLogTransfer accepts a fully committed and signed anchor\ntransaction and publishes it to the Bitcoin network. It also logs the\ntransfer of the given active and passive assets in the database and ships\nany outgoing proofs to the counterparties.",
+        "description": "The RPC is safe to retry after a lost response. A repeat call whose\nfinal anchor transaction is already logged returns that transfer as the\nSendAssetResponse and does not insert another asset_transfers row or\npublish the anchor again. Callers reconcile by retrying this RPC (with\nthe same request_id when they set one) or by calling ListTransfers with\nthe anchor txid. An empty request_id still reconciles by the anchor\ntransaction. A request_id must not be reused for a different anchor\ntransaction while that publish is in flight. The binding is\nprocess-local and in-flight only: it is released when the publish\ncompletes or fails, and it is not kept across a daemon restart.",
         "operationId": "AssetWallet_PublishAndLogTransfer",
         "responses": {
           "200": {
@@ -885,6 +886,11 @@
         "label": {
           "type": "string",
           "description": "An optional short label for the transfer. This label can be used to track\nthe progress of the transfer via the logs or an event subscription.\nMultiple transfers can share the same label."
+        },
+        "request_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "Optional caller-chosen idempotency key for this publish. A retry that\nrepeats the key with the same anchor transaction returns the transfer\nalready logged for that anchor. Reusing the key for a different anchor\ntransaction is rejected while that publish is in flight. The binding is\nprocess-local and in-flight only: it is released when the publish\ncompletes or fails and is not kept across a daemon restart. An empty\nkey still reconciles by the anchor transaction, so a lost response can\nbe retried safely."
         }
       }
     },
