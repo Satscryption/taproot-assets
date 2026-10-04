@@ -18,3 +18,14 @@ WHERE request_id = $1;
 -- name: DeleteCommitVirtualPsbt :exec
 DELETE FROM commit_virtual_psbt_idem
 WHERE request_id = $1;
+
+-- name: SwapCommitVirtualPsbt :execrows
+UPDATE commit_virtual_psbt_idem
+SET record = sqlc.arg('next_record')
+WHERE request_id = sqlc.arg('request_id')
+  AND record = sqlc.arg('expected_record');
+
+-- name: DeleteCommitVirtualPsbtIf :execrows
+DELETE FROM commit_virtual_psbt_idem
+WHERE request_id = sqlc.arg('request_id')
+  AND record = sqlc.arg('expected_record');

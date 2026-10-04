@@ -51,3 +51,46 @@ func TestCommitVirtualPsbtStoreRoundTrip(t *testing.T) {
 	err = store.UpdateCommitRecord(ctx, requestID, []byte("gone"))
 	require.ErrorIs(t, err, ErrNoCommitRecord)
 }
+
+// TestCommitVirtualPsbtStoreCompareAndSwap tests that a swap or
+// conditional delete changes the row only when the stored bytes still
+// match.
+func TestCommitVirtualPsbtStoreCompareAndSwap(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewCommitVirtualPsbtStoreFromDB(NewTestDB(t))
+	requestID := []byte("swap-id")
+	first := []byte("first")
+
+	require.NoError(t, store.InsertCommitRecord(ctx, requestID, first))
+
+	err := store.SwapCommitRecord(
+		ctx, requestID, []byte("other"), []byte("nope"),
+	)
+	require.ErrorIs(t, err, ErrCommitRecordChanged)
+
+	got, err := store.FetchCommitRecord(ctx, requestID)
+	require.NoError(t, err)
+	require.Equal(t, first, got)
+
+	next := []byte("second")
+	require.NoError(t, store.SwapCommitRecord(
+		ctx, requestID, first, next,
+	))
+
+	got, err = store.FetchCommitRecord(ctx, requestID)
+	require.NoError(t, err)
+	require.Equal(t, next, got)
+
+	err = store.DeleteCommitRecordIf(ctx, requestID, first)
+	require.ErrorIs(t, err, ErrCommitRecordChanged)
+
+	require.NoError(t, store.DeleteCommitRecordIf(ctx, requestID, next))
+
+	_, err = store.FetchCommitRecord(ctx, requestID)
+	require.ErrorIs(t, err, ErrNoCommitRecord)
+
+	err = store.DeleteCommitRecordIf(ctx, requestID, next)
+	require.ErrorIs(t, err, ErrNoCommitRecord)
+}

@@ -19,6 +19,25 @@ func (q *Queries) DeleteCommitVirtualPsbt(ctx context.Context, requestID []byte)
 	return err
 }
 
+const DeleteCommitVirtualPsbtIf = `-- name: DeleteCommitVirtualPsbtIf :execrows
+DELETE FROM commit_virtual_psbt_idem
+WHERE request_id = $1
+  AND record = $2
+`
+
+type DeleteCommitVirtualPsbtIfParams struct {
+	RequestID      []byte
+	ExpectedRecord []byte
+}
+
+func (q *Queries) DeleteCommitVirtualPsbtIf(ctx context.Context, arg DeleteCommitVirtualPsbtIfParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, DeleteCommitVirtualPsbtIf, arg.RequestID, arg.ExpectedRecord)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const FetchCommitVirtualPsbt = `-- name: FetchCommitVirtualPsbt :one
 SELECT record
 FROM commit_virtual_psbt_idem
@@ -48,6 +67,27 @@ type InsertCommitVirtualPsbtParams struct {
 func (q *Queries) InsertCommitVirtualPsbt(ctx context.Context, arg InsertCommitVirtualPsbtParams) error {
 	_, err := q.db.ExecContext(ctx, InsertCommitVirtualPsbt, arg.RequestID, arg.Record)
 	return err
+}
+
+const SwapCommitVirtualPsbt = `-- name: SwapCommitVirtualPsbt :execrows
+UPDATE commit_virtual_psbt_idem
+SET record = $1
+WHERE request_id = $2
+  AND record = $3
+`
+
+type SwapCommitVirtualPsbtParams struct {
+	NextRecord     []byte
+	RequestID      []byte
+	ExpectedRecord []byte
+}
+
+func (q *Queries) SwapCommitVirtualPsbt(ctx context.Context, arg SwapCommitVirtualPsbtParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, SwapCommitVirtualPsbt, arg.NextRecord, arg.RequestID, arg.ExpectedRecord)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const UpdateCommitVirtualPsbt = `-- name: UpdateCommitVirtualPsbt :execrows

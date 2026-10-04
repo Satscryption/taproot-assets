@@ -102,6 +102,7 @@ type Querier interface {
 	DeleteAuxCloseInfo(ctx context.Context, chanPoint []byte) error
 	DeleteBurnsByTransferID(ctx context.Context, transferID int64) error
 	DeleteCommitVirtualPsbt(ctx context.Context, requestID []byte) error
+	DeleteCommitVirtualPsbtIf(ctx context.Context, arg DeleteCommitVirtualPsbtIfParams) (int64, error)
 	DeleteExpiredUTXOLeases(ctx context.Context, now sql.NullTime) error
 	DeleteFederationProofSyncLog(ctx context.Context, arg DeleteFederationProofSyncLogParams) error
 	DeleteManagedUTXO(ctx context.Context, outpoint []byte) error
@@ -553,6 +554,7 @@ type Querier interface {
 	// buried foreign transaction — so reviving it would resume a transfer
 	// whose anchor can never confirm.
 	SupersededTransfersSpendingPoint(ctx context.Context, arg SupersededTransfersSpendingPointParams) ([]int64, error)
+	SwapCommitVirtualPsbt(ctx context.Context, arg SwapCommitVirtualPsbtParams) (int64, error)
 	// The asset row a transfer output materialized into, if any: the
 	// convergence guard for re-applying a confirmation, and the target
 	// of compensation when the transfer is abandoned. The genesis filter

@@ -13,6 +13,12 @@ import (
 // record exists for the requested key.
 var ErrNoCommitRecord = errors.New("commit idempotency record not found")
 
+// ErrCommitRecordChanged is returned when a compare-and-swap does not
+// find the expected record bytes. The caller must re-read the row.
+var ErrCommitRecordChanged = errors.New(
+	"commit idempotency record changed",
+)
+
 // CommitVirtualPsbtQueries is the subset of sqlc methods that manage the
 // commit_virtual_psbt_idem table.
 type CommitVirtualPsbtQueries interface {
@@ -26,6 +32,12 @@ type CommitVirtualPsbtQueries interface {
 		arg sqlc.UpdateCommitVirtualPsbtParams) (int64, error)
 
 	DeleteCommitVirtualPsbt(ctx context.Context, requestID []byte) error
+
+	SwapCommitVirtualPsbt(ctx context.Context,
+		arg sqlc.SwapCommitVirtualPsbtParams) (int64, error)
+
+	DeleteCommitVirtualPsbtIf(ctx context.Context,
+		arg sqlc.DeleteCommitVirtualPsbtIfParams) (int64, error)
 }
 
 // BatchedCommitVirtualPsbtStore is the transactional surface for commit
@@ -163,4 +175,76 @@ func (s *CommitVirtualPsbtStore) DeleteCommitRecord(ctx context.Context,
 			return q.DeleteCommitVirtualPsbt(ctx, requestID)
 		},
 	)
+}
+
+// SwapCommitRecord replaces the stored record when it still equals
+// expected. ErrCommitRecordChanged is returned when it does not, and
+// ErrNoCommitRecord when the key is absent.
+func (s *CommitVirtualPsbtStore) SwapCommitRecord(ctx context.Context,
+	requestID, expected, next []byte) error {
+
+	return s.db.ExecTx(
+		ctx, WriteTxOption(), func(q CommitVirtualPsbtQueries) error {
+			n, err := q.SwapCommitVirtualPsbt(
+				ctx, sqlc.SwapCommitVirtualPsbtParams{
+					NextRecord:     next,
+					RequestID:      requestID,
+					ExpectedRecord: expected,
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("swap commit record: %w",
+					err)
+			}
+			if n == 1 {
+				return nil
+			}
+
+			return commitRecordMiss(ctx, q, requestID)
+		},
+	)
+}
+
+// DeleteCommitRecordIf removes the row when it still equals expected.
+// ErrCommitRecordChanged is returned when it does not, and
+// ErrNoCommitRecord when the key is absent.
+func (s *CommitVirtualPsbtStore) DeleteCommitRecordIf(ctx context.Context,
+	requestID, expected []byte) error {
+
+	return s.db.ExecTx(
+		ctx, WriteTxOption(), func(q CommitVirtualPsbtQueries) error {
+			n, err := q.DeleteCommitVirtualPsbtIf(
+				ctx, sqlc.DeleteCommitVirtualPsbtIfParams{
+					RequestID:      requestID,
+					ExpectedRecord: expected,
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("delete commit record: %w",
+					err)
+			}
+			if n == 1 {
+				return nil
+			}
+
+			return commitRecordMiss(ctx, q, requestID)
+		},
+	)
+}
+
+// commitRecordMiss explains a compare-and-swap that matched no row.
+func commitRecordMiss(ctx context.Context, q CommitVirtualPsbtQueries,
+	requestID []byte) error {
+
+	_, err := q.FetchCommitVirtualPsbt(ctx, requestID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrNoCommitRecord
+
+	case err != nil:
+		return fmt.Errorf("fetch commit record: %w", err)
+
+	default:
+		return ErrCommitRecordChanged
+	}
 }

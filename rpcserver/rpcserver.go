@@ -23,11 +23,11 @@ import (
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/btcutil/psbt"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/psbt/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -47,10 +47,13 @@ import (
 	"github.com/lightninglabs/taproot-assets/rpcutils"
 	"github.com/lightninglabs/taproot-assets/tapchannel"
 	"github.com/lightninglabs/taproot-assets/tapconfig"
+	"github.com/lightninglabs/taproot-assets/tapcustody"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	wrpc "github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
@@ -84,6 +87,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -126,12 +130,6 @@ const (
 	// the whole payment if only one of the peers is taking too long to
 	// respond.
 	multiRfqNegotiationTimeout = time.Second * 8
-
-	// leaseReleaseTimeout is the upper bound for the compensating release
-	// of lnd wallet leases (UTXO locks) after a failed request. The release
-	// must not depend on the lifecycle of the request context, but it must
-	// still be bounded so a stuck lnd can't hang the handler forever.
-	leaseReleaseTimeout = time.Second * 30
 
 	// fetchTimeout is a generic timeout to use when fetching data from
 	// the database during any RPC calls that don't have a parent context.
@@ -965,7 +963,7 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 		return nil, err
 	}
 
-	fundBatchResp, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
+	verboseBatch, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
 		FeeRate:        feeRateOpt,
 		SiblingTapTree: tapTreeOpt,
 	})
@@ -974,12 +972,12 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 	}
 
 	// If there was no batch to fund, return an empty response.
-	if fundBatchResp.Batch == nil {
+	if verboseBatch == nil {
 		return &mintrpc.FundBatchResponse{}, nil
 	}
 
 	rpcBatch, err := marshalVerboseBatch(
-		*r.cfg.ChainParams.Params, fundBatchResp.Batch,
+		*r.cfg.ChainParams.Params, verboseBatch,
 		!req.ShortResponse, req.ShortResponse,
 	)
 	if err != nil {
@@ -1834,6 +1832,105 @@ func (r *RPCServer) ListTransfers(ctx context.Context,
 	return resp, nil
 }
 
+const (
+	// defaultAnchoringPageSize is the ListAnchorings page size used
+	// when the request leaves the limit unset.
+	defaultAnchoringPageSize = 100
+
+	// maxAnchoringPageSize caps the ListAnchorings page size. The
+	// anchoring table is never pruned, so the listing is always
+	// paged rather than offered unbounded.
+	maxAnchoringPageSize = 1000
+)
+
+// ListAnchorings lists one page of the re-org watcher's speculative
+// anchorings: everything the daemon has staked on chain outcomes, the
+// phase the chain has assigned to each stake, and the delivery state
+// of the owning subsystem. Filters and page bounds are applied by the
+// registry query itself.
+func (r *RPCServer) ListAnchorings(ctx context.Context,
+	req *taprpc.ListAnchoringsRequest) (*taprpc.ListAnchoringsResponse,
+	error) {
+
+	if r.cfg.AnchoringRegistry == nil {
+		return nil, fmt.Errorf("anchoring registry not available")
+	}
+
+	query := tapdb.AnchoringQuery{
+		Site:      req.Site,
+		StuckOnly: req.StuckOnly,
+		Limit:     defaultAnchoringPageSize,
+		Offset:    req.Offset,
+	}
+	switch {
+	case req.Limit < 0 || req.Offset < 0:
+		return nil, fmt.Errorf("limit and offset must not be " +
+			"negative")
+
+	case req.Limit > maxAnchoringPageSize:
+		return nil, fmt.Errorf("limit %d exceeds the maximum "+
+			"page size %d", req.Limit, maxAnchoringPageSize)
+
+	case req.Limit > 0:
+		query.Limit = req.Limit
+	}
+	if req.Phase != "" {
+		code, err := tapreorg.PhaseCodeFromName(req.Phase)
+		if err != nil {
+			return nil, err
+		}
+		query.Phase = fn.Some(code)
+	}
+
+	anchorings, err := r.cfg.AnchoringRegistry.QueryAnchorings(
+		ctx, query,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to list anchorings: %w", err)
+	}
+
+	resp := &taprpc.ListAnchoringsResponse{}
+	for _, anchoring := range anchorings {
+		resp.Anchorings = append(
+			resp.Anchorings, marshalAnchoring(anchoring),
+		)
+	}
+
+	return resp, nil
+}
+
+// marshalAnchoring renders an anchoring summary for the RPC surface.
+// The phase fields carry the stable phase names — the same vocabulary
+// the request's phase filter takes — with the evidence renderings in
+// the detail fields alongside.
+func marshalAnchoring(summary tapdb.AnchoringSummary) *taprpc.Anchoring {
+	// The error column also holds transient text while delivery
+	// retries below the stuck threshold; it surfaces as the stuck
+	// reason only once the flag is set.
+	var stuckReason string
+	if summary.Stuck {
+		stuckReason = summary.LastDeliveryError
+	}
+
+	return &taprpc.Anchoring{
+		Id:                   int64(summary.ID),
+		Site:                 string(summary.Site),
+		Phase:                summary.Phase.String(),
+		PhaseDetail:          summary.PhaseDetail,
+		DeliveredPhase:       summary.Delivered.String(),
+		DeliveredPhaseDetail: summary.DeliveredDetail,
+		Threshold:            summary.Threshold,
+		CreatedHeight:        summary.CreatedHeight,
+		Stuck:                summary.Stuck,
+		StuckReason:          stuckReason,
+		DeliveryAttempts:     summary.DeliveryAttempts,
+		WitnessTxid:          summary.WitnessTxid,
+		NumCandidates:        summary.NumCandidates,
+		LastDeliveryError:    summary.LastDeliveryError,
+		TerminalAt:           summary.TerminalAt,
+	}
+}
+
 // QueryAddrs queries the set of Taproot Asset addresses stored in the database.
 func (r *RPCServer) QueryAddrs(ctx context.Context,
 	req *taprpc.QueryAddrRequest) (*taprpc.QueryAddrResponse, error) {
@@ -2106,22 +2203,22 @@ func (r *RPCServer) NewAddr(ctx context.Context,
 
 	waitCtx, waitCancel := context.WithTimeout(ctx, addrImportTimeout)
 	defer waitCancel()
-	status, err := tapgarden.WaitForAddrImport(waitCtx, importSub, addrStr)
+	status, err := tapcustody.WaitForAddrImport(waitCtx, importSub, addrStr)
 	if err != nil {
 		return nil, fmt.Errorf("waiting for addr import: %w", err)
 	}
 
 	switch status {
 	// The custodian imported the address successfully; continue.
-	case tapgarden.AddrImportStatusSuccess:
+	case tapcustody.AddrImportStatusSuccess:
 
 	// We timed out or were canceled; the import outcome is unknown.
-	case tapgarden.AddrImportStatusUndefined:
+	case tapcustody.AddrImportStatusUndefined:
 		return nil, fmt.Errorf("address import status unknown, " +
 			"check logs")
 
 	// An error event was seen; it is already wrapped above.
-	case tapgarden.AddrImportStatusError:
+	case tapcustody.AddrImportStatusError:
 		return nil, fmt.Errorf("address import failed")
 	}
 
@@ -2541,10 +2638,10 @@ func (r *RPCServer) ImportProof(ctx context.Context,
 		return nil, fmt.Errorf("error extracting last proof: %w", err)
 	}
 
-	// Now that we know the proof file is at least present, we'll attempt
-	// to import it into the main archive.
-	err = r.cfg.ProofArchive.ImportProofs(
-		ctx, r.ProofVerifierCtx(ctx), false, &proof.AnnotatedProof{
+	// Import through the custody boundary so the asset and all young
+	// transactions in its provenance are staked atomically.
+	err = r.cfg.AssetCustodian.StakeReceive(
+		ctx, &proof.AnnotatedProof{
 			Locator: proof.Locator{
 				AssetID:   fn.Ptr(lastProof.Asset.ID()),
 				ScriptKey: *lastProof.Asset.ScriptKey.PubKey,
@@ -3178,15 +3275,36 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 		)
 
 		// From now on, if we error out, we need to make sure we unlock
-		// the UTXOs that lnd just locked for us.
+		// the UTXOs that lnd just locked for us. A release that
+		// fails leaves the pending idempotency row in place. A
+		// replaced attempt must not unlock outputs a newer attempt
+		// may already have leased under the same lock ID.
 		defer func() {
 			if success {
 				return
 			}
+			if hooks != nil && hooks.attemptReplaced {
+				hooks.retainPending = true
 
-			releaseLeasedOutputs(
-				ctx, lndWallet, lockedUTXO, lockedOutpoints,
-			)
+				return
+			}
+
+			var releaseErr error
+			for idx, utxo := range lockedUTXO {
+				var lockID wtxmgr.LockID
+				copy(lockID[:], utxo.Id)
+
+				op := lockedOutpoints[idx]
+				err := lndWallet.ReleaseOutput(ctx, lockID, op)
+				if err != nil {
+					rpcsLog.Errorf("Error unlocking lnd "+
+						"UTXO %v: %v", op, err)
+					releaseErr = err
+				}
+			}
+			if releaseErr != nil && hooks != nil {
+				hooks.retainPending = true
+			}
 		}()
 
 		// Persist the leases before any later error can return
@@ -3197,6 +3315,7 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 					lockedUTXO, req.CustomLockId,
 				),
 				outpointsFromWire(lockedOutpoints),
+				earliestUtxoLeaseExpiry(lockedUTXO),
 			)
 			if err != nil {
 				return nil, fmt.Errorf("recording funded "+
@@ -3205,24 +3324,9 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 		}
 	}
 
-	// lnd's coin selection ignores the boolean value of the "add" change
-	// output option (see taproot-assets#2209), so if the caller explicitly
-	// asked for no new change output we must verify the funded packet
-	// ourselves and fail closed (the deferred cleanup above releases the
-	// leases lnd just took). skip_funding never reaches lnd, so it is
-	// left unchanged.
-	if noNewAnchorChangeRequested(req) {
-		err := checkNoNewAnchorChange(pkt, fundedPacket, changeIndex)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// We can now update the anchor outputs as we have the final
 	// commitments.
-	outputCommitments, err := tapsend.CreateOutputCommitments(
-		allPackets, tapsend.WithSpenderLeaves(),
-	)
+	outputCommitments, err := tapsend.CreateOutputCommitments(allPackets)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create new output "+
 			"commitments: %w", err)
@@ -3444,14 +3548,6 @@ func (r *RPCServer) validateInputAssets(ctx context.Context,
 		return fmt.Errorf("error validating anchor inputs: %w", err)
 	}
 
-	// The witness of a split only signs the split commitment root, so we
-	// make sure each split root asset is the one its split tree commits
-	// to. Otherwise a split root could be changed after signing, for
-	// example to point to another script key at the same amount.
-	if err := tapsend.ValidateSplitRootLocators(vPackets); err != nil {
-		return fmt.Errorf("error validating split roots: %w", err)
-	}
-
 	// Now that we know the packet inputs match the anchored assets, we can
 	// also check that we don't inflate or deflate the asset supply with the
 	// active and passive assets. We explicitly don't look at the pruned
@@ -3485,11 +3581,6 @@ func (r *RPCServer) validateInputAssets(ctx context.Context,
 // and publishes it to the Bitcoin network. It also logs the transfer of the
 // given active and passive assets in the database and ships any outgoing proofs
 // to the counterparties.
-//
-// A repeat call for an anchor that was published returns that transfer
-// and does not log or publish it again. A transfer whose broadcast
-// failed with a double spend is not a successful publish; that failure
-// is returned instead of the logged row.
 func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 	req *wrpc.PublishAndLogRequest) (*taprpc.SendAssetResponse, error) {
 
@@ -3513,8 +3604,21 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
+	// Before we commit the transaction to the database, we want to make
+	// sure everything is in order. We start by validating the inputs.
 	allPackets := append([]*tappsbt.VPacket{}, activePackets...)
 	allPackets = append(allPackets, passivePackets...)
+	err = r.validateInputAssets(ctx, pkt, allPackets)
+	if err != nil {
+		return nil, fmt.Errorf("error validating input assets: %w", err)
+	}
+
+	// And then the outputs as well.
+	err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
+	if err != nil {
+		return nil, fmt.Errorf("error validating anchor outputs: %w",
+			err)
+	}
 
 	chainFees, err := pkt.GetTxFee()
 	if err != nil {
@@ -3522,38 +3626,12 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
-	// Extract the final transaction before input validation. A retry of
-	// an already-logged anchor must be reconciled even when those inputs
-	// are now leased or spent, which would fail validation.
+	// The BTC level transaction must be fully complete, and we must be able
+	// to extract the final transaction from it.
 	finalTx, err := psbt.Extract(pkt)
 	if err != nil {
 		return nil, fmt.Errorf("error extracting final anchor "+
 			"transaction: %w", err)
-	}
-
-	anchorHash := finalTx.TxHash()
-	logged, err := r.cfg.ChainPorter.QueryParcels(
-		ctx, fn.Some(anchorHash), false,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error querying logged transfer: %w",
-			err)
-	}
-
-	// Nothing is logged yet, so this is the first publish. Validate
-	// before the porter writes the transfer.
-	if len(logged) == 0 {
-		err = r.validateInputAssets(ctx, pkt, allPackets)
-		if err != nil {
-			return nil, fmt.Errorf("error validating input "+
-				"assets: %w", err)
-		}
-
-		err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
-		if err != nil {
-			return nil, fmt.Errorf("error validating anchor "+
-				"outputs: %w", err)
-		}
 	}
 
 	anchorTx := &tapsend.AnchorTransaction{
@@ -3585,17 +3663,18 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 		parcelLabel = req.Label
 	}
 
-	// Ship the pre-anchored parcel. When this anchor is already logged,
-	// the porter returns that transfer and does not publish it again.
-	// Otherwise it logs the transfer, publishes, and ships proofs.
-	preAnchored := tapfreighter.NewPreAnchoredParcel(
-		activePackets, passivePackets, anchorTx,
-		req.SkipAnchorTxBroadcast, parcelLabel,
-		fn.None[uint32](),
+	// We now have everything to ship the pre-anchored parcel using the
+	// freighter. This will publish the TX, create the transfer database
+	// entries and ship the proofs to the counterparties. It'll also wait
+	// for a confirmation and then update the proofs with the block header
+	// information.
+	resp, err := r.cfg.ChainPorter.RequestShipment(
+		tapfreighter.NewPreAnchoredParcel(
+			activePackets, passivePackets, anchorTx,
+			req.SkipAnchorTxBroadcast, parcelLabel,
+			fn.None[uint32](),
+		),
 	)
-	preAnchored.SetRequestID(req.GetRequestId())
-
-	resp, err := r.cfg.ChainPorter.RequestShipment(preAnchored)
 	if err != nil {
 		return nil, fmt.Errorf("error requesting delivery: %w", err)
 	}
@@ -4873,7 +4952,8 @@ func (r *RPCServer) FetchSupplyCommit(ctx context.Context,
 		ctx, assetSpec, locator,
 	)
 	if err != nil {
-		return nil, fetchSupplyCommitStatus(err)
+		return nil, fmt.Errorf("failed to fetch supply commit: %w",
+			err)
 	}
 	rootCommit := commit.Commitment
 
@@ -5513,7 +5593,8 @@ func (r *RPCServer) InsertSupplyCommit(ctx context.Context,
 		ctx, assetSpec, *rootCommitment, *supplyLeaves,
 	)
 	if err != nil {
-		return nil, insertSupplyCommitStatus(err)
+		return nil, fmt.Errorf("failed to insert supply commitment: %w",
+			err)
 	}
 
 	return &unirpc.InsertSupplyCommitResponse{}, nil
@@ -5554,7 +5635,7 @@ func (r *RPCServer) SubscribeReceiveAssetEventNtfns(
 		case *proof.BackoffWaitEvent:
 			return true, nil
 
-		case *tapgarden.AssetReceiveEvent:
+		case *tapcustody.AssetReceiveEvent:
 			return e.Status == address.StatusCompleted, nil
 
 		default:
@@ -5602,7 +5683,7 @@ func (r *RPCServer) SubscribeReceiveEvents(
 	}
 
 	marshaler := func(event fn.Event) (*taprpc.ReceiveEvent, error) {
-		e, ok := event.(*tapgarden.AssetReceiveEvent)
+		e, ok := event.(*tapcustody.AssetReceiveEvent)
 		if !ok {
 			return nil, fmt.Errorf("invalid event type: %T", event)
 		}
@@ -5640,7 +5721,7 @@ func (r *RPCServer) SubscribeReceiveEvents(
 		)
 
 		switch e := event.(type) {
-		case *tapgarden.AssetReceiveEvent:
+		case *tapcustody.AssetReceiveEvent:
 			eventAddrString, err = e.Address.EncodeAddress()
 			if err != nil {
 				return false, fmt.Errorf("error encoding "+
@@ -5848,7 +5929,7 @@ func (r *RPCServer) SubscribeMintEvents(req *mintrpc.SubscribeMintEventsRequest,
 			return nil, fmt.Errorf("invalid event type: %T", event)
 		}
 
-		rpcState, err := marshalBatchState(e.BatchState)
+		rpcState, err := marshalBatchState(e.Batch.State())
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling batch state: "+
 				"%w", err)
@@ -6003,7 +6084,7 @@ func marshallReceiveAssetEvent(event fn.Event,
 			},
 		}, nil
 
-	case *tapgarden.AssetReceiveEvent:
+	case *tapcustody.AssetReceiveEvent:
 		rpcAddr, err := marshalAddr(&e.Address, db)
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling addr: %w", err)
@@ -6390,14 +6471,14 @@ func marshalUnsealedSeedling(params chaincfg.Params, verbose bool,
 
 	if verbose && seedling.PendingAssetGroup != nil {
 		groupVirtualTx, err = rpcutils.MarshalGroupVirtualTx(
-			&seedling.PendingAssetGroup.GroupVirtualTx,
+			&seedling.PendingAssetGroup.VirtualTx,
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		groupReq, err = rpcutils.MarshalGroupKeyRequest(
-			&seedling.PendingAssetGroup.GroupKeyRequest,
+			&seedling.PendingAssetGroup.KeyRequest,
 		)
 		if err != nil {
 			return nil, err
@@ -7348,7 +7429,7 @@ func (r *RPCServer) AssetLeafKeys(ctx context.Context,
 		limit = universe.RequestPageSize
 	}
 
-	leafKeys, err := r.cfg.UniverseArchive.UniverseLeafKeys(
+	leafEntries, err := r.cfg.UniverseArchive.UniverseLeafKeys(
 		ctx, universe.UniverseLeafKeysQuery{
 			Id:            universeID,
 			SortDirection: unmarshalUniSortDirection(req.Direction),
@@ -7362,18 +7443,30 @@ func (r *RPCServer) AssetLeafKeys(ctx context.Context,
 			universeID.StringForLog(), req.Offset, limit, err)
 	}
 
-	hasMore := int32(len(leafKeys)) > limit
+	hasMore := int32(len(leafEntries)) > limit
 	if hasMore {
-		leafKeys = leafKeys[:limit]
+		leafEntries = leafEntries[:limit]
 	}
 
+	// Populate both the legacy `asset_keys` field and the new
+	// `entries` field. Old clients read `asset_keys`; new clients
+	// prefer `entries` and use its leaf_node_hash to diff on
+	// content.
 	resp := &unirpc.AssetLeafKeyResponse{
-		AssetKeys: make([]*unirpc.AssetKey, len(leafKeys)),
+		AssetKeys: make([]*unirpc.AssetKey, len(leafEntries)),
+		Entries:   make([]*unirpc.AssetLeafEntry, len(leafEntries)),
 		HasMore:   hasMore,
 	}
 
-	for i, leafKey := range leafKeys {
-		resp.AssetKeys[i] = marshalLeafKey(leafKey)
+	for i, entry := range leafEntries {
+		assetKey := marshalLeafKey(entry.Key)
+		resp.AssetKeys[i] = assetKey
+
+		rpcEntry := &unirpc.AssetLeafEntry{AssetKey: assetKey}
+		entry.NodeHash.WhenSome(func(h mssmt.NodeHash) {
+			rpcEntry.LeafNodeHash = h[:]
+		})
+		resp.Entries[i] = rpcEntry
 	}
 
 	return resp, nil
@@ -7712,6 +7805,18 @@ func (r *RPCServer) QueryProof(ctx context.Context,
 
 	firstProof, err := r.queryProof(ctx, universeID, leafKey)
 	if err != nil {
+		// Transient contention on the universe — concurrent inserts
+		// holding the read-inconsistency window open — is reported
+		// as Unavailable, so sync clients know to simply retry
+		// rather than treating the proof as unservable.
+		if errors.Is(err, tapdb.ErrMultiverseInconsistent) {
+			return nil, status.Errorf(codes.Unavailable,
+				"universe %v busy, retry query "+
+					"(leaf_key=%x): %v",
+				universeID.StringForLog(),
+				leafKey.UniverseKey(), err)
+		}
+
 		// A leaf the universe doesn't hold is a normal outcome of a
 		// well-formed query: receivers poll for transfer proofs
 		// before the sender has uploaded them. Report it as
@@ -8301,6 +8406,162 @@ func (r *RPCServer) SyncUniverse(ctx context.Context,
 	return r.marshalUniverseDiff(ctx, universeDiff)
 }
 
+// syncDeltaByteBudget caps the marshalled payload size of a single
+// SyncDelta response page, keeping it comfortably under the default
+// 4 MiB gRPC message size limit. A variable rather than a constant so
+// tests can exercise the page-splitting path with small payloads.
+var syncDeltaByteBudget = 3 * 1024 * 1024
+
+// SyncDelta returns the universe leaves inserted on this server after the
+// given sequence number, in insertion order, together with the current
+// roots of the universes the delta touches. Leaves of universes with
+// proof export disabled are omitted from the response but still advance
+// latest_seq: the sequence is a position in this server's insertion log,
+// not a count of exported items.
+func (r *RPCServer) SyncDelta(ctx context.Context,
+	req *unirpc.SyncDeltaRequest) (*unirpc.SyncDeltaResponse, error) {
+
+	pageSize := req.PageSize
+	switch {
+	case pageSize == 0:
+		pageSize = universe.RequestPageSize
+
+	case pageSize < 0:
+		return nil, fmt.Errorf("invalid page size %d", pageSize)
+
+	case pageSize > universe.MaxPageSize:
+		return nil, fmt.Errorf("page size %d exceeds maximum %d",
+			pageSize, universe.MaxPageSize)
+	}
+
+	// Obtain the export gating config once for the whole page.
+	globalConfigs, uniSyncConfigs, err :=
+		r.cfg.FederationDB.QueryFederationSyncConfigs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query federation sync configs: %w",
+			err)
+	}
+	syncConfigs := universe.SyncConfigs{
+		GlobalSyncConfigs: globalConfigs,
+		UniSyncConfigs:    uniSyncConfigs,
+	}
+
+	// A delta page is a single request that can carry many proofs, so we
+	// wait on the proof query rate limiter once per request rather than
+	// once per item.
+	if err := r.proofQueryRateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
+	// The whole page — leaves, inclusion proofs, and universe roots —
+	// is assembled in a single storage snapshot, so a write landing
+	// mid-request can never yield proofs that fail to verify against
+	// the roots reported alongside them.
+	page, err := r.cfg.UniverseArchive.SyncDelta(
+		ctx, req.SinceSeq, pageSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fetch delta page since seq=%d: %w",
+			req.SinceSeq, err)
+	}
+
+	resp := &unirpc.SyncDeltaResponse{
+		LatestSeq: req.SinceSeq,
+	}
+
+	// An empty page reports the committed journal tail: equal to
+	// since_seq for a caught-up caller, and strictly below it when the
+	// caller's cursor lies beyond this journal — the signal it uses to
+	// detect that the journal has been rewound or replaced.
+	if len(page.Items) == 0 {
+		resp.LatestSeq = page.LatestSeq
+	}
+
+	var (
+		bytesUsed int
+		rootsSeen = make(map[universe.IdentifierKey]struct{})
+	)
+
+	for i := range page.Items {
+		item := page.Items[i]
+
+		// Universes with export disabled are omitted, but their
+		// leaves still advance the cursor.
+		if !syncConfigs.IsSyncExportEnabled(item.ID) {
+			resp.LatestSeq = item.Seq
+			continue
+		}
+
+		inclusionProof, err := marshalMssmtProof(item.InclusionProof)
+		if err != nil {
+			return nil, err
+		}
+
+		decDisplay, err := r.cfg.AddrBook.DecDisplayForAssetID(
+			ctx, item.Leaf.ID(),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		assetLeaf, err := r.marshalAssetLeaf(
+			ctx, item.Leaf, decDisplay,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		uniID, err := MarshalUniID(item.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		rpcItem := &unirpc.SyncDeltaItem{
+			UniverseId:             uniID,
+			Key:                    marshalLeafKey(item.Key),
+			Leaf:                   assetLeaf,
+			UniverseInclusionProof: inclusionProof,
+			Seq:                    item.Seq,
+		}
+
+		// Stop before this item if it would push the page past the
+		// response byte budget; latest_seq then points at the last
+		// included item and the caller simply pages again. The size
+		// is the exact marshalled size, measured after assembly, so
+		// only the single item that crosses the budget is assembled
+		// in vain.
+		itemSize := proto.Size(rpcItem)
+		if len(resp.Items) > 0 &&
+			bytesUsed+itemSize > syncDeltaByteBudget {
+
+			break
+		}
+
+		resp.Items = append(resp.Items, rpcItem)
+		bytesUsed += itemSize
+		resp.LatestSeq = item.Seq
+
+		// Include this universe's root once per page, counting it
+		// against the budget alongside the items.
+		idKey := item.ID.Key()
+		if _, ok := rootsSeen[idKey]; !ok {
+			rootsSeen[idKey] = struct{}{}
+
+			uniRoot, err := marshalUniverseRoot(page.Roots[idKey])
+			if err != nil {
+				return nil, err
+			}
+
+			resp.UniverseRoots = append(
+				resp.UniverseRoots, uniRoot,
+			)
+			bytesUsed += proto.Size(uniRoot)
+		}
+	}
+
+	return resp, nil
+}
+
 func marshalUniverseServer(
 	server universe.ServerAddr) *unirpc.UniverseFederationServer {
 
@@ -8391,6 +8652,14 @@ func (r *RPCServer) DeleteFederationServer(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf(""+
 			"remove %d server(s): %w", len(serversToDel), err)
+	}
+
+	// Evict any pooled outbound connections to the removed servers
+	// so they don't linger until shutdown.
+	if r.cfg.UniverseConnPool != nil {
+		for _, addr := range serversToDel {
+			r.cfg.UniverseConnPool.Evict(addr)
+		}
 	}
 
 	return &unirpc.DeleteFederationServerResponse{}, nil
@@ -12191,6 +12460,12 @@ func (r *RPCServer) DecodeAssetPayReq(ctx context.Context,
 // local universe (e.g. through the use of the universerpc.InsertProof RPC or
 // the universe proof courier and universe sync mechanisms) and this call
 // simply instructs the daemon to detect the transfer as an asset it owns.
+//
+// Recovery invariant. The RPC is caller-driven; a crash between the archive
+// import and the anchoring registration is recovered by the caller retrying.
+// Both ImportProofs (idempotent via archive locator dedupe) and
+// RegisterReceiveAnchoring (idempotent via the anchoring registry's
+// (site, match_key) unique index) tolerate the repeat cleanly.
 func (r *RPCServer) RegisterTransfer(ctx context.Context,
 	req *taprpc.RegisterTransferRequest) (*taprpc.RegisterTransferResponse,
 	error) {
@@ -12266,18 +12541,6 @@ func (r *RPCServer) RegisterTransfer(ctx context.Context,
 			"belong to this node: %w", err)
 	}
 
-	// Next, we make sure we don't already have this proof in the local
-	// archive (only in the universe). If we have, it means the user already
-	// imported it, and we don't want to overwrite it.
-	haveProof, err := r.cfg.ProofArchive.HasProof(ctx, locator)
-	if err != nil {
-		return nil, fmt.Errorf("error checking if proof is available: "+
-			"%w", err)
-	}
-	if haveProof {
-		return nil, fmt.Errorf("proof already exists for this transfer")
-	}
-
 	// We now fetch the full proof file from the local multiverse store,
 	// making sure we have the full proof chain for this transfer.
 	fullProvenance, err := r.cfg.Multiverse.FetchProof(ctx, locator)
@@ -12292,25 +12555,20 @@ func (r *RPCServer) RegisterTransfer(ctx context.Context,
 			err)
 	}
 
-	// All seems well, we can now import the proof into our local proof
-	// archive, which will also materialize an asset in the asset database.
-	err = r.cfg.ProofArchive.ImportProofs(
-		ctx, r.ProofVerifierCtx(ctx), false, &proof.AnnotatedProof{
-			Locator: locator,
-			Blob:    fullProvenance,
-		},
-	)
+	// The import and the registration commit together: the receiver
+	// never holds an asset the watcher does not, a receive the
+	// watcher has abandoned is refused (the universe's copy outlived
+	// the compensation), and a file that cannot be staked is refused
+	// rather than held. A proof already imported — a run of this RPC
+	// that failed after its stake committed — is staked again without
+	// being imported twice, so retries are safe.
+	err = r.cfg.AssetCustodian.StakeReceive(ctx, &proof.AnnotatedProof{
+		Locator: locator,
+		Blob:    fullProvenance,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("error importing proof: %w", err)
-	}
-
-	// In case this proof hasn't been buried sufficiently, let's also hand
-	// it to the re-org watcher.
-	err = r.cfg.ReOrgWatcher.MaybeWatch(
-		proofFile, r.cfg.ReOrgWatcher.DefaultUpdateCallback(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error watching received proof: %w", err)
+		return nil, fmt.Errorf("error staking received proof: %w",
+			err)
 	}
 
 	lastProof, err := proofFile.LastProof()
@@ -12340,8 +12598,8 @@ func (r *RPCServer) RegisterTransfer(ctx context.Context,
 // ProofVerifierCtx returns a proof.VerifierCtx that can be used to verify
 // proofs in the RPC server.
 func (r *RPCServer) ProofVerifierCtx(ctx context.Context) proof.VerifierCtx {
-	headerVerifier := tapgarden.GenHeaderVerifier(ctx, r.cfg.ChainBridge)
-	groupVerifier := tapgarden.GenGroupVerifier(ctx, r.cfg.MintingStore)
+	headerVerifier := tapnode.GenHeaderVerifier(ctx, r.cfg.ChainBridge)
+	groupVerifier := tapnode.GenGroupVerifier(ctx, r.cfg.MintingStore)
 
 	var ignoreChecker proof.IgnoreChecker = r.cfg.IgnoreChecker
 	return proof.VerifierCtx{
@@ -12410,7 +12668,7 @@ func (r *RPCServer) ExportAssetWalletBackup(ctx context.Context,
 	// Delegate to the backup package.
 	blob, err := backup.ExportBackup(
 		ctx, mode, confirmedAssets, r.cfg.ProofArchive,
-		r.cfg.TapAddrBook, fedURLs,
+		r.cfg.TapAddrBook, r.cfg.TapAddrBook, fedURLs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to export backup: %w", err)
@@ -12428,11 +12686,15 @@ func (r *RPCServer) ImportAssetsFromBackup(ctx context.Context,
 	*wrpc.ImportAssetsFromBackupResponse, error) {
 
 	cfg := &backup.ImportConfig{
-		SpendChecker:  r.cfg.Lnd.ChainNotifier,
-		ChainQuerier:  r.cfg.ChainBridge,
-		ProofArchive:  r.cfg.ProofArchive,
-		KeyRegistrar:  r.cfg.TapAddrBook,
-		ProofVerifier: r.ProofVerifierCtx(ctx),
+		SpendChecker:   r.cfg.Lnd.ChainNotifier,
+		ChainQuerier:   r.cfg.ChainBridge,
+		ProofArchive:   r.cfg.ProofArchive,
+		ProofStaker:    r.cfg.AssetCustodian,
+		KeyRegistrar:   r.cfg.TapAddrBook,
+		ProofVerifier:  r.ProofVerifierCtx(ctx),
+		KeyDeriver:     r.cfg.Lnd.WalletKit,
+		WalletProofs:   r.cfg.AssetStore,
+		GroupRegistrar: r.cfg.TapAddrBook,
 	}
 
 	numImported, numSkipped, err := backup.ImportBackup(
