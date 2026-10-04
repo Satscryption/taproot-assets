@@ -24,6 +24,16 @@ import (
 const (
 	// DefaultTimeout is the context guard default timeout.
 	DefaultTimeout = 30 * time.Second
+
+	// idleEpochRetryInitial is the delay before the first attempt to
+	// resubscribe after a block-epoch stream ends, and the base delay
+	// after a failed resubscribe. It keeps a dead notifier from turning
+	// into a hot loop.
+	idleEpochRetryInitial = 200 * time.Millisecond
+
+	// idleEpochRetryMax caps the resubscribe delay. A down notifier
+	// backs off, and a later recovery is still picked up.
+	idleEpochRetryMax = 30 * time.Second
 )
 
 // DaemonAdapters is a wrapper around the protofsm.DaemonAdapters interface
@@ -166,7 +176,8 @@ func NewManager(cfg ManagerCfg) *Manager {
 // automatic publishing is enabled, Start registers for block epochs and
 // launches the idle ticker. A failed registration is returned and is not
 // latched, so a later Start retries it. Once Start has succeeded, further
-// calls are a no-op.
+// calls are a no-op. A stream that later closes or errors is resubscribed
+// from that same goroutine, with a capped backoff.
 func (m *Manager) Start() error {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
@@ -190,9 +201,7 @@ func (m *Manager) Start() error {
 	}
 
 	ctx, cancel := m.WithCtxQuitNoTimeout()
-	blockChan, errChan, err := m.cfg.Chain.RegisterBlockEpochNtfn(
-		ctx,
-	)
+	blockChan, errChan, subCancel, err := m.registerBlockEpoch(ctx)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("unable to register for block epochs: %w",
@@ -209,30 +218,72 @@ func (m *Manager) Start() error {
 		defer m.Wg.Done()
 		defer cancel()
 
-		m.idleTickLoop(ctx, blockChan, errChan)
+		m.idleTickLoop(ctx, blockChan, errChan, subCancel)
 	}()
 
 	m.started = true
 	return nil
 }
 
-// idleTickLoop sends an IdleTickEvent to the state machine of every locally
-// controlled asset group that supports supply commitments for each new block.
+// registerBlockEpoch subscribes to block epochs with a child context so
+// the subscription can be dropped without stopping the ticker.
+func (m *Manager) registerBlockEpoch(ctx context.Context) (
+	chan int32, chan error, func(), error) {
+
+	subCtx, subCancel := context.WithCancel(ctx)
+	blockChan, errChan, err := m.cfg.Chain.RegisterBlockEpochNtfn(subCtx)
+	if err != nil {
+		subCancel()
+		return nil, nil, nil, err
+	}
+
+	return blockChan, errChan, subCancel, nil
+}
+
+// idleTickLoop sends an IdleTickEvent for every new block. When the epoch
+// stream ends it resubscribes until the manager is shutting down. The
+// same goroutine owns every subscription, so a restart cannot start a
+// second ticker.
 func (m *Manager) idleTickLoop(ctx context.Context, blockChan chan int32,
-	errChan chan error) {
+	errChan chan error, subCancel func()) {
+
+	// subCancel is reassigned as subscriptions are replaced. The defer
+	// must call whatever cancel is current when the loop leaves.
+	defer func() { subCancel() }()
+
+	for {
+		if !m.serveIdleEpoch(ctx, blockChan, errChan) {
+			return
+		}
+
+		// The stream is dead. Drop it before opening another so
+		// two subscriptions are not live together.
+		subCancel()
+
+		var err error
+		blockChan, errChan, subCancel, err = m.resubscribeBlockEpoch(
+			ctx,
+		)
+		if err != nil {
+			return
+		}
+	}
+}
+
+// serveIdleEpoch reads one block-epoch subscription. It returns true
+// when that subscription ended and the ticker should resubscribe, and
+// false when the manager is shutting down. A closed channel is a single
+// end-of-stream signal, not a series of height-0 blocks.
+func (m *Manager) serveIdleEpoch(ctx context.Context, blockChan chan int32,
+	errChan chan error) bool {
 
 	for {
 		select {
 		case height, ok := <-blockChan:
-			// A closed epoch stream, as when lnd severs
-			// subscriptions, delivers a zero height on every
-			// receive. Leave instead of ticking that height
-			// forever. A real block at height 0 still has
-			// ok set.
 			if !ok {
-				log.Infof("Supply commit idle ticker " +
-					"stopped, block epoch stream closed")
-				return
+				log.Infof("Supply commit idle ticker block " +
+					"epoch stream closed, resubscribing")
+				return true
 			}
 			if height < 0 {
 				continue
@@ -240,21 +291,94 @@ func (m *Manager) idleTickLoop(ctx context.Context, blockChan chan int32,
 
 			m.sendIdleTicks(ctx, uint32(height))
 
-		case err := <-errChan:
+		case err, ok := <-errChan:
+			// A closed error stream is the same end-of-stream
+			// signal as a closed block stream. One receive
+			// leaves the loop; it must not spin.
+			if !ok {
+				log.Infof("Supply commit idle ticker block " +
+					"epoch error stream closed, " +
+					"resubscribing")
+				return true
+			}
 			if err != nil {
-				log.Errorf("Supply commit idle ticker stopped "+
-					"on block epoch error: %v", err)
+				log.Errorf("Supply commit idle ticker block "+
+					"epoch subscription failed, "+
+					"resubscribing: %v", err)
 			}
 
-			return
+			return true
 
 		case <-ctx.Done():
-			return
+			return false
 
 		case <-m.Quit:
-			return
+			return false
 		}
 	}
+}
+
+// resubscribeBlockEpoch opens a new block-epoch subscription. Each
+// attempt waits with a capped backoff so a notifier that is still down
+// cannot be polled in a loop. The wait returns when the manager shuts
+// down.
+func (m *Manager) resubscribeBlockEpoch(ctx context.Context) (
+	chan int32, chan error, func(), error) {
+
+	backoff := idleEpochRetryInitial
+	for {
+		if err := m.waitIdleEpochRetry(ctx, backoff); err != nil {
+			return nil, nil, func() {}, err
+		}
+
+		blockChan, errChan, subCancel, err := m.registerBlockEpoch(ctx)
+		if err != nil {
+			log.Errorf("Supply commit idle ticker failed to "+
+				"resubscribe for block epochs: %v", err)
+			backoff = nextIdleEpochBackoff(backoff)
+			continue
+		}
+
+		log.Infof("Supply commit idle ticker resubscribed for " +
+			"block epochs")
+
+		return blockChan, errChan, subCancel, nil
+	}
+}
+
+// waitIdleEpochRetry blocks for delay, or until the ticker context or
+// the manager quit signal fires.
+func (m *Manager) waitIdleEpochRetry(ctx context.Context,
+	delay time.Duration) error {
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+
+	case <-ctx.Done():
+		return ctx.Err()
+
+	case <-m.Quit:
+		return errors.New("supply commit idle ticker shutting down")
+	}
+}
+
+// nextIdleEpochBackoff grows a resubscribe delay and caps it so the
+// wait cannot run away.
+func nextIdleEpochBackoff(current time.Duration) time.Duration {
+	if current < idleEpochRetryInitial {
+		return idleEpochRetryInitial
+	}
+
+	next := current * 2
+	if next > idleEpochRetryMax || next < current {
+		return idleEpochRetryMax
+	}
+
+	return next
 }
 
 // sendIdleTicks sends an idle tick for the given block height to all locally
