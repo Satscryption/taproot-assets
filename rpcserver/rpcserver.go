@@ -28,7 +28,6 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightninglabs/lndclient"
@@ -130,6 +129,12 @@ const (
 	// the whole payment if only one of the peers is taking too long to
 	// respond.
 	multiRfqNegotiationTimeout = time.Second * 8
+
+	// leaseReleaseTimeout is the upper bound for the compensating release
+	// of lnd wallet leases (UTXO locks) after a failed request. The release
+	// must not depend on the lifecycle of the request context, but it must
+	// still be bounded so a stuck lnd can't hang the handler forever.
+	leaseReleaseTimeout = time.Second * 30
 
 	// fetchTimeout is a generic timeout to use when fetching data from
 	// the database during any RPC calls that don't have a parent context.
@@ -3280,17 +3285,9 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 				return
 			}
 
-			for idx, utxo := range lockedUTXO {
-				var lockID wtxmgr.LockID
-				copy(lockID[:], utxo.Id)
-
-				op := lockedOutpoints[idx]
-				err := lndWallet.ReleaseOutput(ctx, lockID, op)
-				if err != nil {
-					rpcsLog.Errorf("Error unlocking lnd "+
-						"UTXO %v: %v", op, err)
-				}
-			}
+			releaseLeasedOutputs(
+				ctx, lndWallet, lockedUTXO, lockedOutpoints,
+			)
 		}()
 	}
 
