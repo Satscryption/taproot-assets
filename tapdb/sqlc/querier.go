@@ -369,6 +369,7 @@ type Querier interface {
 	InsertUniverseServer(ctx context.Context, arg InsertUniverseServerParams) error
 	LinkDanglingSupplyUpdateEvents(ctx context.Context, arg LinkDanglingSupplyUpdateEventsParams) error
 	ListClaimedOutpoints(ctx context.Context, arg ListClaimedOutpointsParams) ([]ListClaimedOutpointsRow, error)
+	ListCommitVirtualPsbts(ctx context.Context) ([]CommitVirtualPsbtIdem, error)
 	ListLiveReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
 	// The observability surface's list query: a pure row projection with
 	// an aggregated candidate count — no per-row follow-up queries and

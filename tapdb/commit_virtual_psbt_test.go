@@ -30,6 +30,12 @@ func TestCommitVirtualPsbtStoreRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first, got)
 
+	listed, err := store.ListCommitRecords(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	require.Equal(t, requestID, listed[0].RequestID)
+	require.Equal(t, first, listed[0].Record)
+
 	updated := []byte("completed")
 	require.NoError(t, store.UpdateCommitRecord(
 		ctx, requestID, updated,

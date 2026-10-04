@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/tapconfig"
 	"github.com/lightninglabs/taproot-assets/tapdb"
@@ -105,9 +107,10 @@ type commitVirtualPsbtsHooks struct {
 	// the lnd leases failed, so a later retry can see them.
 	retainPending bool
 
-	// attemptReplaced is set when a newer attempt owns the row. The
-	// leases this attempt acquired must not be released: they may
-	// already belong to that newer attempt.
+	// attemptReplaced is set when a newer attempt owns the row.
+	// Outpoints that attempt already recorded stay locked. onFunded
+	// releases every other outpoint this attempt acquired, under
+	// the same lock ID, before the funding defer sees this flag.
 	attemptReplaced bool
 }
 
@@ -331,6 +334,9 @@ func (r *RPCServer) commitHooks(requestID []byte,
 		)
 		if errors.Is(err, errCommitAttemptReplaced) {
 			hooks.attemptReplaced = true
+			r.releaseReplacedAttemptOutputs(
+				requestID, lockID, utxos,
+			)
 		}
 
 		return err
@@ -436,7 +442,7 @@ func (r *RPCServer) claimExisting(ctx context.Context,
 		)
 	}
 
-	state, err := r.inspectPending(ctx, rec)
+	state, err := r.inspectPending(ctx, req.RequestId, rec)
 	if err != nil {
 		return nil, false, time.Time{}, false, err
 	}
@@ -708,6 +714,31 @@ func commitRecordContext() (context.Context, context.CancelFunc) {
 	)
 }
 
+// commitInputLocks keys a mutex by lnd lock ID. Funding and the
+// release of a replaced attempt for that ID must not interleave.
+var commitInputLocks sync.Map
+
+// lockCommitInputs serializes FundPsbt and onFunded for one lock ID
+// with the release of outpoints a replaced attempt acquired under
+// that same ID. The returned function unlocks. onFunded runs while
+// the lock is held, so releaseReplacedAttemptOutputs must not lock
+// again.
+//
+// A lock ID that is not 32 bytes does not take a mutex. Those calls
+// do not share a caller-visible lock ID with a retry.
+func lockCommitInputs(lockID []byte) func() {
+	if len(lockID) != lndLockIDLen {
+		return func() {}
+	}
+
+	key := string(lockID)
+	loaded, _ := commitInputLocks.LoadOrStore(key, new(sync.Mutex))
+	mu := loaded.(*sync.Mutex)
+	mu.Lock()
+
+	return mu.Unlock
+}
+
 func validateCommitRequestID(id []byte) error {
 	if len(id) == 0 {
 		return status.Error(
@@ -757,6 +788,122 @@ func effectiveCommitLockID(leases []*walletrpc.UtxoLease,
 	}
 
 	return append([]byte(nil), fallback...)
+}
+
+// releaseReplacedAttemptOutputs unlocks outpoints this attempt
+// acquired after a retry took over the row. Outpoints the replacement
+// has already recorded stay leased: ReleaseOutput is keyed by the
+// shared lock ID plus the outpoint, so unlocking one of those would
+// drop the replacement's lease. lockCommitInputs is held by the
+// funding caller across FundPsbt and this release, so the replacement
+// cannot be between its own FundPsbt and onFunded while we decide.
+func (r *RPCServer) releaseReplacedAttemptOutputs(requestID, lockID []byte,
+	acquired []*taprpc.OutPoint) {
+
+	ctx, cancel := commitRecordContext()
+	defer cancel()
+
+	keep, err := r.replacementOutpoints(ctx, requestID)
+	if err != nil {
+		rpcsLog.Errorf("Error reading replacement commit %x: %v",
+			requestID, err)
+
+		return
+	}
+
+	for _, op := range acquired {
+		if op == nil || outpointRecorded(keep, op) {
+			continue
+		}
+
+		wireOp, ok := commitOutpointWire(op)
+		if !ok {
+			continue
+		}
+
+		err := r.releaseCommitOutput(ctx, lockID, wireOp)
+		if err != nil {
+			rpcsLog.Errorf("Error releasing replaced commit "+
+				"output %v: %v", wireOp, err)
+		}
+	}
+}
+
+// replacementOutpoints returns the outpoints on the row that now owns
+// requestID. A missing row means nothing was transferred.
+func (r *RPCServer) replacementOutpoints(ctx context.Context,
+	requestID []byte) ([]*taprpc.OutPoint, error) {
+
+	if r.cfg == nil || r.cfg.CommitIdempotency == nil {
+		return nil, status.Error(
+			codes.Internal,
+			"commit idempotency store is not configured",
+		)
+	}
+
+	raw, err := r.cfg.CommitIdempotency.FetchCommitRecord(ctx, requestID)
+	if errors.Is(err, tapdb.ErrNoCommitRecord) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	rec, err := decodeCommitRecord(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	return rec.Outpoints, nil
+}
+
+func (r *RPCServer) releaseCommitOutput(ctx context.Context, lockID []byte,
+	op wire.OutPoint) error {
+
+	if r.cfg == nil || r.cfg.Lnd == nil || r.cfg.Lnd.WalletKit == nil {
+		return errLeasesUnavailable
+	}
+	if len(lockID) != lndLockIDLen {
+		return fmt.Errorf("lock id is %d bytes", len(lockID))
+	}
+
+	var id wtxmgr.LockID
+	copy(id[:], lockID)
+
+	return r.cfg.Lnd.WalletKit.ReleaseOutput(ctx, id, op)
+}
+
+func outpointRecorded(recorded []*taprpc.OutPoint, op *taprpc.OutPoint) bool {
+	if op == nil {
+		return false
+	}
+
+	for _, have := range recorded {
+		if have == nil {
+			continue
+		}
+		if have.OutputIndex == op.OutputIndex &&
+			bytes.Equal(have.Txid, op.Txid) {
+
+			return true
+		}
+	}
+
+	return false
+}
+
+func commitOutpointWire(op *taprpc.OutPoint) (wire.OutPoint, bool) {
+	if op == nil || len(op.Txid) != chainhash.HashSize {
+		return wire.OutPoint{}, false
+	}
+
+	var hash chainhash.Hash
+	copy(hash[:], op.Txid)
+
+	return wire.OutPoint{
+		Hash:  hash,
+		Index: op.OutputIndex,
+	}, true
 }
 
 func outpointsFromWire(ops []wire.OutPoint) []*taprpc.OutPoint {
@@ -993,7 +1140,7 @@ type pendingLeaseState struct {
 	live []lndclient.LeaseDescriptor
 }
 
-func (r *RPCServer) inspectPending(ctx context.Context,
+func (r *RPCServer) inspectPending(ctx context.Context, requestID []byte,
 	rec *commitRecord) (pendingLeaseState, error) {
 
 	leases, err := r.commitLeases(ctx)
@@ -1016,14 +1163,95 @@ func (r *RPCServer) inspectPending(ctx context.Context,
 		return pendingLeaseState{recoverable: true}, nil
 	}
 
-	if len(matched) > 0 {
-		return pendingLeaseState{live: matched}, nil
+	// No outpoints are stored yet, so a lock ID by itself does not
+	// say which request owns the leases. See unrecordedOwnedLeases.
+	owned, err := r.unrecordedOwnedLeases(
+		ctx, requestID, rec.LockID, matched,
+	)
+	if err != nil {
+		return pendingLeaseState{}, err
+	}
+	if len(owned) > 0 {
+		return pendingLeaseState{live: owned}, nil
 	}
 	if rec.LeaseExpiry.IsZero() || time.Now().Before(rec.LeaseExpiry) {
 		return pendingLeaseState{}, nil
 	}
 
 	return pendingLeaseState{recoverable: true}, nil
+}
+
+// unrecordedOwnedLeases filters lock-ID leases down to ones this
+// request can attribute to itself. The row has not stored outpoints
+// yet, and a caller-chosen lock ID is not unique across request IDs.
+//
+// Another pending row with the same lock ID and no outpoints may
+// still be inside FundPsbt. Every lease under that lock is then
+// ambiguous, and this request adopts none of them. Outpoints already
+// stored on any other row with the lock ID belong to that row and are
+// excluded. Leases that remain are this request's, which is also the
+// case when the lock ID was derived as SHA-256(request_id) and no
+// other row uses it.
+func (r *RPCServer) unrecordedOwnedLeases(ctx context.Context,
+	requestID, lockID []byte, matched []lndclient.LeaseDescriptor) (
+	[]lndclient.LeaseDescriptor, error) {
+
+	if len(matched) == 0 || len(lockID) != lndLockIDLen {
+		return nil, nil
+	}
+	if r.cfg == nil || r.cfg.CommitIdempotency == nil {
+		return nil, status.Error(
+			codes.Internal,
+			"commit idempotency store is not configured",
+		)
+	}
+
+	rows, err := r.cfg.CommitIdempotency.ListCommitRecords(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list commit records: %w", err)
+	}
+
+	var claimed []*taprpc.OutPoint
+	for _, row := range rows {
+		if bytes.Equal(row.RequestID, requestID) {
+			continue
+		}
+
+		rec, err := decodeCommitRecord(row.Record)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"decode commit record: %w", err,
+			)
+		}
+		if !bytes.Equal(rec.LockID, lockID) {
+			continue
+		}
+
+		// An in-flight neighbor has not published its outpoints.
+		// The leases under this lock cannot be split safely.
+		if rec.Status == commitStatusPending &&
+			len(rec.Outpoints) == 0 {
+
+			return nil, nil
+		}
+
+		claimed = append(claimed, rec.Outpoints...)
+	}
+
+	owned := make([]lndclient.LeaseDescriptor, 0, len(matched))
+	for _, lease := range matched {
+		op := &taprpc.OutPoint{
+			Txid:        lease.Outpoint.Hash[:],
+			OutputIndex: lease.Outpoint.Index,
+		}
+		if outpointRecorded(claimed, op) {
+			continue
+		}
+
+		owned = append(owned, lease)
+	}
+
+	return owned, nil
 }
 
 // leasesRemain reports whether this attempt's outputs are still leased.
@@ -1064,7 +1292,10 @@ func (r *RPCServer) commitLeases(ctx context.Context) (
 }
 
 // backfillPendingLeases stores outpoints discovered from lnd when
-// funding returned but the pending row does not list them yet.
+// funding returned but the pending row does not list them yet. Only
+// leases unrecordedOwnedLeases can attribute to this request are
+// written. Another request's leases under the same caller-chosen
+// lock ID are left alone.
 func (r *RPCServer) backfillPendingLeases(ctx context.Context,
 	requestID []byte, rec *commitRecord) (*commitRecord, error) {
 
@@ -1072,7 +1303,7 @@ func (r *RPCServer) backfillPendingLeases(ctx context.Context,
 		return rec, nil
 	}
 
-	state, err := r.inspectPending(ctx, rec)
+	state, err := r.inspectPending(ctx, requestID, rec)
 	if err != nil || len(state.live) == 0 {
 		return rec, err
 	}

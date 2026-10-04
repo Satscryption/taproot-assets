@@ -69,6 +69,34 @@ func (q *Queries) InsertCommitVirtualPsbt(ctx context.Context, arg InsertCommitV
 	return err
 }
 
+const ListCommitVirtualPsbts = `-- name: ListCommitVirtualPsbts :many
+SELECT request_id, record
+FROM commit_virtual_psbt_idem
+`
+
+func (q *Queries) ListCommitVirtualPsbts(ctx context.Context) ([]CommitVirtualPsbtIdem, error) {
+	rows, err := q.db.QueryContext(ctx, ListCommitVirtualPsbts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CommitVirtualPsbtIdem
+	for rows.Next() {
+		var i CommitVirtualPsbtIdem
+		if err := rows.Scan(&i.RequestID, &i.Record); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const SwapCommitVirtualPsbt = `-- name: SwapCommitVirtualPsbt :execrows
 UPDATE commit_virtual_psbt_idem
 SET record = $1

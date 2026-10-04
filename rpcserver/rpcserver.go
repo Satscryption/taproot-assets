@@ -3204,6 +3204,12 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 	)
 
 	if !req.SkipFunding {
+		// Hold this lock ID until the RPC returns. FundPsbt, onFunded,
+		// and a later ReleaseOutput then cannot interleave with
+		// another attempt using the same lock ID.
+		unlockInputs := lockCommitInputs(req.CustomLockId)
+		defer unlockInputs()
+
 		// The change output and fee parameters of this RPC are
 		// identical to the walletrpc.FundPsbt, so we just map them 1:1
 		// and let lnd do the validation.
@@ -3276,9 +3282,11 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 
 		// From now on, if we error out, we need to make sure we unlock
 		// the UTXOs that lnd just locked for us. A release that
-		// fails leaves the pending idempotency row in place. A
-		// replaced attempt must not unlock outputs a newer attempt
-		// may already have leased under the same lock ID.
+		// fails leaves the pending idempotency row in place. When
+		// a retry has taken over, onFunded already released the
+		// outpoints that belong only to this attempt. The rest
+		// stay locked: they may be the replacement's leases under
+		// the same lock ID.
 		defer func() {
 			if success {
 				return
@@ -3309,6 +3317,17 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 
 		// Persist the leases before any later error can return
 		// without telling the caller which outputs lnd locked.
+		//
+		// A crash after onFunded returns and before onResult
+		// stores the PSBT leaves this pending row with the
+		// outpoints below and drops the in-memory packet. That
+		// does not strand the request ID. Once lnd no longer
+		// leases those stored outpoints, CommitVirtualPsbts
+		// deletes the row and funds again instead of returning
+		// Aborted for good. The funded PSBT itself is not
+		// recovered; the retry is the recovery.
+		// TestCommitVirtualPsbtsStalePendingFundsAgain is that
+		// takeover.
 		if hooks != nil && hooks.onFunded != nil {
 			err = hooks.onFunded(
 				effectiveCommitLockID(
