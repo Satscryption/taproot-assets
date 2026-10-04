@@ -165,7 +165,7 @@ type ChainPorter struct {
 	subscriberMtx sync.Mutex
 
 	// publishMu guards pre-anchored in-flight shipments, the
-	// process-local request ID bindings, and terminal broadcast errors.
+	// in-flight request ID bindings, and terminal broadcast errors.
 	publishMu sync.Mutex
 
 	// preAnchoredFlights coalesces concurrent publishes of one anchor
@@ -173,9 +173,10 @@ type ChainPorter struct {
 	preAnchoredFlights map[chainhash.Hash]*preAnchoredFlight
 
 	// publishRequestIDs binds a caller request ID to the anchor
-	// transaction it was first used with. The binding lasts for the
-	// life of the process. After a restart the anchor transaction,
-	// which the retry still carries, is the durable key.
+	// transaction of the publish that is using it. The binding is
+	// removed when that publish completes or fails. It is not kept
+	// for the life of the process, and a restart starts empty. The
+	// anchor transaction remains the durable idempotency key.
 	publishRequestIDs map[string]chainhash.Hash
 
 	// terminalBroadcasts records anchors whose broadcast failed with
@@ -572,6 +573,10 @@ func (p *ChainPorter) requestPreAnchoredShipment(
 	}
 	flight.finish(resp, err)
 	delete(p.preAnchoredFlights, txHash)
+	// Followers bind before they wait, so every ID for this anchor
+	// is in the map. Drop them with the flight: the binding only has
+	// to reject reuse while the publish is in flight.
+	p.releasePublishRequestIDs(txHash)
 	p.publishMu.Unlock()
 
 	return resp, err
@@ -596,6 +601,17 @@ func (p *ChainPorter) bindPublishRequestID(id []byte,
 	p.publishRequestIDs[key] = txHash
 
 	return nil
+}
+
+// releasePublishRequestIDs drops every request ID bound to txHash. The
+// caller must hold publishMu. IDs for other anchors are left in place,
+// including ones whose publish is still in flight.
+func (p *ChainPorter) releasePublishRequestIDs(txHash chainhash.Hash) {
+	for key, bound := range p.publishRequestIDs {
+		if bound == txHash {
+			delete(p.publishRequestIDs, key)
+		}
+	}
 }
 
 // terminalBroadcastFailure returns the double-spend error recorded for
