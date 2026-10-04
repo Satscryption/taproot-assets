@@ -1,20 +1,27 @@
 package supplycommit
 
 import (
+	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/psbt/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	lfn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -65,9 +72,88 @@ func (h *supplyCommitTestHarness) expectLatestCommit(
 
 	h.t.Helper()
 
-	h.mockCommits.On("SupplyCommit", mock.Anything, mock.Anything).Return(
-		lfn.Ok(commit),
-	).Times(times)
+	h.mockCommits.On(
+		"SupplyCommit", mock.Anything, mock.Anything,
+	).Return(lfn.Ok(commit)).Times(times)
+}
+
+// expectIdleSuccessorCycle arranges the commitment cycle that follows a
+// due idle tick. The latest commitment is spent, and the anchoring
+// registered with the re-org watcher must include that outpoint so a
+// re-org of the predecessor is observed. SupplyCommit itself is arranged
+// by the caller: the idle check and the transaction builder both read it.
+func (h *supplyCommitTestHarness) expectIdleSuccessorCycle(
+	latest RootCommitment) {
+
+	h.t.Helper()
+
+	require.NotNil(h.t, h.registrar, "idle successor cycle needs the "+
+		"harness registrar")
+
+	h.expectTreeFetches()
+	h.mockCommits.On(
+		"UnspentPrecommits", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(lfn.Ok[PreCommits](nil)).Twice()
+	h.expectFeeEstimation()
+
+	// Preserve the commitment input and append a wallet fee input,
+	// matching the production funding mock used by the anchoring tests.
+	fundPsbtFunc := fundPsbtMockFn(func(
+		_ context.Context, packet *psbt.Packet, _ uint32,
+		_ chainfee.SatPerKWeight, _ int32,
+	) (*tapsend.FundedPsbt, error) {
+
+		fundedTx := packet.UnsignedTx.Copy()
+		fundedTx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: randOutPoint(h.t),
+		})
+
+		fundedPsbt, err := psbt.NewFromUnsignedTx(fundedTx)
+		require.NoError(h.t, err)
+
+		return &tapsend.FundedPsbt{
+			Pkt:               fundedPsbt,
+			ChangeOutputIndex: -1,
+		}, nil
+	})
+	h.mockWallet.On(
+		"FundPsbt", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything,
+	).Return(fundPsbtFunc, nil).Once()
+
+	h.expectPsbtSigning()
+	h.expectApplyCommitTxStake()
+	h.mockDaemon.On(
+		"BroadcastTransaction", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	spent := latest.CommitPoint()
+	h.registrar.On(
+		"Register", mock.Anything,
+		mock.MatchedBy(func(spec tapreorg.RegistrationSpec) bool {
+			for _, pt := range spec.Triggers.OutPoints() {
+				if pt.OutPoint == spent {
+					return true
+				}
+			}
+
+			return false
+		}),
+		mock.Anything,
+	).Return(tapreorg.AnchoringID(1), nil).Once()
+	h.registrar.On(
+		"LookupByMatchKey", mock.Anything, SupplySiteID,
+		mock.Anything,
+	).Return(&tapreorg.Anchoring{ID: 1}, nil).Once()
+}
+
+func (h *supplyCommitTestHarness) assertNoBeginIdle() {
+	h.t.Helper()
+
+	h.mockStateLog.AssertNotCalled(
+		h.t, "BeginIdleTransition", mock.Anything, mock.Anything,
+	)
 }
 
 func newIdleHarness(t *testing.T, initial State, interval uint32,
@@ -86,8 +172,22 @@ func newIdleHarness(t *testing.T, initial State, interval uint32,
 	return h
 }
 
-// TestIdleTickDefaultState tests the idle tick handling of the DefaultState,
-// which is what makes idle successor commitments happen.
+// assertIdleCycleStates waits for one full commitment cycle, ending at
+// rest in the broadcast state where the re-org watcher takes over.
+func (h *supplyCommitTestHarness) assertIdleCycleStates() {
+	h.t.Helper()
+
+	h.assertStateTransitions(
+		&CommitTreeCreateState{},
+		&CommitTxCreateState{},
+		&CommitTxSignState{},
+		&CommitBroadcastState{},
+		&CommitBroadcastState{},
+	)
+}
+
+// TestIdleTickDefaultState tests the idle tick handling of the
+// DefaultState, which is what makes idle successor commitments happen.
 func TestIdleTickDefaultState(t *testing.T) {
 	t.Parallel()
 
@@ -96,15 +196,21 @@ func TestIdleTickDefaultState(t *testing.T) {
 		confirmed = uint32(1000)
 	)
 
-	// With idle commits disabled (the default) the tick is a no-op and no
-	// dependency is touched at all.
+	// With idle commits disabled (the default) the tick is a no-op and
+	// no dependency is touched at all.
 	t.Run("disabled", func(t *testing.T) {
 		h := newIdleHarness(t, &DefaultState{}, 0, false)
 		h.start()
 		defer h.stopAndAssert()
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + 10_000})
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + 10_000,
+		})
 		h.assertStateTransitions(&DefaultState{})
+		h.mockCommits.AssertNotCalled(
+			t, "SupplyCommit", mock.Anything, mock.Anything,
+		)
+		h.assertNoBeginIdle()
 	})
 
 	// Without any commitment there is nothing to succeed.
@@ -115,11 +221,16 @@ func TestIdleTickDefaultState(t *testing.T) {
 
 		h.expectLatestCommit(lfn.None[RootCommitment](), 1)
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + 10_000})
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + 10_000,
+		})
 		h.assertStateTransitions(&DefaultState{})
+		h.assertNoBeginIdle()
 	})
 
-	// An unconfirmed latest commitment can't be old enough.
+	// An unconfirmed latest commitment can't be old enough. On main
+	// that is also a commitment the watcher has not buried yet: its
+	// block details are still empty.
 	t.Run("unconfirmed_commitment", func(t *testing.T) {
 		h := newIdleHarness(t, &DefaultState{}, interval, false)
 		h.start()
@@ -129,8 +240,11 @@ func TestIdleTickDefaultState(t *testing.T) {
 			newTestLatestCommitment(t, false, 0),
 		), 1)
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + 10_000})
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + 10_000,
+		})
 		h.assertStateTransitions(&DefaultState{})
+		h.assertNoBeginIdle()
 	})
 
 	// One block before the deadline nothing happens.
@@ -143,12 +257,17 @@ func TestIdleTickDefaultState(t *testing.T) {
 			newTestLatestCommitment(t, true, confirmed),
 		), 1)
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + interval - 1})
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + interval - 1,
+		})
 		h.assertStateTransitions(&DefaultState{})
+		h.assertNoBeginIdle()
 	})
 
-	// Exactly at confirmation height + interval the idle successor starts
-	// and runs through the full commitment cycle with no pending updates.
+	// Exactly at confirmation height + interval the idle successor
+	// starts and runs through the full commitment cycle with no
+	// pending updates. A further tick while that commitment is in
+	// flight must not publish another one.
 	t.Run("due_starts_successor", func(t *testing.T) {
 		h := newIdleHarness(t, &DefaultState{}, interval, false)
 		h.start()
@@ -156,37 +275,21 @@ func TestIdleTickDefaultState(t *testing.T) {
 
 		latest := newTestLatestCommitment(t, true, confirmed)
 
-		// One SupplyCommit call for the idle check, one for the tx
-		// creation, which must spend the latest commitment.
+		// One SupplyCommit call for the idle check, one for the
+		// tx creation, which must spend the latest commitment.
 		h.expectLatestCommit(lfn.Some(latest), 2)
 		h.mockStateLog.On(
 			"BeginIdleTransition", mock.Anything, mock.Anything,
 		).Return(nil, nil).Once()
+		h.expectIdleSuccessorCycle(latest)
 
-		h.expectTreeFetches()
-		h.mockCommits.On(
-			"UnspentPrecommits", mock.Anything, mock.Anything,
-			mock.Anything,
-		).Return(lfn.Ok[PreCommits](nil)).Once()
-		h.expectFeeEstimation()
-		h.expectPsbtFunding()
-		h.expectPsbtSigning()
-		h.expectInsertSignedCommitTx()
-		h.expectAssetLookup()
-		h.expectSupplySyncer()
-		h.expectBroadcastAndConfRegistration()
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + interval,
+		})
+		h.assertIdleCycleStates()
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + interval})
-		h.assertStateTransitions(
-			&CommitTreeCreateState{},
-			&CommitTxCreateState{},
-			&CommitTxSignState{},
-			&CommitBroadcastState{},
-			&CommitBroadcastState{},
-		)
-
-		// The successor commits no updates and is ancestry linked to
-		// the latest commitment.
+		// The successor commits no updates and is ancestry linked
+		// to the latest commitment.
 		state := assertAndGetCurrentState[*CommitBroadcastState](h)
 		transition := state.SupplyTransition
 		require.Empty(t, transition.PendingUpdates)
@@ -194,6 +297,11 @@ func TestIdleTickDefaultState(t *testing.T) {
 			t, fn.Some(latest.CommitPoint()),
 			transition.NewCommitment.SpentCommitment,
 		)
+
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + interval + 1,
+		})
+		h.assertStateTransitions(&CommitBroadcastState{})
 	})
 
 	// Dangling updates that were bound to the idle transition are
@@ -211,28 +319,12 @@ func TestIdleTickDefaultState(t *testing.T) {
 		h.mockStateLog.On(
 			"BeginIdleTransition", mock.Anything, mock.Anything,
 		).Return([]SupplyUpdateEvent{dangling}, nil).Once()
+		h.expectIdleSuccessorCycle(latest)
 
-		h.expectTreeFetches()
-		h.mockCommits.On(
-			"UnspentPrecommits", mock.Anything, mock.Anything,
-			mock.Anything,
-		).Return(lfn.Ok[PreCommits](nil)).Once()
-		h.expectFeeEstimation()
-		h.expectPsbtFunding()
-		h.expectPsbtSigning()
-		h.expectInsertSignedCommitTx()
-		h.expectAssetLookup()
-		h.expectSupplySyncer()
-		h.expectBroadcastAndConfRegistration()
-
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + interval*2})
-		h.assertStateTransitions(
-			&CommitTreeCreateState{},
-			&CommitTxCreateState{},
-			&CommitTxSignState{},
-			&CommitBroadcastState{},
-			&CommitBroadcastState{},
-		)
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + interval*2,
+		})
+		h.assertIdleCycleStates()
 
 		state := assertAndGetCurrentState[*CommitBroadcastState](h)
 		require.Equal(
@@ -242,7 +334,8 @@ func TestIdleTickDefaultState(t *testing.T) {
 	})
 
 	// A failure to persist the idle transition is an error that is
-	// reported (the machine is torn down, like for other storage errors).
+	// reported (the machine is torn down, like for other storage
+	// errors).
 	t.Run("begin_transition_error", func(t *testing.T) {
 		h := newIdleHarness(t, &DefaultState{}, interval, false)
 		h.start()
@@ -257,14 +350,20 @@ func TestIdleTickDefaultState(t *testing.T) {
 		).Return(nil, beginErr).Once()
 		h.expectFailure(beginErr)
 
-		h.sendEvent(&IdleTickEvent{BlockHeight: confirmed + interval})
+		h.sendEvent(&IdleTickEvent{
+			BlockHeight: confirmed + interval,
+		})
 		h.assertNoStateTransitions()
-		require.ErrorIs(t, h.mockErrReporter.GetReportedError(), beginErr)
+		require.ErrorIs(
+			t, h.mockErrReporter.GetReportedError(), beginErr,
+		)
 	})
 }
 
-// TestIdleTickOtherStates makes sure an idle tick never disturbs a commitment
-// cycle that is in flight.
+// TestIdleTickOtherStates makes sure an idle tick never disturbs a
+// commitment cycle that is in flight, including the broadcast state the
+// machine rests in while the re-org watcher has not buried the
+// transaction.
 func TestIdleTickOtherStates(t *testing.T) {
 	t.Parallel()
 
@@ -279,7 +378,6 @@ func TestIdleTickOtherStates(t *testing.T) {
 		&CommitTxCreateState{SupplyTransition: transition},
 		&CommitTxSignState{SupplyTransition: transition},
 		&CommitBroadcastState{SupplyTransition: transition},
-		&CommitFinalizeState{SupplyTransition: transition},
 	}
 	for _, state := range states {
 		t.Run(state.String(), func(t *testing.T) {
@@ -289,12 +387,13 @@ func TestIdleTickOtherStates(t *testing.T) {
 
 			h.sendEvent(&IdleTickEvent{BlockHeight: 10_000})
 			h.assertStateTransitions(state)
+			h.assertNoBeginIdle()
 		})
 	}
 }
 
-// TestIdleTickUpdatesPendingState tests the opt-in handling of idle ticks while
-// updates are staged.
+// TestIdleTickUpdatesPendingState tests the opt-in handling of idle ticks
+// while updates are staged, and the restart of an empty idle transition.
 func TestIdleTickUpdatesPendingState(t *testing.T) {
 	t.Parallel()
 
@@ -315,6 +414,10 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 		h.assertStateTransitions(&UpdatesPendingState{})
 		state := assertAndGetCurrentState[*UpdatesPendingState](h)
 		require.Len(t, state.pendingUpdates, 1)
+		h.mockStateLog.AssertNotCalled(
+			t, "FreezePendingTransition", mock.Anything,
+			mock.Anything,
+		)
 	})
 
 	// Fully disabled: a no-op.
@@ -325,6 +428,10 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 
 		h.sendEvent(&IdleTickEvent{BlockHeight: 10_000})
 		h.assertStateTransitions(&UpdatesPendingState{})
+		h.mockStateLog.AssertNotCalled(
+			t, "FreezePendingTransition", mock.Anything,
+			mock.Anything,
+		)
 	})
 
 	// With auto publishing the next block commits the staged updates.
@@ -337,13 +444,7 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 		h.expectFullCommitmentCycleMocks(true)
 
 		h.sendEvent(&IdleTickEvent{BlockHeight: 10_000})
-		h.assertStateTransitions(
-			&CommitTreeCreateState{},
-			&CommitTxCreateState{},
-			&CommitTxSignState{},
-			&CommitBroadcastState{},
-			&CommitBroadcastState{},
-		)
+		h.assertIdleCycleStates()
 	})
 
 	// An idle transition without updates that was persisted before a
@@ -353,7 +454,9 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 		h.start()
 		defer h.stopAndAssert()
 
-		h.mockStateLog.On("FetchState", mock.Anything, mock.Anything).Return(
+		h.mockStateLog.On(
+			"FetchState", mock.Anything, mock.Anything,
+		).Return(
 			&UpdatesPendingState{},
 			lfn.Some(SupplyStateTransition{}), nil,
 		).Once()
@@ -361,24 +464,44 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 		h.expectFullCommitmentCycleMocks(true)
 
 		h.sendEvent(&IdleTickEvent{BlockHeight: 10_000})
-		h.assertStateTransitions(
-			&CommitTreeCreateState{},
-			&CommitTxCreateState{},
-			&CommitTxSignState{},
-			&CommitBroadcastState{},
-			&CommitBroadcastState{},
-		)
+		h.assertIdleCycleStates()
 	})
 
-	// With no transition on disk, a manual tick after a restart returns to
-	// the default state instead of committing an empty batch.
+	// The manager re-ticks UpdatesPendingState with a CommitTickEvent
+	// on restart. An empty durable transition must resume rather than
+	// be dropped, or the idle successor persisted by
+	// BeginIdleTransition is abandoned.
+	t.Run("commit_tick_resumes_empty_transition", func(t *testing.T) {
+		h := newIdleHarness(t, &UpdatesPendingState{}, 144, false)
+		h.start()
+		defer h.stopAndAssert()
+
+		h.mockStateLog.On(
+			"FetchState", mock.Anything, mock.Anything,
+		).Return(
+			&UpdatesPendingState{},
+			lfn.Some(SupplyStateTransition{}), nil,
+		).Once()
+		h.expectFreezePendingTransition()
+		h.expectFullCommitmentCycleMocks(true)
+
+		h.sendEvent(&CommitTickEvent{})
+		h.assertIdleCycleStates()
+	})
+
+	// With no transition on disk, a manual tick after a restart
+	// returns to the default state instead of committing an empty
+	// batch.
 	t.Run("manual_tick_nothing_to_commit", func(t *testing.T) {
 		h := newIdleHarness(t, &UpdatesPendingState{}, 0, false)
 		h.start()
 		defer h.stopAndAssert()
 
-		h.mockStateLog.On("FetchState", mock.Anything, mock.Anything).Return(
-			&DefaultState{}, lfn.None[SupplyStateTransition](), nil,
+		h.mockStateLog.On(
+			"FetchState", mock.Anything, mock.Anything,
+		).Return(
+			&DefaultState{}, lfn.None[SupplyStateTransition](),
+			nil,
 		).Once()
 		h.expectCommitState()
 
@@ -387,12 +510,17 @@ func TestIdleTickUpdatesPendingState(t *testing.T) {
 	})
 }
 
-// TestManagerIdleTickLoop makes sure the manager turns block epochs into idle
-// ticks for locally controlled supply commit groups, and only if enabled.
+// TestManagerIdleTickLoop makes sure the manager turns block epochs into
+// idle ticks for locally controlled supply commit groups, and only if
+// enabled.
 func TestManagerIdleTickLoop(t *testing.T) {
 	t.Parallel()
 
 	groupKey := test.RandPubKey(t)
+
+	// regErr, when set, is returned by the first epoch registration.
+	// A later registration succeeds. Subtests run sequentially.
+	var regErr error
 
 	setup := func(t *testing.T, cfg ManagerCfg) (*Manager, chan int32,
 		chan struct{}) {
@@ -406,13 +534,18 @@ func TestManagerIdleTickLoop(t *testing.T) {
 
 		blocks := make(chan int32)
 		errs := make(chan error)
-		chain.On("RegisterBlockEpochNtfn", mock.Anything).Return(
-			blocks, errs, nil,
-		).Maybe()
+		if regErr != nil {
+			chain.On(
+				"RegisterBlockEpochNtfn", mock.Anything,
+			).Return(nil, nil, regErr).Once()
+		}
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Return(blocks, errs, nil).Maybe()
 
-		lookup.On("FetchSupplyCommitAssets", mock.Anything, true).Return(
-			[]btcec.PublicKey{*groupKey}, nil,
-		).Maybe()
+		lookup.On(
+			"FetchSupplyCommitAssets", mock.Anything, true,
+		).Return([]btcec.PublicKey{*groupKey}, nil).Maybe()
 		lookup.On(
 			"QueryAssetGroupByGroupKey", mock.Anything,
 			mock.Anything,
@@ -426,31 +559,39 @@ func TestManagerIdleTickLoop(t *testing.T) {
 			DelegationKey:       fn.Some(*test.RandPubKey(t)),
 		}, nil).Maybe()
 		lookup.On(
-			"FetchInternalKeyLocator", mock.Anything, mock.Anything,
+			"FetchInternalKeyLocator", mock.Anything,
+			mock.Anything,
 		).Return(keychain.KeyLocator{}, nil).Maybe()
 
-		stateLog.On("FetchState", mock.Anything, mock.Anything).Return(
-			&DefaultState{}, lfn.None[SupplyStateTransition](), nil,
+		stateLog.On(
+			"FetchState", mock.Anything, mock.Anything,
+		).Return(
+			&DefaultState{}, lfn.None[SupplyStateTransition](),
+			nil,
 		).Maybe()
 
-		// The state machine reaches out for the latest commitment when
-		// it processes the tick, signal that we got there.
+		// The state machine reaches out for the latest commitment
+		// when it processes the tick; signal that we got there.
 		ticked := make(chan struct{}, 4)
-		commits.On("SupplyCommit", mock.Anything, mock.Anything).Run(
-			func(mock.Arguments) { ticked <- struct{}{} },
-		).Return(lfn.Ok(lfn.None[RootCommitment]())).Maybe()
+		commits.On(
+			"SupplyCommit", mock.Anything, mock.Anything,
+		).Run(func(mock.Arguments) {
+			ticked <- struct{}{}
+		}).Return(lfn.Ok(lfn.None[RootCommitment]())).Maybe()
 
 		cfg.Chain = chain
 		cfg.AssetLookup = lookup
 		cfg.StateLog = stateLog
 		cfg.Commitments = commits
-		cfg.DaemonAdapters = nil
+		cfg.DaemonAdapters = &managerDaemon{newMockDaemonAdapters()}
 
 		return NewManager(cfg), blocks, ticked
 	}
 
 	t.Run("enabled", func(t *testing.T) {
-		m, blocks, ticked := setup(t, ManagerCfg{IdleCommitInterval: 6})
+		m, blocks, ticked := setup(t, ManagerCfg{
+			IdleCommitInterval: 6,
+		})
 		require.NoError(t, m.Start())
 		defer func() { require.NoError(t, m.Stop()) }()
 
@@ -466,11 +607,14 @@ func TestManagerIdleTickLoop(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		m, _, _ := setup(t, ManagerCfg{})
 		require.NoError(t, m.Start())
+		// A second start must not subscribe after the first
+		// decided the ticker is disabled.
+		require.NoError(t, m.Start())
 		defer func() { require.NoError(t, m.Stop()) }()
 
-		// No epoch registration happens (the mock would fail the send
-		// on the unbuffered channel otherwise), and nothing ticks.
-		m.cfg.Chain.(*mockChainBridge).AssertNotCalled(
+		// No epoch registration happens, and nothing ticks.
+		chain := m.cfg.Chain.(*mockChainBridge)
+		chain.AssertNotCalled(
 			t, "RegisterBlockEpochNtfn", mock.Anything,
 		)
 	})
@@ -478,13 +622,267 @@ func TestManagerIdleTickLoop(t *testing.T) {
 	t.Run("epoch_registration_error", func(t *testing.T) {
 		cfg := ManagerCfg{IdleCommitInterval: 6}
 		chain := &mockChainBridge{}
-		chain.On("RegisterBlockEpochNtfn", mock.Anything).Return(
-			nil, nil, errors.New("no chain"),
-		).Once()
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Return(nil, nil, errors.New("no chain")).Twice()
 		cfg.Chain = chain
 
 		m := NewManager(cfg)
 		require.ErrorContains(t, m.Start(), "no chain")
+		// The failed attempt must not latch. A later Start keeps
+		// reporting the error and tries to subscribe again.
+		require.ErrorContains(t, m.Start(), "no chain")
+		chain.AssertNumberOfCalls(
+			t, "RegisterBlockEpochNtfn", 2,
+		)
+		require.NoError(t, m.Stop())
 	})
 
+	t.Run("retries_after_registration_error", func(t *testing.T) {
+		regErr = errors.New("no chain")
+		t.Cleanup(func() { regErr = nil })
+
+		m, blocks, ticked := setup(t, ManagerCfg{
+			IdleCommitInterval: 6,
+		})
+		require.ErrorContains(t, m.Start(), "no chain")
+		require.NoError(t, m.Start())
+		// Success latches. A further Start does not subscribe
+		// again.
+		require.NoError(t, m.Start())
+		defer func() { require.NoError(t, m.Stop()) }()
+
+		chain := m.cfg.Chain.(*mockChainBridge)
+		registered := chain.AssertNumberOfCalls(
+			t, "RegisterBlockEpochNtfn", 2,
+		)
+		if !registered {
+			return
+		}
+
+		blocks <- 1000
+
+		select {
+		case <-ticked:
+		case <-time.After(testTimeout):
+			t.Fatal("no idle tick after registration retry")
+		}
+	})
+}
+
+// idleLoopHarness is a manager whose only job is the block-epoch loop.
+// Fetch counts show whether a tick was dispatched.
+type idleLoopHarness struct {
+	m       *Manager
+	blocks  chan int32
+	errs    chan error
+	fetches *atomic.Int32
+}
+
+func newIdleLoopHarness(t *testing.T) *idleLoopHarness {
+	t.Helper()
+
+	chain := &mockChainBridge{}
+	lookup := &MockAssetLookup{}
+	blocks := make(chan int32)
+	errs := make(chan error)
+	chain.On(
+		"RegisterBlockEpochNtfn", mock.Anything,
+	).Return(blocks, errs, nil).Once()
+
+	fetches := new(atomic.Int32)
+	lookup.On(
+		"FetchSupplyCommitAssets", mock.Anything, true,
+	).Run(func(mock.Arguments) {
+		fetches.Add(1)
+	}).Return([]btcec.PublicKey{}, nil).Maybe()
+
+	m := NewManager(ManagerCfg{
+		IdleCommitInterval: 6,
+		Chain:              chain,
+		AssetLookup:        lookup,
+	})
+	require.NoError(t, m.Start())
+	t.Cleanup(func() {
+		require.NoError(t, m.Stop())
+	})
+
+	return &idleLoopHarness{
+		m:       m,
+		blocks:  blocks,
+		errs:    errs,
+		fetches: fetches,
+	}
+}
+
+// waitIdleLoopExit blocks until the ticker goroutine and its context
+// watcher have both left.
+func waitIdleLoopExit(t *testing.T, h *idleLoopHarness) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		h.m.Wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("idle tick loop did not exit, fetches=%d",
+			h.fetches.Load())
+	}
+}
+
+// TestIdleTickLoopBlockStream checks that a closed epoch stream stops
+// the ticker, while a real height of zero is still delivered, and that
+// quit and epoch errors still stop the loop.
+func TestIdleTickLoopBlockStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("closed stream", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		// Closing the stream must not be read as height 0, and
+		// the loop must leave without a call to Stop.
+		close(h.blocks)
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+
+	t.Run("height zero", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		h.blocks <- 0
+		require.Eventually(t, func() bool {
+			return h.fetches.Load() == 1
+		}, time.Second, 5*time.Millisecond)
+		require.EqualValues(t, 1, h.fetches.Load())
+	})
+
+	t.Run("quit", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		require.NoError(t, h.m.Stop())
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+
+	t.Run("epoch error", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		h.errs <- errors.New("lost chain")
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+}
+
+// gateStateLog counts FetchState calls and blocks each one until
+// release is closed. The block sits inside creation, before the
+// machine is cached.
+type gateStateLog struct {
+	mockStateMachineStore
+
+	calls   atomic.Int32
+	release <-chan struct{}
+}
+
+// FetchState implements StateMachineStore.
+func (g *gateStateLog) FetchState(context.Context, asset.Specifier) (State,
+	lfn.Option[SupplyStateTransition], error) {
+
+	g.calls.Add(1)
+	<-g.release
+
+	return &DefaultState{}, lfn.None[SupplyStateTransition](), nil
+}
+
+// TestFetchStateMachineCreatedOnce checks that two callers asking for
+// an uncached group start one state machine. The idle ticker and
+// SendEvent share this path. Two callers already raced on main; the
+// cache mutex only covers a single Get or Set.
+func TestFetchStateMachineCreatedOnce(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	var closed sync.Once
+	closeRelease := func() {
+		closed.Do(func() { close(release) })
+	}
+	defer closeRelease()
+
+	groupKey := test.RandPubKey(t)
+	spec := asset.NewSpecifierFromGroupKey(*groupKey)
+
+	lookup := &MockAssetLookup{}
+	lookup.On(
+		"QueryAssetGroupByGroupKey", mock.Anything, mock.Anything,
+	).Return(&asset.AssetGroup{
+		Genesis: &asset.Genesis{Tag: "once"},
+	}, nil).Maybe()
+	lookup.On(
+		"FetchAssetMetaForAsset", mock.Anything, mock.Anything,
+	).Return(&proof.MetaReveal{
+		UniverseCommitments: true,
+		DelegationKey:       fn.Some(*test.RandPubKey(t)),
+	}, nil).Maybe()
+	lookup.On(
+		"FetchInternalKeyLocator", mock.Anything, mock.Anything,
+	).Return(keychain.KeyLocator{}, nil).Maybe()
+
+	stateLog := &gateStateLog{release: release}
+	m := NewManager(ManagerCfg{
+		AssetLookup:    lookup,
+		StateLog:       stateLog,
+		DaemonAdapters: &managerDaemon{newMockDaemonAdapters()},
+	})
+	require.NoError(t, m.Start())
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	var (
+		wg         sync.WaitGroup
+		sm1, sm2   *StateMachine
+		err1, err2 error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sm1, err1 = m.fetchStateMachine(spec)
+	}()
+
+	// The first caller is held inside creation, before the cache
+	// insert. Only then start the second, so it observes the miss.
+	require.Eventually(t, func() bool {
+		return stateLog.calls.Load() >= 1
+	}, time.Second, 5*time.Millisecond)
+
+	go func() {
+		defer wg.Done()
+		sm2, err2 = m.fetchStateMachine(spec)
+	}()
+
+	// Give the second caller time to pass the cache check. It
+	// shares the in-flight create, so it must not start another
+	// machine. Without that, it calls FetchState too.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if stateLog.calls.Load() > 1 {
+			t.Fatalf("created %d state machines while the "+
+				"first was still starting",
+				stateLog.calls.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	closeRelease()
+	wg.Wait()
+
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	require.EqualValues(t, 1, stateLog.calls.Load())
+	require.Same(t, sm1, sm2)
+
+	cached, ok := m.smCache.Get(*groupKey)
+	require.True(t, ok)
+	require.Same(t, sm1, cached)
 }
