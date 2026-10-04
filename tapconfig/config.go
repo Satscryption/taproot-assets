@@ -1,6 +1,7 @@
 package tapconfig
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/authmailbox"
+	"github.com/lightninglabs/taproot-assets/backup"
 	"github.com/lightninglabs/taproot-assets/healthcheck"
 	"github.com/lightninglabs/taproot-assets/lndservices"
 	"github.com/lightninglabs/taproot-assets/monitoring"
@@ -16,10 +18,13 @@ import (
 	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/rpcperms"
 	"github.com/lightninglabs/taproot-assets/tapchannel"
+	"github.com/lightninglabs/taproot-assets/tapcustody"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapfeatures"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
 	"github.com/lightninglabs/taproot-assets/universe/supplyverifier"
@@ -100,7 +105,7 @@ type RPCConfig struct {
 type DatabaseConfig struct {
 	RootKeyStore *tapdb.RootKeyStore
 
-	MintingStore tapgarden.MintingStore
+	MintingStore *tapdb.AssetMintingStore
 
 	AssetStore *tapdb.AssetStore
 
@@ -172,6 +177,38 @@ func ParseUniversePublicAccessStatus(
 	}
 }
 
+// UniverseConnPool is the lifecycle interface for a shared pool of
+// outbound gRPC connections to remote universe servers. Defined here
+// to avoid an import cycle: rpcserver imports tapconfig, so the pool's
+// concrete type cannot be referenced from this package directly.
+type UniverseConnPool interface {
+	// Evict closes and drops the pooled connection for the given
+	// server address, if any. Called when a server leaves the
+	// federation so its connection does not linger until shutdown.
+	Evict(addr universe.ServerAddr)
+
+	// Close drains the pool. Called once during server shutdown.
+	Close()
+}
+
+// CommitIdempotencyStore persists opaque CommitVirtualPsbts records
+// keyed by the caller-supplied request ID. The RPC server owns the
+// record encoding.
+//
+// InsertCommitRecord returns *tapdb.ErrSqlUniqueConstraintViolation
+// when the key is already present. FetchCommitRecord and
+// UpdateCommitRecord return tapdb.ErrNoCommitRecord when it is not.
+// DeleteCommitRecord of a missing key is a no-op.
+type CommitIdempotencyStore interface {
+	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	FetchCommitRecord(ctx context.Context, requestID []byte) ([]byte, error)
+
+	UpdateCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	DeleteCommitRecord(ctx context.Context, requestID []byte) error
+}
+
 // Config is the main config of the Taproot Assets server.
 type Config struct {
 	DebugLevel string
@@ -200,13 +237,20 @@ type Config struct {
 
 	MboxServerConfig authmailbox.ServerConfig
 
-	ReOrgWatcher *tapgarden.ReOrgWatcher
+	// AnchoringWatcher is the re-org watcher: sites register
+	// speculative anchorings with it, and it converges them to
+	// chain truth.
+	AnchoringWatcher *tapreorg.Watcher
 
-	AssetMinter tapgarden.Planter
+	// AnchoringRegistry is the anchoring watcher's durable store,
+	// exposed for the observability surface.
+	AnchoringRegistry *tapdb.ReorgRegistryStore
 
-	AssetCustodian *tapgarden.Custodian
+	AssetMinter *tapgarden.ChainPlanter
 
-	ChainBridge tapgarden.ChainBridge
+	AssetCustodian *tapcustody.Custodian
+
+	ChainBridge tapnode.ChainBridge
 
 	AddrBook *address.Book
 
@@ -220,6 +264,12 @@ type Config struct {
 	ProofArchive proof.Archiver
 
 	AssetWallet tapfreighter.Wallet
+
+	// CommitIdempotency stores CommitVirtualPsbts outcomes keyed by
+	// the caller-supplied request ID. A nil store rejects calls that
+	// set a request ID. Calls that leave the request ID empty do not
+	// touch the store.
+	CommitIdempotency CommitIdempotencyStore
 
 	CoinSelect *tapfreighter.CoinSelect
 
@@ -251,6 +301,12 @@ type Config struct {
 
 	UniverseFederation *universe.FederationEnvoy
 
+	// UniverseConnPool holds a pool of gRPC connections to remote
+	// universe servers, shared by the federation envoy's pushers and
+	// the universe syncer. It is closed during shutdown after the
+	// federation envoy has stopped issuing outbound RPCs.
+	UniverseConnPool UniverseConnPool
+
 	// UniFedSyncAllAssets is a flag that indicates whether the
 	// universe federation syncer should default to syncing all assets.
 	UniFedSyncAllAssets bool
@@ -276,6 +332,11 @@ type Config struct {
 	AuxChanCloser *tapchannel.AuxChanCloser
 
 	AuxSweeper *tapchannel.AuxSweeper
+
+	// BackupUpdater keeps the encrypted asset wallet backup file on disk
+	// in sync with the wallet state. It is nil if the backup file is
+	// disabled.
+	BackupUpdater *backup.Updater
 
 	// UniversePublicAccess is a field that indicates the status of public
 	// access (i.e. read/write) to the universe server.
