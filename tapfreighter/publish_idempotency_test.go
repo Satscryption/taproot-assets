@@ -3,6 +3,7 @@ package tapfreighter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapsend"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
 
@@ -163,6 +165,78 @@ func TestPreAnchoredShipmentReturnsLoggedTransfer(t *testing.T) {
 	select {
 	case extra := <-porter.outboundParcels:
 		t.Fatalf("logged anchor was shipped again: %v", extra)
+
+	default:
+	}
+}
+
+// TestPreAnchoredShipmentDoesNotSucceedAfterDoubleSpend asserts that a
+// transfer row written before broadcast is not a successful publish when
+// that broadcast failed with ErrDoubleSpend. A retry must surface the
+// failure. The same anchor with no request ID, the shape channel
+// funding uses, is not a success either.
+func TestPreAnchoredShipmentDoesNotSucceedAfterDoubleSpend(t *testing.T) {
+	t.Parallel()
+
+	tx := testAnchorTx(1_000)
+	parcelLog := &queryParcelLog{}
+	porter := testPorter(parcelLog)
+	t.Cleanup(func() {
+		close(porter.Quit)
+	})
+
+	parcel := testPreAnchoredParcel(tx)
+	parcel.SetRequestID([]byte("req-fail"))
+
+	done := make(chan shipmentResult, 1)
+	go func() {
+		resp, err := porter.RequestShipment(parcel)
+		done <- shipmentResult{resp: resp, err: err}
+	}()
+
+	var got Parcel
+	select {
+	case got = <-porter.outboundParcels:
+	case <-time.After(2 * time.Second):
+		t.Fatal("anchor was not shipped")
+	}
+
+	// StorePreBroadcast has already persisted the row. Broadcast then
+	// fails because the anchor can never confirm.
+	got.kit().errChan <- fmt.Errorf("unable to broadcast "+
+		"transaction %v: %w", tx.TxHash(), lnwallet.ErrDoubleSpend)
+
+	select {
+	case result := <-done:
+		require.ErrorIs(t, result.err, lnwallet.ErrDoubleSpend)
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("broadcast failure was not delivered")
+	}
+
+	parcelLog.mu.Lock()
+	parcelLog.parcels = []*OutboundParcel{{
+		AnchorTx: tx,
+		Label:    "stranded",
+	}}
+	parcelLog.mu.Unlock()
+
+	retry := testPreAnchoredParcel(tx)
+	retry.SetRequestID([]byte("req-fail"))
+	gotRetry := requestShipmentAsync(t, porter, retry)
+	require.ErrorIs(t, gotRetry.err, lnwallet.ErrDoubleSpend)
+	require.Nil(t, gotRetry.resp)
+
+	// Channel funding and close ship a pre-anchored parcel with no
+	// request ID. A failed broadcast of that anchor is the same row.
+	plain := testPreAnchoredParcel(tx)
+	gotPlain := requestShipmentAsync(t, porter, plain)
+	require.ErrorIs(t, gotPlain.err, lnwallet.ErrDoubleSpend)
+	require.Nil(t, gotPlain.resp)
+
+	select {
+	case extra := <-porter.outboundParcels:
+		t.Fatalf("failed anchor was shipped again: %v", extra)
 
 	default:
 	}
