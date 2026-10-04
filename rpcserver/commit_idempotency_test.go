@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	wrpc "github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
@@ -1264,4 +1266,115 @@ func TestCommitVirtualPsbtsRetainPendingSkipsAbandon(t *testing.T) {
 	_, err = srv.commitVirtualPsbts(ctx, req, once)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, calls.Load())
+}
+
+// TestCommitVirtualPsbtsHugeLockStaysPending tests that a lock duration
+// past the UnixNano range does not decode as an already-expired lease.
+// Recovery must not replace that still-pending request.
+func TestCommitVirtualPsbtsHugeLockStaysPending(t *testing.T) {
+	t.Parallel()
+
+	store := newMemCommitStore()
+	srv := newLeaseServer(store, &leaseWallet{})
+	req := commitIDRequest([]byte("huge-lock"))
+	req.LockExpirationSeconds = math.MaxUint64
+
+	release := make(chan struct{})
+	var closed sync.Once
+	closeRelease := func() {
+		closed.Do(func() { close(release) })
+	}
+	t.Cleanup(closeRelease)
+
+	started := make(chan struct{})
+	var calls atomic.Int32
+	once := func(_ context.Context, _ *wrpc.CommitVirtualPsbtsRequest,
+		hooks *commitVirtualPsbtsHooks) (
+		*wrpc.CommitVirtualPsbtsResponse, error) {
+
+		calls.Add(1)
+		close(started)
+		<-release
+
+		resp := cannedCommitResponse(nil)
+		if err := hooks.onResult(resp); err != nil {
+			return nil, err
+		}
+
+		return resp, nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := srv.commitVirtualPsbts(
+			context.Background(), req, once,
+		)
+		errCh <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the commit attempt")
+	}
+
+	raw, err := store.FetchCommitRecord(
+		context.Background(), req.RequestId,
+	)
+	require.NoError(t, err)
+	rec, err := decodeCommitRecord(raw)
+	require.NoError(t, err)
+
+	var retryCalls atomic.Int32
+	_, err = srv.commitVirtualPsbts(
+		context.Background(), req, successOnce(&retryCalls),
+	)
+	if err == nil {
+		t.Fatalf("retry funded a still-pending request; "+
+			"decoded lease expiry %s", rec.LeaseExpiry.UTC())
+	}
+	assertCode(t, err, codes.Aborted)
+	require.EqualValues(t, 0, retryCalls.Load())
+	require.True(t, time.Now().Before(rec.LeaseExpiry),
+		"decoded lease expiry %s", rec.LeaseExpiry.UTC())
+
+	closeRelease()
+	require.NoError(t, <-errCh)
+	require.EqualValues(t, 1, calls.Load())
+}
+
+// TestUtxoLeaseExpiryBeyondUnixNanoStaysFuture tests that an lnd lease
+// expiration that does not fit in UnixNano is not stored as a past
+// deadline. MaxUint64 used to wrap through int64; MaxInt64 seconds is
+// past the last representable nanosecond timestamp.
+func TestUtxoLeaseExpiryBeyondUnixNanoStaysFuture(t *testing.T) {
+	t.Parallel()
+
+	deadlines := []uint64{
+		math.MaxUint64,
+		uint64(math.MaxInt64),
+	}
+	for _, sec := range deadlines {
+		exp := earliestUtxoLeaseExpiry([]*walletrpc.UtxoLease{
+			{Expiration: sec},
+		})
+		raw, err := encodeCommitRecord(&commitRecord{
+			Status:      commitStatusPending,
+			CreatedAt:   time.Now(),
+			LeaseExpiry: exp,
+		})
+		require.NoError(t, err)
+
+		rec, err := decodeCommitRecord(raw)
+		require.NoError(t, err)
+		require.True(t, time.Now().Before(rec.LeaseExpiry),
+			"seconds %d decoded as %s", sec,
+			rec.LeaseExpiry.UTC())
+	}
+
+	soon := time.Now().Add(time.Hour).Unix()
+	exp := earliestUtxoLeaseExpiry([]*walletrpc.UtxoLease{
+		{Expiration: uint64(soon)},
+	})
+	require.Equal(t, soon, exp.Unix())
 }

@@ -56,9 +56,19 @@ const (
 
 	// maxCommitLockSeconds is the largest lock duration that fits in
 	// a time.Duration. A larger request value would overflow and look
-	// like a lease that already expired.
+	// like a lease that already expired. The UnixNano range is
+	// tighter than that and is applied when the deadline is
+	// computed.
 	maxCommitLockSeconds = uint64(math.MaxInt64 / int64(time.Second))
 )
+
+// maxUnixNanoTime is the latest instant time.Time.UnixNano can
+// represent. A later deadline wraps to a past instant when stored.
+var maxUnixNanoTime = time.Unix(0, math.MaxInt64).UTC()
+
+// minUnixNanoTime is the earliest instant time.Time.UnixNano can
+// represent.
+var minUnixNanoTime = time.Unix(0, math.MinInt64).UTC()
 
 var (
 	// errLeasesUnavailable is returned when the daemon has no lnd
@@ -311,7 +321,9 @@ func (r *RPCServer) commitHooks(requestID []byte,
 				}
 				rec.Outpoints = utxos
 				if !expiry.IsZero() {
-					rec.LeaseExpiry = expiry
+					rec.LeaseExpiry = clampUnixNanoTime(
+						expiry,
+					)
 				}
 
 				return nil
@@ -475,9 +487,9 @@ func (r *RPCServer) insertPendingCommit(ctx context.Context,
 		RequestHash: hash,
 		LockID:      append([]byte(nil), req.CustomLockId...),
 		CreatedAt:   now,
-		LeaseExpiry: now.Add(commitLockDuration(
-			req.LockExpirationSeconds,
-		)),
+		LeaseExpiry: commitLeaseDeadline(
+			now, req.LockExpirationSeconds,
+		),
 	}
 	encoded, err := encodeCommitRecord(rec)
 	if err != nil {
@@ -820,13 +832,21 @@ func encodeCommitRecord(rec *commitRecord) ([]byte, error) {
 	}
 	buf.Write(rec.Response)
 
+	createdNano, err := unixNano(rec.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("encode commit created time: %w", err)
+	}
+	expiryNano, err := unixNano(clampUnixNanoTime(rec.LeaseExpiry))
+	if err != nil {
+		return nil, fmt.Errorf("encode commit lease expiry: %w", err)
+	}
 	if err := binary.Write(
-		&buf, binary.BigEndian, unixNano(rec.CreatedAt),
+		&buf, binary.BigEndian, createdNano,
 	); err != nil {
 		return nil, err
 	}
 	if err := binary.Write(
-		&buf, binary.BigEndian, unixNano(rec.LeaseExpiry),
+		&buf, binary.BigEndian, expiryNano,
 	); err != nil {
 		return nil, err
 	}
@@ -936,8 +956,19 @@ func decodeCommitRecord(raw []byte) (*commitRecord, error) {
 			return nil, fmt.Errorf("read commit lease expiry: %w",
 				err)
 		}
-		createdAt = timeFromUnixNano(createdNano)
-		leaseExpiry = timeFromUnixNano(expiryNano)
+		var decErr error
+		createdAt, decErr = timeFromUnixNano(createdNano)
+		if decErr != nil {
+			return nil, fmt.Errorf(
+				"commit created time: %w", decErr,
+			)
+		}
+		leaseExpiry, decErr = timeFromUnixNano(expiryNano)
+		if decErr != nil {
+			return nil, fmt.Errorf(
+				"commit lease expiry: %w", decErr,
+			)
+		}
 	}
 
 	return &commitRecord{
@@ -1059,7 +1090,7 @@ func (r *RPCServer) backfillPendingLeases(ctx context.Context,
 			if exp := earliestDescriptorExpiry(
 				state.live,
 			); !exp.IsZero() {
-				cur.LeaseExpiry = exp
+				cur.LeaseExpiry = clampUnixNanoTime(exp)
 			}
 
 			return nil
@@ -1153,7 +1184,7 @@ func earliestUtxoLeaseExpiry(leases []*walletrpc.UtxoLease) time.Time {
 			continue
 		}
 
-		exp := time.Unix(int64(lease.Expiration), 0)
+		exp := timeFromUnixSeconds(lease.Expiration)
 		if earliest.IsZero() || exp.Before(earliest) {
 			earliest = exp
 		}
@@ -1173,22 +1204,96 @@ func commitLockDuration(seconds uint64) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// commitLeaseDeadline is when a not-yet-funded attempt may be replaced.
+// The duration is clamped so the stored UnixNano cannot wrap into the
+// past and let recovery treat the attempt as already expired.
+func commitLeaseDeadline(now time.Time, seconds uint64) time.Time {
+	if !now.Before(maxUnixNanoTime) {
+		return maxUnixNanoTime
+	}
+
+	d := commitLockDuration(seconds)
+	if remain := maxUnixNanoTime.Sub(now); d > remain {
+		d = remain
+	}
+
+	return now.Add(d)
+}
+
+// clampUnixNanoTime saturates t at the UnixNano bounds. The zero time
+// stays zero so a missing deadline is unchanged.
+func clampUnixNanoTime(t time.Time) time.Time {
+	switch {
+	case t.IsZero():
+		return t
+
+	case t.After(maxUnixNanoTime):
+		return maxUnixNanoTime
+
+	case t.Before(minUnixNanoTime):
+		return minUnixNanoTime
+
+	default:
+		return t
+	}
+}
+
+// timeFromUnixSeconds converts an lnd lease expiration. Values past the
+// UnixNano range saturate at its end. A uint64 that does not fit in
+// int64 must not be cast: that wrap is a time in the past.
+func timeFromUnixSeconds(sec uint64) time.Time {
+	if sec == 0 {
+		return time.Time{}
+	}
+
+	maxSec := uint64(maxUnixNanoTime.Unix())
+	if sec > maxSec {
+		return maxUnixNanoTime
+	}
+
+	return time.Unix(int64(sec), 0).UTC()
+}
+
 func sameCommitAttempt(stored, attempt time.Time) bool {
 	return stored.Equal(attempt)
 }
 
-func unixNano(t time.Time) int64 {
+// unixNano encodes t. It refuses a time UnixNano cannot represent,
+// because that call wraps and decodes as a different instant.
+func unixNano(t time.Time) (int64, error) {
 	if t.IsZero() {
-		return 0
+		return 0, nil
+	}
+	if t.Before(minUnixNanoTime) || t.After(maxUnixNanoTime) {
+		return 0, fmt.Errorf(
+			"time %s is outside the UnixNano range", t.UTC(),
+		)
 	}
 
-	return t.UnixNano()
+	n := t.UnixNano()
+	if !time.Unix(0, n).Equal(t) {
+		return 0, fmt.Errorf(
+			"time %s is outside the UnixNano range", t.UTC(),
+		)
+	}
+
+	return n, nil
 }
 
-func timeFromUnixNano(n int64) time.Time {
+// timeFromUnixNano decodes a stored timestamp. A value that does not
+// round-trip is rejected so it cannot be read as an earlier deadline.
+func timeFromUnixNano(n int64) (time.Time, error) {
 	if n == 0 {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 
-	return time.Unix(0, n)
+	t := time.Unix(0, n)
+	if t.UnixNano() != n {
+		return time.Time{}, fmt.Errorf(
+			"commit timestamp %d is outside the UnixNano range",
+			n,
+		)
+	}
+
+	return t, nil
 }
