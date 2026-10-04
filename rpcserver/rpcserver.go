@@ -3291,6 +3291,19 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 		}()
 	}
 
+	// lnd's coin selection ignores the boolean value of the "add" change
+	// output option (see taproot-assets#2209), so if the caller explicitly
+	// asked for no new change output we must verify the funded packet
+	// ourselves and fail closed (the deferred cleanup above releases the
+	// leases lnd just took). skip_funding never reaches lnd, so it is
+	// left unchanged.
+	if noNewAnchorChangeRequested(req) {
+		err := checkNoNewAnchorChange(pkt, fundedPacket, changeIndex)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// We can now update the anchor outputs as we have the final
 	// commitments.
 	outputCommitments, err := tapsend.CreateOutputCommitments(allPackets)
