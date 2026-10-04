@@ -518,13 +518,36 @@ var fundBatchCommand = cli.Command{
 }
 
 func fundBatch(ctx *cli.Context) error {
+	req, err := fundBatchRequest(ctx)
+	if err != nil {
+		return err
+	}
+
 	ctxc := getContext()
 	client, cleanUp := getMintClient(ctx)
 	defer cleanUp()
 
+	resp, err := client.FundBatch(ctxc, req)
+	if err != nil {
+		return fmt.Errorf("unable to fund batch: %w", err)
+	}
+
+	printRespJSON(resp)
+	return nil
+}
+
+// fundBatchRequest parses `assets mint fund` flags into the RPC request.
+func fundBatchRequest(ctx *cli.Context) (*mintrpc.FundBatchRequest, error) {
 	feeRate, err := parseFeeRate(ctx)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	// Reject custom-anchor output controls before building the request.
+	// They are only read when --anchor_psbt is set; dropping them here
+	// would fund a wallet batch instead.
+	if err := customAnchorFlagsWithoutPsbt(ctx); err != nil {
+		return nil, err
 	}
 
 	req := &mintrpc.FundBatchRequest{
@@ -535,16 +558,17 @@ func fundBatch(ctx *cli.Context) error {
 		anchorPath := tapcfg.CleanAndExpandPath(path)
 		req.AnchorPsbt, err = os.ReadFile(anchorPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		assetIdx := ctx.Uint64(assetAnchorOutputIndexName)
 		if assetIdx > math.MaxUint32 {
-			return fmt.Errorf("asset anchor output index out of " +
-				"range")
+			return nil, fmt.Errorf("asset anchor output index " +
+				"out of range")
 		}
 		changeIdx := ctx.Int64(changeOutputIndexName)
 		if changeIdx < 0 || changeIdx > math.MaxInt32 {
-			return fmt.Errorf("change output index out of range")
+			return nil, fmt.Errorf("change output index out of " +
+				"range")
 		}
 		req.AssetAnchorOutputIndex = uint32(assetIdx)
 		req.ChangeOutputIndex = int32(changeIdx)
@@ -552,7 +576,7 @@ func fundBatch(ctx *cli.Context) error {
 		if ctx.IsSet(preCommitOutputIndexName) {
 			preCommitIdx := ctx.Uint64(preCommitOutputIndexName)
 			if preCommitIdx > math.MaxUint32 {
-				return fmt.Errorf(
+				return nil, fmt.Errorf(
 					"pre-commitment output " +
 						"index out of range",
 				)
@@ -560,13 +584,40 @@ func fundBatch(ctx *cli.Context) error {
 			req.PreCommitOutputIndex = fn.Ptr(uint32(preCommitIdx))
 		}
 	}
-	resp, err := client.FundBatch(ctxc, req)
-	if err != nil {
-		return fmt.Errorf("unable to fund batch: %w", err)
+
+	return req, nil
+}
+
+// customAnchorFlagsWithoutPsbt rejects output-selection flags that apply
+// only to a caller-funded anchor when that PSBT was not provided.
+func customAnchorFlagsWithoutPsbt(ctx *cli.Context) error {
+	if ctx.String(anchorPsbtName) != "" {
+		return nil
 	}
 
-	printRespJSON(resp)
-	return nil
+	var flags []string
+	if ctx.Bool(noChangeOutputName) {
+		flags = append(flags, "--"+noChangeOutputName)
+	}
+	if ctx.IsSet(preCommitOutputIndexName) {
+		flags = append(flags, "--"+preCommitOutputIndexName)
+	}
+	if ctx.IsSet(assetAnchorOutputIndexName) &&
+		ctx.Uint64(assetAnchorOutputIndexName) != 0 {
+
+		flags = append(flags, "--"+assetAnchorOutputIndexName)
+	}
+	if ctx.IsSet(changeOutputIndexName) &&
+		ctx.Int64(changeOutputIndexName) != 0 {
+
+		flags = append(flags, "--"+changeOutputIndexName)
+	}
+	if len(flags) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%s can only be set with --%s",
+		strings.Join(flags, ", "), anchorPsbtName)
 }
 
 var prepareBatchCommand = cli.Command{
