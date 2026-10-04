@@ -3542,8 +3542,10 @@ func (r *RPCServer) validateInputAssets(ctx context.Context,
 // given active and passive assets in the database and ships any outgoing proofs
 // to the counterparties.
 //
-// A repeat call for an anchor that is already logged returns that transfer
-// and does not log or publish it again.
+// A repeat call for an anchor that was published returns that transfer
+// and does not log or publish it again. A transfer whose broadcast
+// failed with a double spend is not a successful publish; that failure
+// is returned instead of the logged row.
 func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 	req *wrpc.PublishAndLogRequest) (*taprpc.SendAssetResponse, error) {
 

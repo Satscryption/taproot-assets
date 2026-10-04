@@ -164,8 +164,8 @@ type ChainPorter struct {
 	// subscriberMtx guards the subscribers map.
 	subscriberMtx sync.Mutex
 
-	// publishMu guards pre-anchored in-flight shipments and the
-	// process-local request ID bindings.
+	// publishMu guards pre-anchored in-flight shipments, the
+	// process-local request ID bindings, and terminal broadcast errors.
 	publishMu sync.Mutex
 
 	// preAnchoredFlights coalesces concurrent publishes of one anchor
@@ -177,6 +177,12 @@ type ChainPorter struct {
 	// life of the process. After a restart the anchor transaction,
 	// which the retry still carries, is the durable key.
 	publishRequestIDs map[string]chainhash.Hash
+
+	// terminalBroadcasts records anchors whose broadcast failed with
+	// ErrDoubleSpend. The transfer row is written before that
+	// broadcast, so a later publish of the same anchor must return
+	// this failure instead of the row. The anchor can never confirm.
+	terminalBroadcasts map[chainhash.Hash]error
 
 	*fn.ContextGuard
 }
@@ -196,6 +202,9 @@ func NewChainPorter(cfg *ChainPorterConfig) *ChainPorter {
 			map[chainhash.Hash]*preAnchoredFlight,
 		),
 		publishRequestIDs: make(map[string]chainhash.Hash),
+		terminalBroadcasts: make(
+			map[chainhash.Hash]error,
+		),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: tapgarden.DefaultTimeout,
 			Quit:           make(chan struct{}),
@@ -556,6 +565,11 @@ func (p *ChainPorter) requestPreAnchoredShipment(
 	resp, err := p.shipPreAnchored(parcel)
 
 	p.publishMu.Lock()
+	// The row is durable before broadcast. Remember a double spend
+	// so a retry cannot report that row as a successful publish.
+	if errors.Is(err, lnwallet.ErrDoubleSpend) {
+		p.terminalBroadcasts[txHash] = err
+	}
 	flight.finish(resp, err)
 	delete(p.preAnchoredFlights, txHash)
 	p.publishMu.Unlock()
@@ -584,8 +598,21 @@ func (p *ChainPorter) bindPublishRequestID(id []byte,
 	return nil
 }
 
+// terminalBroadcastFailure returns the double-spend error recorded for
+// txHash, or nil. The caller must not hold publishMu.
+func (p *ChainPorter) terminalBroadcastFailure(
+	txHash chainhash.Hash) error {
+
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+
+	return p.terminalBroadcasts[txHash]
+}
+
 // shipPreAnchored returns the transfer already logged for the parcel's
-// anchor, or enqueues a new shipment when none is logged.
+// anchor, or enqueues a new shipment when none is logged. A logged
+// anchor whose broadcast failed with ErrDoubleSpend is returned as
+// that failure.
 func (p *ChainPorter) shipPreAnchored(
 	parcel *PreAnchoredParcel) (*OutboundParcel, error) {
 
@@ -599,6 +626,18 @@ func (p *ChainPorter) shipPreAnchored(
 			err)
 	}
 	if len(existing) > 0 {
+		// A row is written in StorePreBroadcast, before
+		// PublishTransaction. ErrDoubleSpend means that anchor
+		// can never confirm; the row is not a successful publish.
+		bcastErr := p.terminalBroadcastFailure(txHash)
+		if bcastErr != nil {
+			log.Infof("Anchor transaction %v was logged but its "+
+				"broadcast failed and can never confirm",
+				txHash)
+
+			return nil, bcastErr
+		}
+
 		log.Infof("Anchor transaction %v already logged; returning "+
 			"the existing transfer", txHash)
 
