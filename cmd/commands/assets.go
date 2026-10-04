@@ -560,6 +560,16 @@ func fundBatchRequest(ctx *cli.Context) (*mintrpc.FundBatchRequest, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// FundBatch selects custom funding only when anchor_psbt
+		// is non-empty. A zero-length file would otherwise fund
+		// from the daemon wallet.
+		if len(req.AnchorPsbt) == 0 {
+			return nil, fmt.Errorf(
+				"--%s file is empty: %s", anchorPsbtName,
+				anchorPath,
+			)
+		}
 		assetIdx := ctx.Uint64(assetAnchorOutputIndexName)
 		if assetIdx > math.MaxUint32 {
 			return nil, fmt.Errorf("asset anchor output index " +

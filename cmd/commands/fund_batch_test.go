@@ -126,3 +126,36 @@ func TestFundBatchRejectsCustomAnchorFlagsWithoutPsbt(t *testing.T) {
 		require.EqualValues(t, 1, req.AssetAnchorOutputIndex)
 	})
 }
+
+// TestFundBatchRejectsEmptyAnchorPsbtFile ensures a zero-length
+// --anchor_psbt file is rejected before a funding request is built.
+// os.ReadFile succeeds on that file, and FundBatch treats an empty
+// anchor_psbt as wallet funding.
+func TestFundBatchRejectsEmptyAnchorPsbtFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "anchor.psbt")
+	require.NoError(t, os.WriteFile(path, []byte{}, 0o600))
+
+	ctx := fundBatchCLIContext(t, []string{
+		"--" + anchorPsbtName, path,
+	})
+	req, err := fundBatchRequest(ctx)
+	summary := "<nil>"
+	if req != nil {
+		summary = fmt.Sprintf(
+			"anchor_len=%d no_change=%v pre_commit_set=%v "+
+				"asset_idx=%d change_idx=%d",
+			len(req.AnchorPsbt), req.NoChangeOutput,
+			req.PreCommitOutputIndex != nil,
+			req.AssetAnchorOutputIndex, req.ChangeOutputIndex,
+		)
+	}
+	require.Error(
+		t, err, "accepted empty --%s file: %s", anchorPsbtName,
+		summary,
+	)
+	require.Nil(t, req)
+	require.ErrorContains(t, err, "empty")
+	require.ErrorContains(t, err, "--"+anchorPsbtName)
+}
