@@ -3459,6 +3459,9 @@ func (r *RPCServer) validateInputAssets(ctx context.Context,
 // and publishes it to the Bitcoin network. It also logs the transfer of the
 // given active and passive assets in the database and ships any outgoing proofs
 // to the counterparties.
+//
+// A repeat call for an anchor that is already logged returns that transfer
+// and does not log or publish it again.
 func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 	req *wrpc.PublishAndLogRequest) (*taprpc.SendAssetResponse, error) {
 
@@ -3482,21 +3485,8 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
-	// Before we commit the transaction to the database, we want to make
-	// sure everything is in order. We start by validating the inputs.
 	allPackets := append([]*tappsbt.VPacket{}, activePackets...)
 	allPackets = append(allPackets, passivePackets...)
-	err = r.validateInputAssets(ctx, pkt, allPackets)
-	if err != nil {
-		return nil, fmt.Errorf("error validating input assets: %w", err)
-	}
-
-	// And then the outputs as well.
-	err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
-	if err != nil {
-		return nil, fmt.Errorf("error validating anchor outputs: %w",
-			err)
-	}
 
 	chainFees, err := pkt.GetTxFee()
 	if err != nil {
@@ -3504,12 +3494,38 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
-	// The BTC level transaction must be fully complete, and we must be able
-	// to extract the final transaction from it.
+	// Extract the final transaction before input validation. A retry of
+	// an already-logged anchor must be reconciled even when those inputs
+	// are now leased or spent, which would fail validation.
 	finalTx, err := psbt.Extract(pkt)
 	if err != nil {
 		return nil, fmt.Errorf("error extracting final anchor "+
 			"transaction: %w", err)
+	}
+
+	anchorHash := finalTx.TxHash()
+	logged, err := r.cfg.ChainPorter.QueryParcels(
+		ctx, fn.Some(anchorHash), false,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error querying logged transfer: %w",
+			err)
+	}
+
+	// Nothing is logged yet, so this is the first publish. Validate
+	// before the porter writes the transfer.
+	if len(logged) == 0 {
+		err = r.validateInputAssets(ctx, pkt, allPackets)
+		if err != nil {
+			return nil, fmt.Errorf("error validating input "+
+				"assets: %w", err)
+		}
+
+		err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
+		if err != nil {
+			return nil, fmt.Errorf("error validating anchor "+
+				"outputs: %w", err)
+		}
 	}
 
 	anchorTx := &tapsend.AnchorTransaction{
@@ -3541,18 +3557,17 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 		parcelLabel = req.Label
 	}
 
-	// We now have everything to ship the pre-anchored parcel using the
-	// freighter. This will publish the TX, create the transfer database
-	// entries and ship the proofs to the counterparties. It'll also wait
-	// for a confirmation and then update the proofs with the block header
-	// information.
-	resp, err := r.cfg.ChainPorter.RequestShipment(
-		tapfreighter.NewPreAnchoredParcel(
-			activePackets, passivePackets, anchorTx,
-			req.SkipAnchorTxBroadcast, parcelLabel,
-			fn.None[uint32](),
-		),
+	// Ship the pre-anchored parcel. When this anchor is already logged,
+	// the porter returns that transfer and does not publish it again.
+	// Otherwise it logs the transfer, publishes, and ships proofs.
+	preAnchored := tapfreighter.NewPreAnchoredParcel(
+		activePackets, passivePackets, anchorTx,
+		req.SkipAnchorTxBroadcast, parcelLabel,
+		fn.None[uint32](),
 	)
+	preAnchored.SetRequestID(req.GetRequestId())
+
+	resp, err := r.cfg.ChainPorter.RequestShipment(preAnchored)
 	if err != nil {
 		return nil, fmt.Errorf("error requesting delivery: %w", err)
 	}
