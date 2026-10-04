@@ -42,6 +42,15 @@ type AssetWalletClient interface {
 	// transaction and publishes it to the Bitcoin network. It also logs the
 	// transfer of the given active and passive assets in the database and ships
 	// any outgoing proofs to the counterparties.
+	//
+	// The RPC is safe to retry after a lost response. A repeat call whose
+	// final anchor transaction is already logged returns that transfer as the
+	// SendAssetResponse and does not insert another asset_transfers row or
+	// publish the anchor again. Callers reconcile by retrying this RPC (with
+	// the same request_id when they set one) or by calling ListTransfers with
+	// the anchor txid. An empty request_id still reconciles by the anchor
+	// transaction. A request_id must not be reused for a different anchor
+	// transaction.
 	PublishAndLogTransfer(ctx context.Context, in *PublishAndLogRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
@@ -258,6 +267,15 @@ type AssetWalletServer interface {
 	// transaction and publishes it to the Bitcoin network. It also logs the
 	// transfer of the given active and passive assets in the database and ships
 	// any outgoing proofs to the counterparties.
+	//
+	// The RPC is safe to retry after a lost response. A repeat call whose
+	// final anchor transaction is already logged returns that transfer as the
+	// SendAssetResponse and does not insert another asset_transfers row or
+	// publish the anchor again. Callers reconcile by retrying this RPC (with
+	// the same request_id when they set one) or by calling ListTransfers with
+	// the anchor txid. An empty request_id still reconciles by the anchor
+	// transaction. A request_id must not be reused for a different anchor
+	// transaction.
 	PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
