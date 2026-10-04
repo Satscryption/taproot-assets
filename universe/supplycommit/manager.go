@@ -18,6 +18,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/protofsm"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -132,8 +133,22 @@ type Manager struct {
 	// used to create guarded contexts.
 	*fn.ContextGuard
 
-	startOnce sync.Once
-	stopOnce  sync.Once
+	// startMu serializes Start. Registration failure must stay
+	// retryable: a sync.Once would consume the attempt, and a later
+	// Start would report success without subscribing.
+	startMu sync.Mutex
+
+	// started is true once Start has completed without error. Further
+	// Start calls are then a no-op.
+	started bool
+
+	stopOnce sync.Once
+
+	// smFlight collapses concurrent creates of one group into a single
+	// call. The cache mutex covers one map operation, so two callers
+	// can otherwise both miss and start a machine from the same
+	// durable state. Different groups still create in parallel.
+	smFlight singleflight.Group
 }
 
 // NewManager creates a new multi state machine manager.
@@ -147,46 +162,58 @@ func NewManager(cfg ManagerCfg) *Manager {
 	}
 }
 
-// Start starts the multi state machine manager.
+// Start starts the multi state machine manager. When idle successors or
+// automatic publishing is enabled, Start registers for block epochs and
+// launches the idle ticker. A failed registration is returned and is not
+// latched, so a later Start retries it. Once Start has succeeded, further
+// calls are a no-op.
 func (m *Manager) Start() error {
-	var startErr error
-	m.startOnce.Do(func() {
-		// Initialize the state machine cache.
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	if m.started {
+		return nil
+	}
+
+	// The cache is created even when registration fails, so Stop can
+	// run after a failed Start. A retry must not replace it: a caller
+	// may already have stored a machine there.
+	if m.smCache == nil {
 		m.smCache = newStateMachineCache()
+	}
 
-		// If idle successors or automatic publishing is enabled, we
-		// need to tick the state machines as new blocks arrive.
-		if !m.cfg.autoCommitEnabled() {
-			return
-		}
+	// If idle successors or automatic publishing is enabled, we need
+	// to tick the state machines as new blocks arrive.
+	if !m.cfg.autoCommitEnabled() {
+		m.started = true
+		return nil
+	}
 
-		ctx, cancel := m.WithCtxQuitNoTimeout()
-		blockChan, errChan, err := m.cfg.Chain.RegisterBlockEpochNtfn(
-			ctx,
-		)
-		if err != nil {
-			cancel()
-			startErr = fmt.Errorf("unable to register for block "+
-				"epochs: %w", err)
+	ctx, cancel := m.WithCtxQuitNoTimeout()
+	blockChan, errChan, err := m.cfg.Chain.RegisterBlockEpochNtfn(
+		ctx,
+	)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("unable to register for block epochs: %w",
+			err)
+	}
 
-			return
-		}
+	log.Infof("Supply commit idle ticker enabled "+
+		"(idle_commit_interval=%d blocks, "+
+		"auto_publish_pending=%v)", m.cfg.IdleCommitInterval,
+		m.cfg.AutoPublishPending)
 
-		log.Infof("Supply commit idle ticker enabled "+
-			"(idle_commit_interval=%d blocks, "+
-			"auto_publish_pending=%v)", m.cfg.IdleCommitInterval,
-			m.cfg.AutoPublishPending)
+	m.Wg.Add(1)
+	go func() {
+		defer m.Wg.Done()
+		defer cancel()
 
-		m.Wg.Add(1)
-		go func() {
-			defer m.Wg.Done()
-			defer cancel()
+		m.idleTickLoop(ctx, blockChan, errChan)
+	}()
 
-			m.idleTickLoop(ctx, blockChan, errChan)
-		}()
-	})
-
-	return startErr
+	m.started = true
+	return nil
 }
 
 // idleTickLoop sends an IdleTickEvent to the state machine of every locally
@@ -196,7 +223,17 @@ func (m *Manager) idleTickLoop(ctx context.Context, blockChan chan int32,
 
 	for {
 		select {
-		case height := <-blockChan:
+		case height, ok := <-blockChan:
+			// A closed epoch stream, as when lnd severs
+			// subscriptions, delivers a zero height on every
+			// receive. Leave instead of ticking that height
+			// forever. A real block at height 0 still has
+			// ok set.
+			if !ok {
+				log.Infof("Supply commit idle ticker " +
+					"stopped, block epoch stream closed")
+				return
+			}
 			if height < 0 {
 				continue
 			}
@@ -399,26 +436,47 @@ func (m *Manager) fetchStateMachine(
 			err)
 	}
 
-	// Check if the state machine for the asset group already exists in the
-	// cache.
-	sm, ok := m.smCache.Get(*groupKey)
-	if ok {
-		// If the state machine is found and is running, return it.
-		if sm.IsRunning() {
-			return sm, nil
-		}
-
-		// If the state machine exists but is not running, replace it in
-		// the cache with a new running instance.
+	// Fast path: the usual case is a machine that is already running.
+	if sm, ok := m.runningMachine(*groupKey); ok {
+		return sm, nil
 	}
 
-	// Before we can create a state machine, we need to ensure that the
-	// asset group supports supply commitments. If it doesn't, then we
-	// return an error.
+	// Creation reads the durable state and starts a goroutine. Share
+	// that work per group so a second caller, including the idle
+	// ticker, adopts the machine instead of starting another from the
+	// same state.
+	flightKey := string(groupKey.SerializeCompressed())
+	created, err, _ := m.smFlight.Do(flightKey, func() (any, error) {
+		return m.createStateMachine(assetSpec, groupKey)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return created.(*StateMachine), nil
+}
+
+// createStateMachine returns the running machine for the group, creating
+// and caching one when none is running. Callers must already be inside
+// smFlight for this group so two creates cannot overlap.
+func (m *Manager) createStateMachine(assetSpec asset.Specifier,
+	groupKey *btcec.PublicKey) (*StateMachine, error) {
+
+	// Re-check under the flight. A caller that lost the race finds
+	// the winner's machine here.
+	if sm, ok := m.runningMachine(*groupKey); ok {
+		return sm, nil
+	}
+
+	// Nothing running is cached (a stopped machine falls through).
+	// Before creating one, ensure that the asset group supports supply
+	// commitments. If it doesn't, then we return an error.
 	ctx, cancel := m.WithCtxQuitNoTimeout()
 	defer cancel()
 
-	err = CheckSupplyCommitSupport(ctx, m.cfg.AssetLookup, assetSpec, true)
+	err := CheckSupplyCommitSupport(
+		ctx, m.cfg.AssetLookup, assetSpec, true,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure supply commit "+
 			"support for asset: %w", err)
@@ -427,12 +485,26 @@ func (m *Manager) fetchStateMachine(
 	// Start the state machine and add it to the cache.
 	newSm, err := m.startAssetSM(ctx, assetSpec)
 	if err != nil {
-		return nil, fmt.Errorf("unable to start state machine: %w", err)
+		return nil, fmt.Errorf("unable to start state machine: %w",
+			err)
 	}
 
 	m.smCache.Set(*groupKey, newSm)
 
 	return newSm, nil
+}
+
+// runningMachine returns the cached state machine for the group when it
+// exists and is running.
+func (m *Manager) runningMachine(groupKey btcec.PublicKey) (*StateMachine,
+	bool) {
+
+	sm, ok := m.smCache.Get(groupKey)
+	if !ok || !sm.IsRunning() {
+		return nil, false
+	}
+
+	return sm, true
 }
 
 // SendEvent sends an event to the state machine associated with the given asset
