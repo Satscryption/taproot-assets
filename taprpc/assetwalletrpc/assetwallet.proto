@@ -56,7 +56,9 @@ service AssetWallet {
     the same request_id when they set one) or by calling ListTransfers with
     the anchor txid. An empty request_id still reconciles by the anchor
     transaction. A request_id must not be reused for a different anchor
-    transaction.
+    transaction while that publish is in flight. The binding is
+    process-local and in-flight only: it is released when the publish
+    completes or fails, and it is not kept across a daemon restart.
     */
     rpc PublishAndLogTransfer (PublishAndLogRequest)
         returns (taprpc.SendAssetResponse);
@@ -484,8 +486,11 @@ message PublishAndLogRequest {
     Optional caller-chosen idempotency key for this publish. A retry that
     repeats the key with the same anchor transaction returns the transfer
     already logged for that anchor. Reusing the key for a different anchor
-    transaction is rejected. An empty key still reconciles by the anchor
-    transaction, so a lost response can be retried safely.
+    transaction is rejected while that publish is in flight. The binding is
+    process-local and in-flight only: it is released when the publish
+    completes or fails and is not kept across a daemon restart. An empty
+    key still reconciles by the anchor transaction, so a lost response can
+    be retried safely.
     */
     bytes request_id = 8;
 }

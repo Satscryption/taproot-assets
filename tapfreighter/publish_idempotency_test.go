@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -325,6 +328,84 @@ func TestPublishRequestIDsReleasedWhenPublishEnds(t *testing.T) {
 	porter.publishMu.Lock()
 	defer porter.publishMu.Unlock()
 	require.Empty(t, porter.publishRequestIDs)
+}
+
+// TestPublishRequestIDContractIsProcessLocal asserts the published
+// contract matches the binding we keep: process-local and in-flight
+// only. A new porter is a restart and accepts an id the previous
+// process already used.
+func TestPublishRequestIDContractIsProcessLocal(t *testing.T) {
+	t.Parallel()
+
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	root := filepath.Join(filepath.Dir(file), "..")
+
+	const phrase = "process-local and in-flight only"
+	for _, rel := range []string{
+		"taprpc/assetwalletrpc/assetwallet.proto",
+		"docs/release-notes/release-notes-0.9.0.md",
+	} {
+		body, err := os.ReadFile(filepath.Join(root, rel))
+		require.NoError(t, err)
+		require.Contains(t, string(body), phrase, rel)
+	}
+
+	notes, err := os.ReadFile(filepath.Join(
+		root, "docs/release-notes/release-notes-0.9.0.md",
+	))
+	require.NoError(t, err)
+	require.NotContains(t, string(notes), "life of the process")
+
+	tx := testAnchorTx(1_000)
+	previous := testPorter(&queryParcelLog{
+		parcels: []*OutboundParcel{{AnchorTx: tx}},
+	})
+	t.Cleanup(func() {
+		close(previous.Quit)
+	})
+
+	parcel := testPreAnchoredParcel(tx)
+	parcel.SetRequestID([]byte("restart-id"))
+	got := requestShipmentAsync(t, previous, parcel)
+	require.NoError(t, got.err)
+
+	restarted := testPorter(&queryParcelLog{})
+	t.Cleanup(func() {
+		close(restarted.Quit)
+	})
+
+	other := testPreAnchoredParcel(testAnchorTx(2_000))
+	other.SetRequestID([]byte("restart-id"))
+
+	done := make(chan shipmentResult, 1)
+	go func() {
+		resp, err := restarted.RequestShipment(other)
+		done <- shipmentResult{resp: resp, err: err}
+	}()
+
+	select {
+	case shipped := <-restarted.outboundParcels:
+		shipped.kit().respChan <- &OutboundParcel{
+			AnchorTx: other.anchorTx.FinalTx,
+		}
+
+	case result := <-done:
+		require.NotErrorIs(t, result.err, ErrPublishRequestIDReused)
+		t.Fatalf("restarted porter rejected the publish: %v",
+			result.err)
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("restarted porter did not accept the request id")
+	}
+
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("restarted publish did not finish")
+	}
 }
 
 // TestPreAnchoredShipmentQueryErrorDoesNotEnqueue asserts that a failed
