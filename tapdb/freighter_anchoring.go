@@ -1126,6 +1126,123 @@ func (a *AssetStore) rollBackPassiveFile(ctx context.Context,
 	return truncated, nil
 }
 
+// cloneProofFile returns an independent copy of a proof file.
+func cloneProofFile(file *proof.File) (*proof.File, error) {
+	if file == nil {
+		return nil, fmt.Errorf("proof file is nil")
+	}
+
+	var buf bytes.Buffer
+	if err := file.Encode(&buf); err != nil {
+		return nil, err
+	}
+
+	cloned := &proof.File{}
+	if err := cloned.Decode(bytes.NewReader(buf.Bytes())); err != nil {
+		return nil, err
+	}
+
+	return cloned, nil
+}
+
+// burnLeafProof returns a self-contained copy of a confirmed burn
+// suffix for a supply-commitment burn leaf. Universe servers verify
+// that leaf with no prior snapshot, so the copy embeds the full proof
+// file of every input the burn spends, including the primary input
+// whose provenance a proof file would otherwise carry as its prefix.
+//
+// suffix is not modified. inputFiles are the spent inputs keyed by
+// witness PrevID, and must be the files from before the suffix was
+// appended to the primary input. A duplicate witness, a missing or
+// empty file, or a file whose tip is not the spent input fails closed.
+// The encoded leaf must fit in proof.FileMaxProofSizeBytes, which is
+// the largest proof a verifier will accept.
+func burnLeafProof(suffix *proof.Proof,
+	inputFiles map[asset.PrevID]*proof.File) (*proof.Proof, error) {
+
+	if suffix == nil {
+		return nil, fmt.Errorf("burn output proof suffix is nil")
+	}
+
+	witnesses := suffix.Asset.Witnesses()
+	if len(witnesses) == 0 {
+		return nil, fmt.Errorf("burn output has no input witnesses")
+	}
+
+	seen := make(map[asset.PrevID]struct{}, len(witnesses))
+	files := make([]proof.File, 0, len(witnesses))
+	for idx := range witnesses {
+		prevID := witnesses[idx].PrevID
+		if prevID == nil {
+			return nil, fmt.Errorf("burn input witness %d has "+
+				"no previous ID", idx)
+		}
+		if _, ok := seen[*prevID]; ok {
+			return nil, fmt.Errorf("duplicate burn input %v",
+				prevID.OutPoint)
+		}
+		seen[*prevID] = struct{}{}
+
+		inputFile := inputFiles[*prevID]
+		if inputFile == nil {
+			return nil, fmt.Errorf("missing proof for burn "+
+				"input %v", prevID.OutPoint)
+		}
+		if inputFile.NumProofs() == 0 {
+			return nil, fmt.Errorf("empty proof for burn input %v",
+				prevID.OutPoint)
+		}
+
+		last, err := inputFile.LastProof()
+		if err != nil {
+			return nil, fmt.Errorf("invalid proof for burn "+
+				"input %v: %w", prevID.OutPoint, err)
+		}
+
+		lastID := asset.PrevID{
+			OutPoint: last.OutPoint(),
+			ID:       last.Asset.ID(),
+			ScriptKey: asset.ToSerialized(
+				last.Asset.ScriptKey.PubKey,
+			),
+		}
+		if lastID != *prevID {
+			return nil, fmt.Errorf("burn input proof mismatch: "+
+				"expected %v, got %v", *prevID, lastID)
+		}
+
+		files = append(files, *inputFile)
+	}
+
+	// Deep copy so the leaf does not share the suffix's additional
+	// input slice with the proof file AppendProof already stored.
+	var buf bytes.Buffer
+	if err := suffix.Encode(&buf); err != nil {
+		return nil, fmt.Errorf("unable to encode burn proof: %w", err)
+	}
+
+	burnProof := &proof.Proof{}
+	if err := burnProof.Decode(bytes.NewReader(buf.Bytes())); err != nil {
+		return nil, fmt.Errorf("unable to decode burn proof: %w", err)
+	}
+
+	// The stored transfer proof keeps non-primary inputs only. The
+	// leaf needs every spent input, primary included.
+	burnProof.AdditionalInputs = files
+
+	var encoded bytes.Buffer
+	if err := burnProof.Encode(&encoded); err != nil {
+		return nil, fmt.Errorf("unable to encode burn leaf: %w", err)
+	}
+	if encoded.Len() > proof.FileMaxProofSizeBytes {
+		return nil, fmt.Errorf("burn leaf proof is too large: "+
+			"%d bytes, max is %d", encoded.Len(),
+			proof.FileMaxProofSizeBytes)
+	}
+
+	return burnProof, nil
+}
+
 // RebuildAnchorConfirm reconstructs a transfer's confirmation event
 // purely from stored state plus the witness's block context (header
 // and merkle inclusion proof, captured by the re-org watcher at
@@ -1356,10 +1473,28 @@ func (a *AssetStore) rebuildAnchorConfirm(ctx context.Context,
 				"output asset %v", assetID)
 		}
 
+		// Burn leaves are verified without a prior snapshot, so
+		// they need every input file, including the primary.
+		// Collected here, before the primary file is extended
+		// with this suffix, and not written onto the suffix the
+		// transfer proof file stores.
+		var burnInputs map[asset.PrevID]*proof.File
+		if suffix.Asset.IsBurn() {
+			burnInputs = make(
+				map[asset.PrevID]*proof.File, len(prevIDs),
+			)
+		}
+
 		for extra := 1; extra < len(prevIDs); extra++ {
 			extraFile, err := fetchInputFile(prevIDs[extra])
 			if err != nil {
 				return nil, nil, err
+			}
+			if burnInputs != nil {
+				_, seen := burnInputs[prevIDs[extra]]
+				if !seen {
+					burnInputs[prevIDs[extra]] = extraFile
+				}
 			}
 			suffix.AdditionalInputs = append(
 				suffix.AdditionalInputs, *extraFile,
@@ -1369,6 +1504,14 @@ func (a *AssetStore) rebuildAnchorConfirm(ctx context.Context,
 		file, err := fetchInputFile(prevIDs[0])
 		if err != nil {
 			return nil, nil, err
+		}
+		if burnInputs != nil {
+			cloned, err := cloneProofFile(file)
+			if err != nil {
+				return nil, nil, fmt.Errorf("unable to copy "+
+					"burn input proof: %w", err)
+			}
+			burnInputs[prevIDs[0]] = cloned
 		}
 		if err := file.AppendProof(*suffix); err != nil {
 			return nil, nil, fmt.Errorf("unable to append "+
@@ -1402,8 +1545,17 @@ func (a *AssetStore) rebuildAnchorConfirm(ctx context.Context,
 			Blob: blob.Bytes(),
 		}
 
-		// Burns are recognizable from the suffix itself.
+		// Burns are recognizable from the suffix itself. The
+		// leaf proof is a copy that embeds input provenance;
+		// the suffix stored in the transfer proof file is left
+		// as the chain built above.
 		if suffix.Asset.IsBurn() {
+			burnProof, err := burnLeafProof(suffix, burnInputs)
+			if err != nil {
+				return nil, nil, fmt.Errorf("unable to "+
+					"build burn proof: %w", err)
+			}
+
 			burn := &tapfreighter.AssetBurn{
 				Note:      burnNote,
 				AssetID:   assetID[:],
@@ -1412,7 +1564,7 @@ func (a *AssetStore) rebuildAnchorConfirm(ctx context.Context,
 				//nolint:lll
 				AnchorTxid: anchorTxid,
 				ScriptKey:  &suffix.Asset.ScriptKey,
-				Proof:      suffix,
+				Proof:      burnProof,
 				OutPoint: wire.OutPoint{
 					Hash: anchorTxid,
 					//nolint:lll

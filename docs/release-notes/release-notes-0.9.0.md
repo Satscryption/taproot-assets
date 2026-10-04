@@ -21,6 +21,13 @@
 
 # Bug Fixes
 
+- Supply commitment burn leaves pushed to a universe server now embed
+  the full proof files of the spent inputs, including the primary
+  input. A bare burn suffix has no provenance for that input, so
+  servers rejected the commitment with "missing asset input(s)" and
+  later commitments for the group could not be published
+  ([issue #2285](https://github.com/lightninglabs/taproot-assets/issues/2285)).
+
 - [Importing an asset wallet
   backup](https://github.com/lightninglabs/taproot-assets/pull/2277) into a
   node whose database was wiped but whose proofs directory survived no longer
