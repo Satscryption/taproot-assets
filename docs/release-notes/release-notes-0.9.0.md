@@ -21,6 +21,23 @@
 
 # Bug Fixes
 
+- **Deferred lease release on canceled RPC contexts**
+  ([issue #2206](https://github.com/lightninglabs/taproot-assets/issues/2206)):
+  Compensating UTXO lease releases in `CommitVirtualPsbts`, `FundPacket`,
+  and `FundBurn` now run on a bounded context that preserves request values
+  but is not canceled when the caller disconnects, so a canceled request no
+  longer leaks lnd wallet leases until they expire.
+
+* `CommitVirtualPsbts` fails closed when `anchor_change_output.add` is
+  false and `skip_funding` is unset, if lnd funding would add or alter
+  anchor outputs
+  ([issue #2209](https://github.com/lightninglabs/taproot-assets/issues/2209)).
+  Funding that changes the anchor output set now returns a descriptive
+  error instead of a different output topology. Use `skip_funding=true`
+  with caller-supplied BTC inputs, or set `add=true`, until lnd
+  supports a real no-new-change funding mode. `skip_funding` and
+  `add=true` are unchanged.
+
 - [Importing an asset wallet
   backup](https://github.com/lightninglabs/taproot-assets/pull/2277) into a
   node whose database was wiped but whose proofs directory survived no longer
