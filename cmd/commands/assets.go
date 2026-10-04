@@ -1,10 +1,12 @@
 package commands
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -641,26 +643,119 @@ var prepareBatchCommand = cli.Command{
 }
 
 func prepareBatch(ctx *cli.Context) error {
-	client, cleanUp := getMintClient(ctx)
+	return prepareBatchWith(ctx, getContext, getMintClient)
+}
+
+// mintClientOpener opens a mint RPC client and returns a cleanup func.
+type mintClientOpener func(*cli.Context) (mintrpc.MintClient, func())
+
+// prepareBatchWith prepares a custom anchor batch. --output_psbt is checked
+// before newCtx and openClient run, so an unwritable path does not commit
+// the batch. The RPC response is printed whenever PrepareBatch succeeds,
+// including when the PSBT file cannot be written afterwards.
+func prepareBatchWith(ctx *cli.Context, newCtx func() context.Context,
+	openClient mintClientOpener) error {
+
+	outputPath, err := prepareBatchOutputPath(ctx)
+	if err != nil {
+		return err
+	}
+
+	client, cleanUp := openClient(ctx)
 	defer cleanUp()
+
 	resp, err := client.PrepareBatch(
-		getContext(), &mintrpc.PrepareBatchRequest{},
+		newCtx(), &mintrpc.PrepareBatchRequest{},
 	)
 	if err != nil {
 		return fmt.Errorf("unable to prepare batch: %w", err)
 	}
-	if path := ctx.String(outputPsbtName); path != "" {
-		if resp.Batch == nil {
-			return fmt.Errorf("prepare response has no batch")
-		}
-		path = tapcfg.CleanAndExpandPath(path)
-		err = os.WriteFile(path, resp.Batch.BatchPsbt, 0o600)
-		if err != nil {
-			return fmt.Errorf("unable to write prepared PSBT: %w",
-				err)
-		}
-	}
+
+	writeErr := writePreparedBatchPsbt(outputPath, resp)
+
+	// The batch is already committed. Printing after a failed write
+	// leaves the caller with the packet.
 	printRespJSON(resp)
+	return writeErr
+}
+
+// prepareBatchOutputPath expands --output_psbt and rejects a path that
+// cannot be written. An empty flag leaves the PSBT in the JSON response.
+func prepareBatchOutputPath(ctx *cli.Context) (string, error) {
+	raw := ctx.String(outputPsbtName)
+	if raw == "" {
+		return "", nil
+	}
+
+	path := tapcfg.CleanAndExpandPath(raw)
+	if err := ensureOutputPsbtWritable(path); err != nil {
+		return "", fmt.Errorf("unable to write prepared PSBT: %w",
+			err)
+	}
+
+	return path, nil
+}
+
+// ensureOutputPsbtWritable rejects a path that cannot be created or
+// replaced. A missing file is checked by creating a temporary file in the
+// parent directory, so PrepareBatch is not called when that directory is
+// not writable. An existing file is opened for write without truncating it.
+func ensureOutputPsbtWritable(path string) error {
+	dir := filepath.Dir(path)
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !dirInfo.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+
+	info, err := os.Stat(path)
+	switch {
+	case err == nil && info.IsDir():
+		return fmt.Errorf("%s is a directory", path)
+
+	case err == nil:
+		var f *os.File
+		f, err = os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+
+	case os.IsNotExist(err):
+		probe, createErr := os.CreateTemp(dir, ".tapcli-prepare-*")
+		if createErr != nil {
+			return createErr
+		}
+
+		// Same writable-directory probe as tapcfg.ensureDirWritable.
+		defer func() { _ = os.Remove(probe.Name()) }() //nolint:gosec
+
+		return probe.Close()
+
+	default:
+		return err
+	}
+}
+
+// writePreparedBatchPsbt stores the committed PSBT at path. An empty path
+// means the caller only wants the JSON response.
+func writePreparedBatchPsbt(path string,
+	resp *mintrpc.PrepareBatchResponse) error {
+
+	if path == "" {
+		return nil
+	}
+	if resp.Batch == nil {
+		return fmt.Errorf("prepare response has no batch")
+	}
+
+	err := os.WriteFile(path, resp.Batch.BatchPsbt, 0o600)
+	if err != nil {
+		return fmt.Errorf("unable to write prepared PSBT: %w", err)
+	}
+
 	return nil
 }
 
