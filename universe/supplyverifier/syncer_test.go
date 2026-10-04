@@ -3,6 +3,8 @@ package supplyverifier
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -438,6 +440,227 @@ func TestSupplySyncerRetryConfigDefault(t *testing.T) {
 	custom := fn.RetryConfig{MaxRetries: 3, InitialBackoff: time.Second}
 	syncer = NewSupplySyncer(SupplySyncerConfig{Retry: &custom})
 	require.Equal(t, custom, syncer.retryConfig())
+}
+
+// syncerWithRetry builds a syncer aimed at one scripted server and
+// returns the store that records logged pushes.
+func syncerWithRetry(client *scriptedUniverse, hist SupplyCommitHistory,
+	maxRetries int) (SupplySyncer, *recordingSyncerStore, string) {
+
+	const host = "uni.example:10029"
+
+	store := &recordingSyncerStore{}
+	syncer := NewSupplySyncer(SupplySyncerConfig{
+		ClientFactory: client.factory,
+		Store:         store,
+		UniverseFederationView: &staticFederationView{
+			servers: []universe.ServerAddr{
+				universe.NewServerAddrFromStr(host),
+			},
+		},
+		History: hist,
+		Retry:   fastRetry(maxRetries),
+	})
+
+	return syncer, store, host
+}
+
+// TestRetryConfigClampsNegativeMaxRetries pins that a negative retry
+// budget is clamped to zero and that a valid budget is unchanged. Zero
+// means the initial attempt and no further retries.
+func TestRetryConfigClampsNegativeMaxRetries(t *testing.T) {
+	t.Parallel()
+
+	custom := fn.RetryConfig{
+		MaxRetries:        -7,
+		InitialBackoff:    time.Second,
+		BackoffMultiplier: 3,
+		MaxBackoff:        2 * time.Second,
+	}
+	syncer := NewSupplySyncer(SupplySyncerConfig{Retry: &custom})
+	got := syncer.retryConfig()
+
+	require.Equal(t, 0, got.MaxRetries)
+	require.Equal(t, time.Second, got.InitialBackoff)
+	require.Equal(t, 3.0, got.BackoffMultiplier)
+	require.Equal(t, 2*time.Second, got.MaxBackoff)
+
+	// Clamping copies the config; the caller's value stays intact.
+	require.Equal(t, -7, custom.MaxRetries)
+
+	zero := fn.RetryConfig{MaxRetries: 0}
+	syncer = NewSupplySyncer(SupplySyncerConfig{Retry: &zero})
+	require.Equal(t, 0, syncer.retryConfig().MaxRetries)
+
+	positive := fn.RetryConfig{MaxRetries: 4}
+	syncer = NewSupplySyncer(SupplySyncerConfig{Retry: &positive})
+	require.Equal(t, 4, syncer.retryConfig().MaxRetries)
+
+	lowest := fn.RetryConfig{MaxRetries: math.MinInt}
+	syncer = NewSupplySyncer(SupplySyncerConfig{Retry: &lowest})
+	require.Equal(t, 0, syncer.retryConfig().MaxRetries)
+}
+
+// TestNegativeMaxRetriesStillAttempts pins that a negative
+// Retry.MaxRetries cannot skip the universe call and report success.
+// That field counts retries after the first attempt. A negative value
+// used to run the retry loop zero times and return nil, so a push
+// logged the commitment as delivered and a pull reported success
+// without contacting the server.
+func TestNegativeMaxRetriesStillAttempts(t *testing.T) {
+	t.Parallel()
+
+	for _, budget := range []int{-1, math.MinInt} {
+		t.Run(fmt.Sprintf("budget_%d", budget), func(t *testing.T) {
+			t.Parallel()
+
+			testNegativeMaxRetriesStillAttempts(t, budget)
+		})
+	}
+}
+
+func testNegativeMaxRetriesStillAttempts(t *testing.T, budget int) {
+	ctx := context.Background()
+	spec := testSpec(t)
+	commitment := rootCommit(1, fn.None[wire.OutPoint]())
+
+	t.Run("failed push is not delivered", func(t *testing.T) {
+		client := newScriptedUniverse()
+		client.failInsertsLeft = 1
+		client.insertErr = errors.New("unavailable")
+		syncer, store, _ := syncerWithRetry(client, nil, budget)
+
+		errMap, err := syncer.PushSupplyCommitment(
+			ctx, spec, commitment, supplycommit.SupplyLeaves{},
+			supplycommit.ChainProof{}, nil,
+		)
+		require.NoError(t, err)
+		require.Len(t, errMap, 1)
+		for _, pushErr := range errMap {
+			require.ErrorContains(t, pushErr, "unavailable")
+		}
+
+		dials, inserts, _ := client.snapshot()
+		require.Equal(t, 1, dials)
+		require.Len(t, inserts, 1)
+		require.Empty(t, store.logged)
+	})
+
+	t.Run("successful push contacts the server", func(t *testing.T) {
+		client := newScriptedUniverse()
+		syncer, store, host := syncerWithRetry(client, nil, budget)
+
+		errMap, err := syncer.PushSupplyCommitment(
+			ctx, spec, commitment, supplycommit.SupplyLeaves{},
+			supplycommit.ChainProof{}, nil,
+		)
+		require.NoError(t, err)
+		require.Empty(t, errMap)
+
+		dials, inserts, _ := client.snapshot()
+		require.Equal(t, 1, dials)
+		require.Equal(t, []wire.OutPoint{
+			commitment.CommitPoint(),
+		}, inserts)
+		require.Equal(t, []string{host}, store.logged)
+	})
+
+	t.Run("failed pull is not a fetched commitment", func(t *testing.T) {
+		client := newScriptedUniverse()
+		client.fetchFailLeft = 3
+		client.fetchErr = errors.New("unavailable")
+		syncer, _, host := syncerWithRetry(client, nil, budget)
+
+		// pullUniServer is asserted directly. PullSupplyCommitment
+		// logs the root hash of a successful result, and the
+		// zero-attempt bug hands it an empty result.
+		result, err := syncer.pullUniServer(
+			ctx, spec, fn.None[wire.OutPoint](),
+			universe.NewServerAddrFromStr(host),
+		)
+		_, _, fetches := client.snapshot()
+		require.Equal(t, 1, fetches)
+		require.ErrorContains(t, err, "unavailable")
+		require.Equal(t, supplycommit.FetchSupplyCommitResult{}, result)
+
+		var res SupplyCommitPullResult
+		require.NotPanics(t, func() {
+			res, err = syncer.PullSupplyCommitment(
+				ctx, spec, fn.None[wire.OutPoint](), nil,
+			)
+		})
+		require.NoError(t, err)
+		require.Len(t, res.ErrorMap, 1)
+		require.True(t, res.FetchResult.IsNone())
+		_, _, fetches = client.snapshot()
+		require.Equal(t, 2, fetches)
+	})
+
+	t.Run("successful pull returns the server commitment",
+		func(t *testing.T) {
+			client := newScriptedUniverse()
+			fetched := rootCommit(4, fn.None[wire.OutPoint]())
+			fetched.SupplyRoot = mssmt.NewComputedBranch(
+				mssmt.EmptyTreeRootHash, 0,
+			)
+			want := supplycommit.FetchSupplyCommitResult{
+				RootCommitment: fetched,
+			}
+			client.fetchResult = want
+			syncer, _, host := syncerWithRetry(client, nil, budget)
+
+			result, err := syncer.pullUniServer(
+				ctx, spec, fn.None[wire.OutPoint](),
+				universe.NewServerAddrFromStr(host),
+			)
+			_, _, fetches := client.snapshot()
+			require.Equal(t, 1, fetches)
+			require.NoError(t, err)
+			require.Equal(
+				t, want.RootCommitment.SupplyRoot.NodeHash(),
+				result.RootCommitment.SupplyRoot.NodeHash(),
+			)
+		})
+
+	t.Run("repair still inserts predecessors", func(t *testing.T) {
+		chain := commitChain(2)
+		client := newScriptedUniverse()
+		syncer, store, host := syncerWithRetry(
+			client, historyOf(chain), budget,
+		)
+
+		errMap, err := syncer.PushSupplyCommitment(
+			ctx, spec, chain[1], supplycommit.SupplyLeaves{},
+			supplycommit.ChainProof{}, nil,
+		)
+		require.NoError(t, err)
+		require.Empty(t, errMap)
+
+		_, inserts, _ := client.snapshot()
+		require.Equal(t, []wire.OutPoint{
+			chain[1].CommitPoint(),
+			chain[0].CommitPoint(),
+			chain[1].CommitPoint(),
+		}, inserts)
+		require.Equal(t, []string{host}, store.logged)
+	})
+
+	t.Run("cancelled context is not success", func(t *testing.T) {
+		syncer := NewSupplySyncer(SupplySyncerConfig{
+			Retry: fastRetry(budget),
+		})
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		calls := 0
+		err := syncer.retrySupplyOp(cancelled, func() error {
+			calls++
+
+			return nil
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, calls)
+	})
 }
 
 // TestPushSupplyCommitmentRetriesTransientInsert pins backoff retry of
