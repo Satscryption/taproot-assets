@@ -835,7 +835,12 @@ type CommitVirtualPsbtsRequest_ExistingOutputIndex struct {
 }
 
 type CommitVirtualPsbtsRequest_Add struct {
-	// Add a new P2TR change output to the PSBT if required.
+	// Add a new P2TR change output to the PSBT if required. When set to
+	// false, tapd asks lnd not to add a new change output. Until lnd
+	// supports that mode (see lightningnetwork/lnd#10967), funding may
+	// still alter the anchor output set; tapd then fails closed with an
+	// error (see lightninglabs/taproot-assets#2209). Use
+	// skip_funding=true with caller-supplied inputs or add=true instead.
 	Add bool `protobuf:"varint,5,opt,name=add,proto3,oneof"`
 }
 

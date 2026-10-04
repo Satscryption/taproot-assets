@@ -254,6 +254,10 @@ var allTestCases = []*testCase{
 		test: testPsbtNormalInteractiveFullValueSend,
 	},
 	{
+		name: "commit virtual psbts no new change",
+		test: testCommitVirtualPsbtsNoNewChange,
+	},
+	{
 		name: "psbt multi version send",
 		test: testPsbtMultiVersionSend,
 	},

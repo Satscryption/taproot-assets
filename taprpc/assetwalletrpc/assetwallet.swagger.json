@@ -577,7 +577,7 @@
         },
         "add": {
           "type": "boolean",
-          "description": "Add a new P2TR change output to the PSBT if required."
+          "description": "Add a new P2TR change output to the PSBT if required. When set to\nfalse, tapd asks lnd not to add a new change output. Until lnd\nsupports that mode (see lightningnetwork/lnd#10967), funding may\nstill alter the anchor output set; tapd then fails closed with an\nerror (see lightninglabs/taproot-assets#2209). Use\nskip_funding=true with caller-supplied inputs or add=true instead."
         },
         "target_conf": {
           "type": "integer",
