@@ -18,7 +18,11 @@ http:
     - selector: assetwalletrpc.AssetWallet.CommitVirtualPsbts
       post: "/v1/taproot-assets/wallet/virtual-psbt/commit"
       body: "*"
-      
+
+    - selector: assetwalletrpc.AssetWallet.GetCommitVirtualPsbtsStatus
+      post: "/v1/taproot-assets/wallet/virtual-psbt/commit/status"
+      body: "*"
+
     - selector: assetwalletrpc.AssetWallet.PublishAndLogTransfer
       post: "/v1/taproot-assets/wallet/virtual-psbt/log-transfer"
       body: "*"

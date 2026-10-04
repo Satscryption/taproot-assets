@@ -128,6 +128,61 @@ func (TransitionProofVersion) EnumDescriptor() ([]byte, []int) {
 	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{1}
 }
 
+type CommitVirtualPsbtsStatus int32
+
+const (
+	// No CommitVirtualPsbts call with this request_id has been recorded.
+	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN CommitVirtualPsbtsStatus = 0
+	// The call has been claimed and has not yet recorded a final response.
+	// Leased outpoints are present only after funding has returned. A repeat
+	// of CommitVirtualPsbts will not fund again.
+	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_PENDING CommitVirtualPsbtsStatus = 1
+	// The call completed. Repeating CommitVirtualPsbts with the same request
+	// returns the stored response.
+	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED CommitVirtualPsbtsStatus = 2
+)
+
+// Enum value maps for CommitVirtualPsbtsStatus.
+var (
+	CommitVirtualPsbtsStatus_name = map[int32]string{
+		0: "COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN",
+		1: "COMMIT_VIRTUAL_PSBTS_STATUS_PENDING",
+		2: "COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED",
+	}
+	CommitVirtualPsbtsStatus_value = map[string]int32{
+		"COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN":   0,
+		"COMMIT_VIRTUAL_PSBTS_STATUS_PENDING":   1,
+		"COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED": 2,
+	}
+)
+
+func (x CommitVirtualPsbtsStatus) Enum() *CommitVirtualPsbtsStatus {
+	p := new(CommitVirtualPsbtsStatus)
+	*p = x
+	return p
+}
+
+func (x CommitVirtualPsbtsStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CommitVirtualPsbtsStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_assetwalletrpc_assetwallet_proto_enumTypes[2].Descriptor()
+}
+
+func (CommitVirtualPsbtsStatus) Type() protoreflect.EnumType {
+	return &file_assetwalletrpc_assetwallet_proto_enumTypes[2]
+}
+
+func (x CommitVirtualPsbtsStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CommitVirtualPsbtsStatus.Descriptor instead.
+func (CommitVirtualPsbtsStatus) EnumDescriptor() ([]byte, []int) {
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{2}
+}
+
 // BackupMode specifies the backup format to use when exporting.
 type BackupMode int32
 
@@ -169,11 +224,11 @@ func (x BackupMode) String() string {
 }
 
 func (BackupMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_assetwalletrpc_assetwallet_proto_enumTypes[2].Descriptor()
+	return file_assetwalletrpc_assetwallet_proto_enumTypes[3].Descriptor()
 }
 
 func (BackupMode) Type() protoreflect.EnumType {
-	return &file_assetwalletrpc_assetwallet_proto_enumTypes[2]
+	return &file_assetwalletrpc_assetwallet_proto_enumTypes[3]
 }
 
 func (x BackupMode) Number() protoreflect.EnumNumber {
@@ -182,7 +237,7 @@ func (x BackupMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BackupMode.Descriptor instead.
 func (BackupMode) EnumDescriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{2}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{3}
 }
 
 type FundVirtualPsbtRequest struct {
@@ -689,8 +744,18 @@ type CommitVirtualPsbtsRequest struct {
 	// The version to use when generating the state transition proof suffixes.
 	// If unset, the daemon's default proof version is used.
 	TransitionProofVersion TransitionProofVersion `protobuf:"varint,11,opt,name=transition_proof_version,json=transitionProofVersion,proto3,enum=assetwalletrpc.TransitionProofVersion" json:"transition_proof_version,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the
+	// RPC is unchanged and nothing is stored. When set, tapd records the
+	// outcome under this key. A later call with the same key and the same
+	// request returns that stored response and does not fund again. The same
+	// key with a different request is rejected. A repeat while the first call
+	// is still running, or before its outcome was recorded, is rejected; use
+	// GetCommitVirtualPsbtsStatus to read the lock ID and leased outpoints.
+	// If custom_lock_id is empty, tapd derives a 32-byte lock ID as
+	// SHA-256(request_id) and uses that for the lnd lease.
+	RequestId     []byte `protobuf:"bytes,12,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CommitVirtualPsbtsRequest) Reset() {
@@ -820,6 +885,13 @@ func (x *CommitVirtualPsbtsRequest) GetTransitionProofVersion() TransitionProofV
 		return x.TransitionProofVersion
 	}
 	return TransitionProofVersion_TRANSITION_PROOF_VERSION_V0
+}
+
+func (x *CommitVirtualPsbtsRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type isCommitVirtualPsbtsRequest_AnchorChangeOutput interface {
@@ -957,6 +1029,117 @@ func (x *CommitVirtualPsbtsResponse) GetLndLockedUtxos() []*taprpc.OutPoint {
 	return nil
 }
 
+type GetCommitVirtualPsbtsStatusRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The request_id passed to CommitVirtualPsbts. Required, 1 to 64 bytes.
+	RequestId     []byte `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCommitVirtualPsbtsStatusRequest) Reset() {
+	*x = GetCommitVirtualPsbtsStatusRequest{}
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCommitVirtualPsbtsStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCommitVirtualPsbtsStatusRequest) ProtoMessage() {}
+
+func (x *GetCommitVirtualPsbtsStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCommitVirtualPsbtsStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetCommitVirtualPsbtsStatusRequest) Descriptor() ([]byte, []int) {
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetCommitVirtualPsbtsStatusRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
+}
+
+type GetCommitVirtualPsbtsStatusResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Whether the commit is unknown, still in progress, or completed.
+	Status CommitVirtualPsbtsStatus `protobuf:"varint,1,opt,name=status,proto3,enum=assetwalletrpc.CommitVirtualPsbtsStatus" json:"status,omitempty"`
+	// The lnd lock ID for the leases, when known. This is the request's
+	// custom_lock_id (or the ID derived from request_id) until funding
+	// returns, then the lock ID reported by lnd.
+	LockId []byte `protobuf:"bytes,2,opt,name=lock_id,json=lockId,proto3" json:"lock_id,omitempty"`
+	// Outpoints leased for this commit. Empty until funding has returned.
+	// Only inputs added by CommitVirtualPsbts are included.
+	LndLockedUtxos []*taprpc.OutPoint `protobuf:"bytes,3,rep,name=lnd_locked_utxos,json=lndLockedUtxos,proto3" json:"lnd_locked_utxos,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) Reset() {
+	*x = GetCommitVirtualPsbtsStatusResponse{}
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCommitVirtualPsbtsStatusResponse) ProtoMessage() {}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCommitVirtualPsbtsStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetCommitVirtualPsbtsStatusResponse) Descriptor() ([]byte, []int) {
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) GetStatus() CommitVirtualPsbtsStatus {
+	if x != nil {
+		return x.Status
+	}
+	return CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN
+}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) GetLockId() []byte {
+	if x != nil {
+		return x.LockId
+	}
+	return nil
+}
+
+func (x *GetCommitVirtualPsbtsStatusResponse) GetLndLockedUtxos() []*taprpc.OutPoint {
+	if x != nil {
+		return x.LndLockedUtxos
+	}
+	return nil
+}
+
 type PublishAndLogRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The funded BTC level anchor transaction with all outputs updated to commit
@@ -990,7 +1173,7 @@ type PublishAndLogRequest struct {
 
 func (x *PublishAndLogRequest) Reset() {
 	*x = PublishAndLogRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[9]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1002,7 +1185,7 @@ func (x *PublishAndLogRequest) String() string {
 func (*PublishAndLogRequest) ProtoMessage() {}
 
 func (x *PublishAndLogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[9]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1015,7 +1198,7 @@ func (x *PublishAndLogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishAndLogRequest.ProtoReflect.Descriptor instead.
 func (*PublishAndLogRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{9}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PublishAndLogRequest) GetAnchorPsbt() []byte {
@@ -1077,7 +1260,7 @@ type NextInternalKeyRequest struct {
 
 func (x *NextInternalKeyRequest) Reset() {
 	*x = NextInternalKeyRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[10]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1089,7 +1272,7 @@ func (x *NextInternalKeyRequest) String() string {
 func (*NextInternalKeyRequest) ProtoMessage() {}
 
 func (x *NextInternalKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[10]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1102,7 +1285,7 @@ func (x *NextInternalKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextInternalKeyRequest.ProtoReflect.Descriptor instead.
 func (*NextInternalKeyRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{10}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *NextInternalKeyRequest) GetKeyFamily() uint32 {
@@ -1122,7 +1305,7 @@ type NextInternalKeyResponse struct {
 
 func (x *NextInternalKeyResponse) Reset() {
 	*x = NextInternalKeyResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[11]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1134,7 +1317,7 @@ func (x *NextInternalKeyResponse) String() string {
 func (*NextInternalKeyResponse) ProtoMessage() {}
 
 func (x *NextInternalKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[11]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1147,7 +1330,7 @@ func (x *NextInternalKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextInternalKeyResponse.ProtoReflect.Descriptor instead.
 func (*NextInternalKeyResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{11}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *NextInternalKeyResponse) GetInternalKey() *taprpc.KeyDescriptor {
@@ -1167,7 +1350,7 @@ type NextScriptKeyRequest struct {
 
 func (x *NextScriptKeyRequest) Reset() {
 	*x = NextScriptKeyRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[12]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1179,7 +1362,7 @@ func (x *NextScriptKeyRequest) String() string {
 func (*NextScriptKeyRequest) ProtoMessage() {}
 
 func (x *NextScriptKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[12]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1192,7 +1375,7 @@ func (x *NextScriptKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextScriptKeyRequest.ProtoReflect.Descriptor instead.
 func (*NextScriptKeyRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{12}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *NextScriptKeyRequest) GetKeyFamily() uint32 {
@@ -1213,7 +1396,7 @@ type NextScriptKeyResponse struct {
 
 func (x *NextScriptKeyResponse) Reset() {
 	*x = NextScriptKeyResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[13]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1225,7 +1408,7 @@ func (x *NextScriptKeyResponse) String() string {
 func (*NextScriptKeyResponse) ProtoMessage() {}
 
 func (x *NextScriptKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[13]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1238,7 +1421,7 @@ func (x *NextScriptKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextScriptKeyResponse.ProtoReflect.Descriptor instead.
 func (*NextScriptKeyResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{13}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *NextScriptKeyResponse) GetScriptKey() *taprpc.ScriptKey {
@@ -1259,7 +1442,7 @@ type QueryInternalKeyRequest struct {
 
 func (x *QueryInternalKeyRequest) Reset() {
 	*x = QueryInternalKeyRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[14]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1271,7 +1454,7 @@ func (x *QueryInternalKeyRequest) String() string {
 func (*QueryInternalKeyRequest) ProtoMessage() {}
 
 func (x *QueryInternalKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[14]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1284,7 +1467,7 @@ func (x *QueryInternalKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryInternalKeyRequest.ProtoReflect.Descriptor instead.
 func (*QueryInternalKeyRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{14}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *QueryInternalKeyRequest) GetInternalKey() []byte {
@@ -1304,7 +1487,7 @@ type QueryInternalKeyResponse struct {
 
 func (x *QueryInternalKeyResponse) Reset() {
 	*x = QueryInternalKeyResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[15]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1316,7 +1499,7 @@ func (x *QueryInternalKeyResponse) String() string {
 func (*QueryInternalKeyResponse) ProtoMessage() {}
 
 func (x *QueryInternalKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[15]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1329,7 +1512,7 @@ func (x *QueryInternalKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryInternalKeyResponse.ProtoReflect.Descriptor instead.
 func (*QueryInternalKeyResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{15}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *QueryInternalKeyResponse) GetInternalKey() *taprpc.KeyDescriptor {
@@ -1351,7 +1534,7 @@ type QueryScriptKeyRequest struct {
 
 func (x *QueryScriptKeyRequest) Reset() {
 	*x = QueryScriptKeyRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[16]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1363,7 +1546,7 @@ func (x *QueryScriptKeyRequest) String() string {
 func (*QueryScriptKeyRequest) ProtoMessage() {}
 
 func (x *QueryScriptKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[16]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1376,7 +1559,7 @@ func (x *QueryScriptKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryScriptKeyRequest.ProtoReflect.Descriptor instead.
 func (*QueryScriptKeyRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{16}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *QueryScriptKeyRequest) GetTweakedScriptKey() []byte {
@@ -1397,7 +1580,7 @@ type QueryScriptKeyResponse struct {
 
 func (x *QueryScriptKeyResponse) Reset() {
 	*x = QueryScriptKeyResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[17]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1409,7 +1592,7 @@ func (x *QueryScriptKeyResponse) String() string {
 func (*QueryScriptKeyResponse) ProtoMessage() {}
 
 func (x *QueryScriptKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[17]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1422,7 +1605,7 @@ func (x *QueryScriptKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryScriptKeyResponse.ProtoReflect.Descriptor instead.
 func (*QueryScriptKeyResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{17}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *QueryScriptKeyResponse) GetScriptKey() *taprpc.ScriptKey {
@@ -1452,7 +1635,7 @@ type ProveAssetOwnershipRequest struct {
 
 func (x *ProveAssetOwnershipRequest) Reset() {
 	*x = ProveAssetOwnershipRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[18]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1464,7 +1647,7 @@ func (x *ProveAssetOwnershipRequest) String() string {
 func (*ProveAssetOwnershipRequest) ProtoMessage() {}
 
 func (x *ProveAssetOwnershipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[18]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1477,7 +1660,7 @@ func (x *ProveAssetOwnershipRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProveAssetOwnershipRequest.ProtoReflect.Descriptor instead.
 func (*ProveAssetOwnershipRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{18}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ProveAssetOwnershipRequest) GetAssetId() []byte {
@@ -1517,7 +1700,7 @@ type ProveAssetOwnershipResponse struct {
 
 func (x *ProveAssetOwnershipResponse) Reset() {
 	*x = ProveAssetOwnershipResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[19]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1529,7 +1712,7 @@ func (x *ProveAssetOwnershipResponse) String() string {
 func (*ProveAssetOwnershipResponse) ProtoMessage() {}
 
 func (x *ProveAssetOwnershipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[19]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1542,7 +1725,7 @@ func (x *ProveAssetOwnershipResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProveAssetOwnershipResponse.ProtoReflect.Descriptor instead.
 func (*ProveAssetOwnershipResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{19}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ProveAssetOwnershipResponse) GetProofWithWitness() []byte {
@@ -1567,7 +1750,7 @@ type VerifyAssetOwnershipRequest struct {
 
 func (x *VerifyAssetOwnershipRequest) Reset() {
 	*x = VerifyAssetOwnershipRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[20]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1579,7 +1762,7 @@ func (x *VerifyAssetOwnershipRequest) String() string {
 func (*VerifyAssetOwnershipRequest) ProtoMessage() {}
 
 func (x *VerifyAssetOwnershipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[20]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1592,7 +1775,7 @@ func (x *VerifyAssetOwnershipRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyAssetOwnershipRequest.ProtoReflect.Descriptor instead.
 func (*VerifyAssetOwnershipRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{20}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *VerifyAssetOwnershipRequest) GetProofWithWitness() []byte {
@@ -1629,7 +1812,7 @@ type VerifyAssetOwnershipResponse struct {
 
 func (x *VerifyAssetOwnershipResponse) Reset() {
 	*x = VerifyAssetOwnershipResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[21]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1641,7 +1824,7 @@ func (x *VerifyAssetOwnershipResponse) String() string {
 func (*VerifyAssetOwnershipResponse) ProtoMessage() {}
 
 func (x *VerifyAssetOwnershipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[21]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1654,7 +1837,7 @@ func (x *VerifyAssetOwnershipResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyAssetOwnershipResponse.ProtoReflect.Descriptor instead.
 func (*VerifyAssetOwnershipResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{21}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *VerifyAssetOwnershipResponse) GetValidProof() bool {
@@ -1709,7 +1892,7 @@ type RemoveUTXOLeaseRequest struct {
 
 func (x *RemoveUTXOLeaseRequest) Reset() {
 	*x = RemoveUTXOLeaseRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[22]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1721,7 +1904,7 @@ func (x *RemoveUTXOLeaseRequest) String() string {
 func (*RemoveUTXOLeaseRequest) ProtoMessage() {}
 
 func (x *RemoveUTXOLeaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[22]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1734,7 +1917,7 @@ func (x *RemoveUTXOLeaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveUTXOLeaseRequest.ProtoReflect.Descriptor instead.
 func (*RemoveUTXOLeaseRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{22}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *RemoveUTXOLeaseRequest) GetOutpoint() *taprpc.OutPoint {
@@ -1752,7 +1935,7 @@ type RemoveUTXOLeaseResponse struct {
 
 func (x *RemoveUTXOLeaseResponse) Reset() {
 	*x = RemoveUTXOLeaseResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[23]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1764,7 +1947,7 @@ func (x *RemoveUTXOLeaseResponse) String() string {
 func (*RemoveUTXOLeaseResponse) ProtoMessage() {}
 
 func (x *RemoveUTXOLeaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[23]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1777,7 +1960,7 @@ func (x *RemoveUTXOLeaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveUTXOLeaseResponse.ProtoReflect.Descriptor instead.
 func (*RemoveUTXOLeaseResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{23}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{25}
 }
 
 type DeclareScriptKeyRequest struct {
@@ -1790,7 +1973,7 @@ type DeclareScriptKeyRequest struct {
 
 func (x *DeclareScriptKeyRequest) Reset() {
 	*x = DeclareScriptKeyRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[24]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1802,7 +1985,7 @@ func (x *DeclareScriptKeyRequest) String() string {
 func (*DeclareScriptKeyRequest) ProtoMessage() {}
 
 func (x *DeclareScriptKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[24]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1815,7 +1998,7 @@ func (x *DeclareScriptKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeclareScriptKeyRequest.ProtoReflect.Descriptor instead.
 func (*DeclareScriptKeyRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{24}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *DeclareScriptKeyRequest) GetScriptKey() *taprpc.ScriptKey {
@@ -1836,7 +2019,7 @@ type DeclareScriptKeyResponse struct {
 
 func (x *DeclareScriptKeyResponse) Reset() {
 	*x = DeclareScriptKeyResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[25]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1848,7 +2031,7 @@ func (x *DeclareScriptKeyResponse) String() string {
 func (*DeclareScriptKeyResponse) ProtoMessage() {}
 
 func (x *DeclareScriptKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[25]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1861,7 +2044,7 @@ func (x *DeclareScriptKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeclareScriptKeyResponse.ProtoReflect.Descriptor instead.
 func (*DeclareScriptKeyResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{25}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *DeclareScriptKeyResponse) GetScriptKey() *taprpc.ScriptKey {
@@ -1883,7 +2066,7 @@ type ExportAssetWalletBackupRequest struct {
 
 func (x *ExportAssetWalletBackupRequest) Reset() {
 	*x = ExportAssetWalletBackupRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[26]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1895,7 +2078,7 @@ func (x *ExportAssetWalletBackupRequest) String() string {
 func (*ExportAssetWalletBackupRequest) ProtoMessage() {}
 
 func (x *ExportAssetWalletBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[26]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1908,7 +2091,7 @@ func (x *ExportAssetWalletBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAssetWalletBackupRequest.ProtoReflect.Descriptor instead.
 func (*ExportAssetWalletBackupRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{26}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ExportAssetWalletBackupRequest) GetMode() BackupMode {
@@ -1929,7 +2112,7 @@ type ExportAssetWalletBackupResponse struct {
 
 func (x *ExportAssetWalletBackupResponse) Reset() {
 	*x = ExportAssetWalletBackupResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[27]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1941,7 +2124,7 @@ func (x *ExportAssetWalletBackupResponse) String() string {
 func (*ExportAssetWalletBackupResponse) ProtoMessage() {}
 
 func (x *ExportAssetWalletBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[27]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1954,7 +2137,7 @@ func (x *ExportAssetWalletBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAssetWalletBackupResponse.ProtoReflect.Descriptor instead.
 func (*ExportAssetWalletBackupResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{27}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ExportAssetWalletBackupResponse) GetBackup() []byte {
@@ -1975,7 +2158,7 @@ type ImportAssetsFromBackupRequest struct {
 
 func (x *ImportAssetsFromBackupRequest) Reset() {
 	*x = ImportAssetsFromBackupRequest{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[28]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1987,7 +2170,7 @@ func (x *ImportAssetsFromBackupRequest) String() string {
 func (*ImportAssetsFromBackupRequest) ProtoMessage() {}
 
 func (x *ImportAssetsFromBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[28]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2000,7 +2183,7 @@ func (x *ImportAssetsFromBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportAssetsFromBackupRequest.ProtoReflect.Descriptor instead.
 func (*ImportAssetsFromBackupRequest) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{28}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ImportAssetsFromBackupRequest) GetBackup() []byte {
@@ -2025,7 +2208,7 @@ type ImportAssetsFromBackupResponse struct {
 
 func (x *ImportAssetsFromBackupResponse) Reset() {
 	*x = ImportAssetsFromBackupResponse{}
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[29]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2037,7 +2220,7 @@ func (x *ImportAssetsFromBackupResponse) String() string {
 func (*ImportAssetsFromBackupResponse) ProtoMessage() {}
 
 func (x *ImportAssetsFromBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[29]
+	mi := &file_assetwalletrpc_assetwallet_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2050,7 +2233,7 @@ func (x *ImportAssetsFromBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportAssetsFromBackupResponse.ProtoReflect.Descriptor instead.
 func (*ImportAssetsFromBackupResponse) Descriptor() ([]byte, []int) {
-	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{29}
+	return file_assetwalletrpc_assetwallet_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ImportAssetsFromBackupResponse) GetNumImported() uint32 {
@@ -2106,7 +2289,7 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	"signedPsbt\x12#\n" +
 	"\rsigned_inputs\x18\x02 \x03(\rR\fsignedInputs\"@\n" +
 	"\x19AnchorVirtualPsbtsRequest\x12#\n" +
-	"\rvirtual_psbts\x18\x01 \x03(\fR\fvirtualPsbts\"\xa7\x04\n" +
+	"\rvirtual_psbts\x18\x01 \x03(\fR\fvirtualPsbts\"\xc6\x04\n" +
 	"\x19CommitVirtualPsbtsRequest\x12#\n" +
 	"\rvirtual_psbts\x18\x01 \x03(\fR\fvirtualPsbts\x12.\n" +
 	"\x13passive_asset_psbts\x18\x02 \x03(\fR\x11passiveAssetPsbts\x12\x1f\n" +
@@ -2121,7 +2304,9 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	"\x17lock_expiration_seconds\x18\t \x01(\x04R\x15lockExpirationSeconds\x12!\n" +
 	"\fskip_funding\x18\n" +
 	" \x01(\bR\vskipFunding\x12`\n" +
-	"\x18transition_proof_version\x18\v \x01(\x0e2&.assetwalletrpc.TransitionProofVersionR\x16transitionProofVersionB\x16\n" +
+	"\x18transition_proof_version\x18\v \x01(\x0e2&.assetwalletrpc.TransitionProofVersionR\x16transitionProofVersion\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\f \x01(\fR\trequestIdB\x16\n" +
 	"\x14anchor_change_outputB\x06\n" +
 	"\x04fees\"\xfe\x01\n" +
 	"\x1aCommitVirtualPsbtsResponse\x12\x1f\n" +
@@ -2130,7 +2315,14 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	"\rvirtual_psbts\x18\x02 \x03(\fR\fvirtualPsbts\x12.\n" +
 	"\x13passive_asset_psbts\x18\x04 \x03(\fR\x11passiveAssetPsbts\x12.\n" +
 	"\x13change_output_index\x18\x05 \x01(\x05R\x11changeOutputIndex\x12:\n" +
-	"\x10lnd_locked_utxos\x18\x06 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\"\xc7\x02\n" +
+	"\x10lnd_locked_utxos\x18\x06 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\"C\n" +
+	"\"GetCommitVirtualPsbtsStatusRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\fR\trequestId\"\xbc\x01\n" +
+	"#GetCommitVirtualPsbtsStatusResponse\x12@\n" +
+	"\x06status\x18\x01 \x01(\x0e2(.assetwalletrpc.CommitVirtualPsbtsStatusR\x06status\x12\x17\n" +
+	"\alock_id\x18\x02 \x01(\fR\x06lockId\x12:\n" +
+	"\x10lnd_locked_utxos\x18\x03 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\"\xc7\x02\n" +
 	"\x14PublishAndLogRequest\x12\x1f\n" +
 	"\vanchor_psbt\x18\x01 \x01(\fR\n" +
 	"anchorPsbt\x12#\n" +
@@ -2205,18 +2397,23 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	" COIN_SELECT_SCRIPT_TREES_ALLOWED\x10\x02*Z\n" +
 	"\x16TransitionProofVersion\x12\x1f\n" +
 	"\x1bTRANSITION_PROOF_VERSION_V0\x10\x00\x12\x1f\n" +
-	"\x1bTRANSITION_PROOF_VERSION_V1\x10\x01*2\n" +
+	"\x1bTRANSITION_PROOF_VERSION_V1\x10\x01*\x97\x01\n" +
+	"\x18CommitVirtualPsbtsStatus\x12'\n" +
+	"#COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN\x10\x00\x12'\n" +
+	"#COMMIT_VIRTUAL_PSBTS_STATUS_PENDING\x10\x01\x12)\n" +
+	"%COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED\x10\x02*2\n" +
 	"\n" +
 	"BackupMode\x12\a\n" +
 	"\x03RAW\x10\x00\x12\v\n" +
 	"\aCOMPACT\x10\x01\x12\x0e\n" +
 	"\n" +
-	"OPTIMISTIC\x10\x022\xa5\f\n" +
+	"OPTIMISTIC\x10\x022\xae\r\n" +
 	"\vAssetWallet\x12b\n" +
 	"\x0fFundVirtualPsbt\x12&.assetwalletrpc.FundVirtualPsbtRequest\x1a'.assetwalletrpc.FundVirtualPsbtResponse\x12b\n" +
 	"\x0fSignVirtualPsbt\x12&.assetwalletrpc.SignVirtualPsbtRequest\x1a'.assetwalletrpc.SignVirtualPsbtResponse\x12Z\n" +
 	"\x12AnchorVirtualPsbts\x12).assetwalletrpc.AnchorVirtualPsbtsRequest\x1a\x19.taprpc.SendAssetResponse\x12k\n" +
-	"\x12CommitVirtualPsbts\x12).assetwalletrpc.CommitVirtualPsbtsRequest\x1a*.assetwalletrpc.CommitVirtualPsbtsResponse\x12X\n" +
+	"\x12CommitVirtualPsbts\x12).assetwalletrpc.CommitVirtualPsbtsRequest\x1a*.assetwalletrpc.CommitVirtualPsbtsResponse\x12\x86\x01\n" +
+	"\x1bGetCommitVirtualPsbtsStatus\x122.assetwalletrpc.GetCommitVirtualPsbtsStatusRequest\x1a3.assetwalletrpc.GetCommitVirtualPsbtsStatusResponse\x12X\n" +
 	"\x15PublishAndLogTransfer\x12$.assetwalletrpc.PublishAndLogRequest\x1a\x19.taprpc.SendAssetResponse\x12b\n" +
 	"\x0fNextInternalKey\x12&.assetwalletrpc.NextInternalKeyRequest\x1a'.assetwalletrpc.NextInternalKeyResponse\x12\\\n" +
 	"\rNextScriptKey\x12$.assetwalletrpc.NextScriptKeyRequest\x1a%.assetwalletrpc.NextScriptKeyResponse\x12e\n" +
@@ -2241,104 +2438,111 @@ func file_assetwalletrpc_assetwallet_proto_rawDescGZIP() []byte {
 	return file_assetwalletrpc_assetwallet_proto_rawDescData
 }
 
-var file_assetwalletrpc_assetwallet_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_assetwalletrpc_assetwallet_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_assetwalletrpc_assetwallet_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_assetwalletrpc_assetwallet_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_assetwalletrpc_assetwallet_proto_goTypes = []any{
-	(CoinSelectType)(0),                     // 0: assetwalletrpc.CoinSelectType
-	(TransitionProofVersion)(0),             // 1: assetwalletrpc.TransitionProofVersion
-	(BackupMode)(0),                         // 2: assetwalletrpc.BackupMode
-	(*FundVirtualPsbtRequest)(nil),          // 3: assetwalletrpc.FundVirtualPsbtRequest
-	(*FundVirtualPsbtResponse)(nil),         // 4: assetwalletrpc.FundVirtualPsbtResponse
-	(*TxTemplate)(nil),                      // 5: assetwalletrpc.TxTemplate
-	(*PrevId)(nil),                          // 6: assetwalletrpc.PrevId
-	(*SignVirtualPsbtRequest)(nil),          // 7: assetwalletrpc.SignVirtualPsbtRequest
-	(*SignVirtualPsbtResponse)(nil),         // 8: assetwalletrpc.SignVirtualPsbtResponse
-	(*AnchorVirtualPsbtsRequest)(nil),       // 9: assetwalletrpc.AnchorVirtualPsbtsRequest
-	(*CommitVirtualPsbtsRequest)(nil),       // 10: assetwalletrpc.CommitVirtualPsbtsRequest
-	(*CommitVirtualPsbtsResponse)(nil),      // 11: assetwalletrpc.CommitVirtualPsbtsResponse
-	(*PublishAndLogRequest)(nil),            // 12: assetwalletrpc.PublishAndLogRequest
-	(*NextInternalKeyRequest)(nil),          // 13: assetwalletrpc.NextInternalKeyRequest
-	(*NextInternalKeyResponse)(nil),         // 14: assetwalletrpc.NextInternalKeyResponse
-	(*NextScriptKeyRequest)(nil),            // 15: assetwalletrpc.NextScriptKeyRequest
-	(*NextScriptKeyResponse)(nil),           // 16: assetwalletrpc.NextScriptKeyResponse
-	(*QueryInternalKeyRequest)(nil),         // 17: assetwalletrpc.QueryInternalKeyRequest
-	(*QueryInternalKeyResponse)(nil),        // 18: assetwalletrpc.QueryInternalKeyResponse
-	(*QueryScriptKeyRequest)(nil),           // 19: assetwalletrpc.QueryScriptKeyRequest
-	(*QueryScriptKeyResponse)(nil),          // 20: assetwalletrpc.QueryScriptKeyResponse
-	(*ProveAssetOwnershipRequest)(nil),      // 21: assetwalletrpc.ProveAssetOwnershipRequest
-	(*ProveAssetOwnershipResponse)(nil),     // 22: assetwalletrpc.ProveAssetOwnershipResponse
-	(*VerifyAssetOwnershipRequest)(nil),     // 23: assetwalletrpc.VerifyAssetOwnershipRequest
-	(*VerifyAssetOwnershipResponse)(nil),    // 24: assetwalletrpc.VerifyAssetOwnershipResponse
-	(*RemoveUTXOLeaseRequest)(nil),          // 25: assetwalletrpc.RemoveUTXOLeaseRequest
-	(*RemoveUTXOLeaseResponse)(nil),         // 26: assetwalletrpc.RemoveUTXOLeaseResponse
-	(*DeclareScriptKeyRequest)(nil),         // 27: assetwalletrpc.DeclareScriptKeyRequest
-	(*DeclareScriptKeyResponse)(nil),        // 28: assetwalletrpc.DeclareScriptKeyResponse
-	(*ExportAssetWalletBackupRequest)(nil),  // 29: assetwalletrpc.ExportAssetWalletBackupRequest
-	(*ExportAssetWalletBackupResponse)(nil), // 30: assetwalletrpc.ExportAssetWalletBackupResponse
-	(*ImportAssetsFromBackupRequest)(nil),   // 31: assetwalletrpc.ImportAssetsFromBackupRequest
-	(*ImportAssetsFromBackupResponse)(nil),  // 32: assetwalletrpc.ImportAssetsFromBackupResponse
-	nil,                                     // 33: assetwalletrpc.TxTemplate.RecipientsEntry
-	(*taprpc.AddressWithAmount)(nil),        // 34: taprpc.AddressWithAmount
-	(*taprpc.OutPoint)(nil),                 // 35: taprpc.OutPoint
-	(*taprpc.KeyDescriptor)(nil),            // 36: taprpc.KeyDescriptor
-	(*taprpc.ScriptKey)(nil),                // 37: taprpc.ScriptKey
-	(*taprpc.SendAssetResponse)(nil),        // 38: taprpc.SendAssetResponse
+	(CoinSelectType)(0),                         // 0: assetwalletrpc.CoinSelectType
+	(TransitionProofVersion)(0),                 // 1: assetwalletrpc.TransitionProofVersion
+	(CommitVirtualPsbtsStatus)(0),               // 2: assetwalletrpc.CommitVirtualPsbtsStatus
+	(BackupMode)(0),                             // 3: assetwalletrpc.BackupMode
+	(*FundVirtualPsbtRequest)(nil),              // 4: assetwalletrpc.FundVirtualPsbtRequest
+	(*FundVirtualPsbtResponse)(nil),             // 5: assetwalletrpc.FundVirtualPsbtResponse
+	(*TxTemplate)(nil),                          // 6: assetwalletrpc.TxTemplate
+	(*PrevId)(nil),                              // 7: assetwalletrpc.PrevId
+	(*SignVirtualPsbtRequest)(nil),              // 8: assetwalletrpc.SignVirtualPsbtRequest
+	(*SignVirtualPsbtResponse)(nil),             // 9: assetwalletrpc.SignVirtualPsbtResponse
+	(*AnchorVirtualPsbtsRequest)(nil),           // 10: assetwalletrpc.AnchorVirtualPsbtsRequest
+	(*CommitVirtualPsbtsRequest)(nil),           // 11: assetwalletrpc.CommitVirtualPsbtsRequest
+	(*CommitVirtualPsbtsResponse)(nil),          // 12: assetwalletrpc.CommitVirtualPsbtsResponse
+	(*GetCommitVirtualPsbtsStatusRequest)(nil),  // 13: assetwalletrpc.GetCommitVirtualPsbtsStatusRequest
+	(*GetCommitVirtualPsbtsStatusResponse)(nil), // 14: assetwalletrpc.GetCommitVirtualPsbtsStatusResponse
+	(*PublishAndLogRequest)(nil),                // 15: assetwalletrpc.PublishAndLogRequest
+	(*NextInternalKeyRequest)(nil),              // 16: assetwalletrpc.NextInternalKeyRequest
+	(*NextInternalKeyResponse)(nil),             // 17: assetwalletrpc.NextInternalKeyResponse
+	(*NextScriptKeyRequest)(nil),                // 18: assetwalletrpc.NextScriptKeyRequest
+	(*NextScriptKeyResponse)(nil),               // 19: assetwalletrpc.NextScriptKeyResponse
+	(*QueryInternalKeyRequest)(nil),             // 20: assetwalletrpc.QueryInternalKeyRequest
+	(*QueryInternalKeyResponse)(nil),            // 21: assetwalletrpc.QueryInternalKeyResponse
+	(*QueryScriptKeyRequest)(nil),               // 22: assetwalletrpc.QueryScriptKeyRequest
+	(*QueryScriptKeyResponse)(nil),              // 23: assetwalletrpc.QueryScriptKeyResponse
+	(*ProveAssetOwnershipRequest)(nil),          // 24: assetwalletrpc.ProveAssetOwnershipRequest
+	(*ProveAssetOwnershipResponse)(nil),         // 25: assetwalletrpc.ProveAssetOwnershipResponse
+	(*VerifyAssetOwnershipRequest)(nil),         // 26: assetwalletrpc.VerifyAssetOwnershipRequest
+	(*VerifyAssetOwnershipResponse)(nil),        // 27: assetwalletrpc.VerifyAssetOwnershipResponse
+	(*RemoveUTXOLeaseRequest)(nil),              // 28: assetwalletrpc.RemoveUTXOLeaseRequest
+	(*RemoveUTXOLeaseResponse)(nil),             // 29: assetwalletrpc.RemoveUTXOLeaseResponse
+	(*DeclareScriptKeyRequest)(nil),             // 30: assetwalletrpc.DeclareScriptKeyRequest
+	(*DeclareScriptKeyResponse)(nil),            // 31: assetwalletrpc.DeclareScriptKeyResponse
+	(*ExportAssetWalletBackupRequest)(nil),      // 32: assetwalletrpc.ExportAssetWalletBackupRequest
+	(*ExportAssetWalletBackupResponse)(nil),     // 33: assetwalletrpc.ExportAssetWalletBackupResponse
+	(*ImportAssetsFromBackupRequest)(nil),       // 34: assetwalletrpc.ImportAssetsFromBackupRequest
+	(*ImportAssetsFromBackupResponse)(nil),      // 35: assetwalletrpc.ImportAssetsFromBackupResponse
+	nil,                                         // 36: assetwalletrpc.TxTemplate.RecipientsEntry
+	(*taprpc.AddressWithAmount)(nil),            // 37: taprpc.AddressWithAmount
+	(*taprpc.OutPoint)(nil),                     // 38: taprpc.OutPoint
+	(*taprpc.KeyDescriptor)(nil),                // 39: taprpc.KeyDescriptor
+	(*taprpc.ScriptKey)(nil),                    // 40: taprpc.ScriptKey
+	(*taprpc.SendAssetResponse)(nil),            // 41: taprpc.SendAssetResponse
 }
 var file_assetwalletrpc_assetwallet_proto_depIdxs = []int32{
-	5,  // 0: assetwalletrpc.FundVirtualPsbtRequest.raw:type_name -> assetwalletrpc.TxTemplate
+	6,  // 0: assetwalletrpc.FundVirtualPsbtRequest.raw:type_name -> assetwalletrpc.TxTemplate
 	0,  // 1: assetwalletrpc.FundVirtualPsbtRequest.coin_select_type:type_name -> assetwalletrpc.CoinSelectType
-	6,  // 2: assetwalletrpc.TxTemplate.inputs:type_name -> assetwalletrpc.PrevId
-	33, // 3: assetwalletrpc.TxTemplate.recipients:type_name -> assetwalletrpc.TxTemplate.RecipientsEntry
-	34, // 4: assetwalletrpc.TxTemplate.addresses_with_amounts:type_name -> taprpc.AddressWithAmount
-	35, // 5: assetwalletrpc.PrevId.outpoint:type_name -> taprpc.OutPoint
+	7,  // 2: assetwalletrpc.TxTemplate.inputs:type_name -> assetwalletrpc.PrevId
+	36, // 3: assetwalletrpc.TxTemplate.recipients:type_name -> assetwalletrpc.TxTemplate.RecipientsEntry
+	37, // 4: assetwalletrpc.TxTemplate.addresses_with_amounts:type_name -> taprpc.AddressWithAmount
+	38, // 5: assetwalletrpc.PrevId.outpoint:type_name -> taprpc.OutPoint
 	1,  // 6: assetwalletrpc.CommitVirtualPsbtsRequest.transition_proof_version:type_name -> assetwalletrpc.TransitionProofVersion
-	35, // 7: assetwalletrpc.CommitVirtualPsbtsResponse.lnd_locked_utxos:type_name -> taprpc.OutPoint
-	35, // 8: assetwalletrpc.PublishAndLogRequest.lnd_locked_utxos:type_name -> taprpc.OutPoint
-	36, // 9: assetwalletrpc.NextInternalKeyResponse.internal_key:type_name -> taprpc.KeyDescriptor
-	37, // 10: assetwalletrpc.NextScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
-	36, // 11: assetwalletrpc.QueryInternalKeyResponse.internal_key:type_name -> taprpc.KeyDescriptor
-	37, // 12: assetwalletrpc.QueryScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
-	35, // 13: assetwalletrpc.ProveAssetOwnershipRequest.outpoint:type_name -> taprpc.OutPoint
-	35, // 14: assetwalletrpc.VerifyAssetOwnershipResponse.outpoint:type_name -> taprpc.OutPoint
-	35, // 15: assetwalletrpc.RemoveUTXOLeaseRequest.outpoint:type_name -> taprpc.OutPoint
-	37, // 16: assetwalletrpc.DeclareScriptKeyRequest.script_key:type_name -> taprpc.ScriptKey
-	37, // 17: assetwalletrpc.DeclareScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
-	2,  // 18: assetwalletrpc.ExportAssetWalletBackupRequest.mode:type_name -> assetwalletrpc.BackupMode
-	3,  // 19: assetwalletrpc.AssetWallet.FundVirtualPsbt:input_type -> assetwalletrpc.FundVirtualPsbtRequest
-	7,  // 20: assetwalletrpc.AssetWallet.SignVirtualPsbt:input_type -> assetwalletrpc.SignVirtualPsbtRequest
-	9,  // 21: assetwalletrpc.AssetWallet.AnchorVirtualPsbts:input_type -> assetwalletrpc.AnchorVirtualPsbtsRequest
-	10, // 22: assetwalletrpc.AssetWallet.CommitVirtualPsbts:input_type -> assetwalletrpc.CommitVirtualPsbtsRequest
-	12, // 23: assetwalletrpc.AssetWallet.PublishAndLogTransfer:input_type -> assetwalletrpc.PublishAndLogRequest
-	13, // 24: assetwalletrpc.AssetWallet.NextInternalKey:input_type -> assetwalletrpc.NextInternalKeyRequest
-	15, // 25: assetwalletrpc.AssetWallet.NextScriptKey:input_type -> assetwalletrpc.NextScriptKeyRequest
-	17, // 26: assetwalletrpc.AssetWallet.QueryInternalKey:input_type -> assetwalletrpc.QueryInternalKeyRequest
-	19, // 27: assetwalletrpc.AssetWallet.QueryScriptKey:input_type -> assetwalletrpc.QueryScriptKeyRequest
-	21, // 28: assetwalletrpc.AssetWallet.ProveAssetOwnership:input_type -> assetwalletrpc.ProveAssetOwnershipRequest
-	23, // 29: assetwalletrpc.AssetWallet.VerifyAssetOwnership:input_type -> assetwalletrpc.VerifyAssetOwnershipRequest
-	25, // 30: assetwalletrpc.AssetWallet.RemoveUTXOLease:input_type -> assetwalletrpc.RemoveUTXOLeaseRequest
-	27, // 31: assetwalletrpc.AssetWallet.DeclareScriptKey:input_type -> assetwalletrpc.DeclareScriptKeyRequest
-	29, // 32: assetwalletrpc.AssetWallet.ExportAssetWalletBackup:input_type -> assetwalletrpc.ExportAssetWalletBackupRequest
-	31, // 33: assetwalletrpc.AssetWallet.ImportAssetsFromBackup:input_type -> assetwalletrpc.ImportAssetsFromBackupRequest
-	4,  // 34: assetwalletrpc.AssetWallet.FundVirtualPsbt:output_type -> assetwalletrpc.FundVirtualPsbtResponse
-	8,  // 35: assetwalletrpc.AssetWallet.SignVirtualPsbt:output_type -> assetwalletrpc.SignVirtualPsbtResponse
-	38, // 36: assetwalletrpc.AssetWallet.AnchorVirtualPsbts:output_type -> taprpc.SendAssetResponse
-	11, // 37: assetwalletrpc.AssetWallet.CommitVirtualPsbts:output_type -> assetwalletrpc.CommitVirtualPsbtsResponse
-	38, // 38: assetwalletrpc.AssetWallet.PublishAndLogTransfer:output_type -> taprpc.SendAssetResponse
-	14, // 39: assetwalletrpc.AssetWallet.NextInternalKey:output_type -> assetwalletrpc.NextInternalKeyResponse
-	16, // 40: assetwalletrpc.AssetWallet.NextScriptKey:output_type -> assetwalletrpc.NextScriptKeyResponse
-	18, // 41: assetwalletrpc.AssetWallet.QueryInternalKey:output_type -> assetwalletrpc.QueryInternalKeyResponse
-	20, // 42: assetwalletrpc.AssetWallet.QueryScriptKey:output_type -> assetwalletrpc.QueryScriptKeyResponse
-	22, // 43: assetwalletrpc.AssetWallet.ProveAssetOwnership:output_type -> assetwalletrpc.ProveAssetOwnershipResponse
-	24, // 44: assetwalletrpc.AssetWallet.VerifyAssetOwnership:output_type -> assetwalletrpc.VerifyAssetOwnershipResponse
-	26, // 45: assetwalletrpc.AssetWallet.RemoveUTXOLease:output_type -> assetwalletrpc.RemoveUTXOLeaseResponse
-	28, // 46: assetwalletrpc.AssetWallet.DeclareScriptKey:output_type -> assetwalletrpc.DeclareScriptKeyResponse
-	30, // 47: assetwalletrpc.AssetWallet.ExportAssetWalletBackup:output_type -> assetwalletrpc.ExportAssetWalletBackupResponse
-	32, // 48: assetwalletrpc.AssetWallet.ImportAssetsFromBackup:output_type -> assetwalletrpc.ImportAssetsFromBackupResponse
-	34, // [34:49] is the sub-list for method output_type
-	19, // [19:34] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	38, // 7: assetwalletrpc.CommitVirtualPsbtsResponse.lnd_locked_utxos:type_name -> taprpc.OutPoint
+	2,  // 8: assetwalletrpc.GetCommitVirtualPsbtsStatusResponse.status:type_name -> assetwalletrpc.CommitVirtualPsbtsStatus
+	38, // 9: assetwalletrpc.GetCommitVirtualPsbtsStatusResponse.lnd_locked_utxos:type_name -> taprpc.OutPoint
+	38, // 10: assetwalletrpc.PublishAndLogRequest.lnd_locked_utxos:type_name -> taprpc.OutPoint
+	39, // 11: assetwalletrpc.NextInternalKeyResponse.internal_key:type_name -> taprpc.KeyDescriptor
+	40, // 12: assetwalletrpc.NextScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
+	39, // 13: assetwalletrpc.QueryInternalKeyResponse.internal_key:type_name -> taprpc.KeyDescriptor
+	40, // 14: assetwalletrpc.QueryScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
+	38, // 15: assetwalletrpc.ProveAssetOwnershipRequest.outpoint:type_name -> taprpc.OutPoint
+	38, // 16: assetwalletrpc.VerifyAssetOwnershipResponse.outpoint:type_name -> taprpc.OutPoint
+	38, // 17: assetwalletrpc.RemoveUTXOLeaseRequest.outpoint:type_name -> taprpc.OutPoint
+	40, // 18: assetwalletrpc.DeclareScriptKeyRequest.script_key:type_name -> taprpc.ScriptKey
+	40, // 19: assetwalletrpc.DeclareScriptKeyResponse.script_key:type_name -> taprpc.ScriptKey
+	3,  // 20: assetwalletrpc.ExportAssetWalletBackupRequest.mode:type_name -> assetwalletrpc.BackupMode
+	4,  // 21: assetwalletrpc.AssetWallet.FundVirtualPsbt:input_type -> assetwalletrpc.FundVirtualPsbtRequest
+	8,  // 22: assetwalletrpc.AssetWallet.SignVirtualPsbt:input_type -> assetwalletrpc.SignVirtualPsbtRequest
+	10, // 23: assetwalletrpc.AssetWallet.AnchorVirtualPsbts:input_type -> assetwalletrpc.AnchorVirtualPsbtsRequest
+	11, // 24: assetwalletrpc.AssetWallet.CommitVirtualPsbts:input_type -> assetwalletrpc.CommitVirtualPsbtsRequest
+	13, // 25: assetwalletrpc.AssetWallet.GetCommitVirtualPsbtsStatus:input_type -> assetwalletrpc.GetCommitVirtualPsbtsStatusRequest
+	15, // 26: assetwalletrpc.AssetWallet.PublishAndLogTransfer:input_type -> assetwalletrpc.PublishAndLogRequest
+	16, // 27: assetwalletrpc.AssetWallet.NextInternalKey:input_type -> assetwalletrpc.NextInternalKeyRequest
+	18, // 28: assetwalletrpc.AssetWallet.NextScriptKey:input_type -> assetwalletrpc.NextScriptKeyRequest
+	20, // 29: assetwalletrpc.AssetWallet.QueryInternalKey:input_type -> assetwalletrpc.QueryInternalKeyRequest
+	22, // 30: assetwalletrpc.AssetWallet.QueryScriptKey:input_type -> assetwalletrpc.QueryScriptKeyRequest
+	24, // 31: assetwalletrpc.AssetWallet.ProveAssetOwnership:input_type -> assetwalletrpc.ProveAssetOwnershipRequest
+	26, // 32: assetwalletrpc.AssetWallet.VerifyAssetOwnership:input_type -> assetwalletrpc.VerifyAssetOwnershipRequest
+	28, // 33: assetwalletrpc.AssetWallet.RemoveUTXOLease:input_type -> assetwalletrpc.RemoveUTXOLeaseRequest
+	30, // 34: assetwalletrpc.AssetWallet.DeclareScriptKey:input_type -> assetwalletrpc.DeclareScriptKeyRequest
+	32, // 35: assetwalletrpc.AssetWallet.ExportAssetWalletBackup:input_type -> assetwalletrpc.ExportAssetWalletBackupRequest
+	34, // 36: assetwalletrpc.AssetWallet.ImportAssetsFromBackup:input_type -> assetwalletrpc.ImportAssetsFromBackupRequest
+	5,  // 37: assetwalletrpc.AssetWallet.FundVirtualPsbt:output_type -> assetwalletrpc.FundVirtualPsbtResponse
+	9,  // 38: assetwalletrpc.AssetWallet.SignVirtualPsbt:output_type -> assetwalletrpc.SignVirtualPsbtResponse
+	41, // 39: assetwalletrpc.AssetWallet.AnchorVirtualPsbts:output_type -> taprpc.SendAssetResponse
+	12, // 40: assetwalletrpc.AssetWallet.CommitVirtualPsbts:output_type -> assetwalletrpc.CommitVirtualPsbtsResponse
+	14, // 41: assetwalletrpc.AssetWallet.GetCommitVirtualPsbtsStatus:output_type -> assetwalletrpc.GetCommitVirtualPsbtsStatusResponse
+	41, // 42: assetwalletrpc.AssetWallet.PublishAndLogTransfer:output_type -> taprpc.SendAssetResponse
+	17, // 43: assetwalletrpc.AssetWallet.NextInternalKey:output_type -> assetwalletrpc.NextInternalKeyResponse
+	19, // 44: assetwalletrpc.AssetWallet.NextScriptKey:output_type -> assetwalletrpc.NextScriptKeyResponse
+	21, // 45: assetwalletrpc.AssetWallet.QueryInternalKey:output_type -> assetwalletrpc.QueryInternalKeyResponse
+	23, // 46: assetwalletrpc.AssetWallet.QueryScriptKey:output_type -> assetwalletrpc.QueryScriptKeyResponse
+	25, // 47: assetwalletrpc.AssetWallet.ProveAssetOwnership:output_type -> assetwalletrpc.ProveAssetOwnershipResponse
+	27, // 48: assetwalletrpc.AssetWallet.VerifyAssetOwnership:output_type -> assetwalletrpc.VerifyAssetOwnershipResponse
+	29, // 49: assetwalletrpc.AssetWallet.RemoveUTXOLease:output_type -> assetwalletrpc.RemoveUTXOLeaseResponse
+	31, // 50: assetwalletrpc.AssetWallet.DeclareScriptKey:output_type -> assetwalletrpc.DeclareScriptKeyResponse
+	33, // 51: assetwalletrpc.AssetWallet.ExportAssetWalletBackup:output_type -> assetwalletrpc.ExportAssetWalletBackupResponse
+	35, // 52: assetwalletrpc.AssetWallet.ImportAssetsFromBackup:output_type -> assetwalletrpc.ImportAssetsFromBackupResponse
+	37, // [37:53] is the sub-list for method output_type
+	21, // [21:37] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_assetwalletrpc_assetwallet_proto_init() }
@@ -2361,8 +2565,8 @@ func file_assetwalletrpc_assetwallet_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_assetwalletrpc_assetwallet_proto_rawDesc), len(file_assetwalletrpc_assetwallet_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   31,
+			NumEnums:      4,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
