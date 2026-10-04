@@ -767,13 +767,33 @@ var finalizeBatchCommand = cli.Command{
 }
 
 func finalizeBatch(ctx *cli.Context) error {
+	req, err := finalizeBatchRequest(ctx)
+	if err != nil {
+		return err
+	}
+
 	ctxc := getContext()
 	client, cleanUp := getMintClient(ctx)
 	defer cleanUp()
 
+	resp, err := client.FinalizeBatch(ctxc, req)
+	if err != nil {
+		return fmt.Errorf("unable to finalize batch: %w", err)
+	}
+
+	printRespJSON(resp)
+	return nil
+}
+
+// finalizeBatchRequest parses `assets mint finalize` flags into the RPC
+// request. Parsing happens before the client is opened so a bad
+// --signed_psbt file never reaches FinalizeBatch.
+func finalizeBatchRequest(ctx *cli.Context) (*mintrpc.FinalizeBatchRequest,
+	error) {
+
 	feeRate, err := parseFeeRate(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	req := &mintrpc.FinalizeBatchRequest{
@@ -784,16 +804,21 @@ func finalizeBatch(ctx *cli.Context) error {
 		signedPath := tapcfg.CleanAndExpandPath(path)
 		req.SignedPsbt, err = os.ReadFile(signedPath)
 		if err != nil {
-			return err
+			return nil, err
+		}
+
+		// FinalizeBatch selects the externally signed anchor only
+		// when signed_psbt is non-empty. A zero-length file would
+		// otherwise finalize with the daemon wallet.
+		if len(req.SignedPsbt) == 0 {
+			return nil, fmt.Errorf(
+				"--%s file is empty: %s", signedPsbtName,
+				signedPath,
+			)
 		}
 	}
-	resp, err := client.FinalizeBatch(ctxc, req)
-	if err != nil {
-		return fmt.Errorf("unable to finalize batch: %w", err)
-	}
 
-	printRespJSON(resp)
-	return nil
+	return req, nil
 }
 
 var cancelBatchCommand = cli.Command{
