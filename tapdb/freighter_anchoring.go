@@ -53,6 +53,26 @@ func (a *AssetStore) applyPendingParcel(ctx context.Context,
 	finalLeaseOwner [32]byte, finalLeaseExpiry time.Time) error {
 
 	newAnchorTXID := spend.AnchorTx.TxHash()
+
+	// A retry of the same anchor (a lost PublishAndLogTransfer
+	// response, or a second porter entry for that anchor) must not
+	// insert another asset_transfers row. chain_txns.txid is unique,
+	// but asset_transfers.anchor_txn_id is not.
+	existing, err := q.QueryAssetTransfers(ctx, TransferQuery{
+		AnchorTxHash: newAnchorTXID[:],
+	})
+	if err != nil {
+		return fmt.Errorf("unable to query existing transfer: %w",
+			err)
+	}
+	if len(existing) > 0 {
+		log.Infof("Anchor transaction %v already logged as "+
+			"transfer id=%d; not inserting another row",
+			newAnchorTXID, existing[0].ID)
+
+		return nil
+	}
+
 	anchorTxBytes, err := fn.Serialize(spend.AnchorTx)
 	if err != nil {
 		return err
