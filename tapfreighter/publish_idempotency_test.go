@@ -243,29 +243,88 @@ func TestPreAnchoredShipmentDoesNotSucceedAfterDoubleSpend(t *testing.T) {
 }
 
 // TestPreAnchoredShipmentRejectsReusedRequestID asserts that one request
-// ID cannot publish two different anchor transactions.
+// ID cannot publish two different anchor transactions while the first
+// publish is still in flight.
 func TestPreAnchoredShipmentRejectsReusedRequestID(t *testing.T) {
 	t.Parallel()
 
 	tx := testAnchorTx(1_000)
-	logged := &OutboundParcel{AnchorTx: tx}
-	porter := testPorter(&queryParcelLog{
-		parcels: []*OutboundParcel{logged},
-	})
+	block := make(chan struct{})
+	parcelLog := &queryParcelLog{block: block}
+	porter := testPorter(parcelLog)
 	t.Cleanup(func() {
 		close(porter.Quit)
 	})
 
 	first := testPreAnchoredParcel(tx)
 	first.SetRequestID([]byte("same-id"))
-	got := requestShipmentAsync(t, porter, first)
-	require.NoError(t, got.err)
-	require.Same(t, logged, got.resp)
+
+	done := make(chan shipmentResult, 1)
+	go func() {
+		resp, err := porter.RequestShipment(first)
+		done <- shipmentResult{resp: resp, err: err}
+	}()
+
+	require.Eventually(t, func() bool {
+		return parcelLog.calls.Load() >= 1
+	}, time.Second, 5*time.Millisecond)
 
 	other := testPreAnchoredParcel(testAnchorTx(2_000))
 	other.SetRequestID([]byte("same-id"))
-	got = requestShipmentAsync(t, porter, other)
+	got := requestShipmentAsync(t, porter, other)
 	require.ErrorIs(t, got.err, ErrPublishRequestIDReused)
+
+	close(block)
+
+	var shipped Parcel
+	select {
+	case shipped = <-porter.outboundParcels:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight anchor was not shipped")
+	}
+
+	logged := &OutboundParcel{AnchorTx: tx}
+	shipped.kit().respChan <- logged
+
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Equal(t, logged, result.resp)
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight shipment did not finish")
+	}
+}
+
+// TestPublishRequestIDsReleasedWhenPublishEnds asserts that a request
+// ID is dropped once its publish completes, so distinct IDs do not
+// accumulate for the life of the process.
+func TestPublishRequestIDsReleasedWhenPublishEnds(t *testing.T) {
+	t.Parallel()
+
+	const n = 8
+	parcels := make([]*OutboundParcel, n)
+	for i := 0; i < n; i++ {
+		parcels[i] = &OutboundParcel{
+			AnchorTx: testAnchorTx(int64(1_000 + i)),
+		}
+	}
+	porter := testPorter(&queryParcelLog{parcels: parcels})
+	t.Cleanup(func() {
+		close(porter.Quit)
+	})
+
+	for i := 0; i < n; i++ {
+		parcel := testPreAnchoredParcel(parcels[i].AnchorTx)
+		parcel.SetRequestID([]byte{byte(i + 1)})
+		got := requestShipmentAsync(t, porter, parcel)
+		require.NoError(t, got.err)
+		require.Same(t, parcels[i], got.resp)
+	}
+
+	porter.publishMu.Lock()
+	defer porter.publishMu.Unlock()
+	require.Empty(t, porter.publishRequestIDs)
 }
 
 // TestPreAnchoredShipmentQueryErrorDoesNotEnqueue asserts that a failed
