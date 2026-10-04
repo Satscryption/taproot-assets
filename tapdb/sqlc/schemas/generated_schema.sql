@@ -459,6 +459,15 @@ CREATE TABLE chain_txns (
     tx_index INTEGER
 );
 
+CREATE TABLE commit_virtual_psbt_idem (
+    -- request_id is the caller-supplied idempotency key.
+    request_id BLOB PRIMARY KEY
+        CHECK (length(request_id) BETWEEN 1 AND 64),
+
+    -- record holds the pending or completed commit outcome.
+    record BLOB NOT NULL
+);
+
 CREATE INDEX creation_time_idx ON addr_events(creation_time);
 
 CREATE TABLE federation_global_sync_config (
