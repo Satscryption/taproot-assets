@@ -3146,12 +3146,13 @@ func transitionProofOptions(
 	}
 }
 
-// CommitVirtualPsbts creates the output commitments and proofs for the given
-// virtual transactions by committing them to the BTC level anchor transaction.
-// In addition, the BTC level anchor transaction is funded and prepared up to
-// the point where it is ready to be signed.
-func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
-	req *wrpc.CommitVirtualPsbtsRequest) (*wrpc.CommitVirtualPsbtsResponse,
+// fundAndCommitVirtualPsbts creates the output commitments and proofs for
+// the given virtual transactions and funds the BTC level anchor. hooks may
+// be nil. When set, onFunded runs after lnd returns the leased inputs and
+// onResult runs with the finished response before those leases are kept.
+func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
+	req *wrpc.CommitVirtualPsbtsRequest,
+	hooks *commitVirtualPsbtsHooks) (*wrpc.CommitVirtualPsbtsResponse,
 	error) {
 
 	proofOpts, err := transitionProofOptions(req.TransitionProofVersion)
@@ -3292,6 +3293,21 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 				}
 			}
 		}()
+
+		// Persist the leases before any later error can return
+		// without telling the caller which outputs lnd locked.
+		if hooks != nil && hooks.onFunded != nil {
+			err = hooks.onFunded(
+				effectiveCommitLockID(
+					lockedUTXO, req.CustomLockId,
+				),
+				outpointsFromWire(lockedOutpoints),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("recording funded "+
+					"leases: %w", err)
+			}
+		}
 	}
 
 	// We can now update the anchor outputs as we have the final
@@ -3364,6 +3380,16 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 		response.LndLockedUtxos[idx] = &taprpc.OutPoint{
 			Txid:        lockedOutpoints[idx].Hash[:],
 			OutputIndex: lockedOutpoints[idx].Index,
+		}
+	}
+
+	// Persist a successful result before cancelling lease cleanup, so a
+	// failure to store the outcome still releases the leases.
+	if hooks != nil && hooks.onResult != nil {
+		err = hooks.onResult(response)
+		if err != nil {
+			return nil, fmt.Errorf("recording commit result: %w",
+				err)
 		}
 	}
 

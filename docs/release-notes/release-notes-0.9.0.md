@@ -218,6 +218,14 @@
 
 ## RPC Additions
 
+* `CommitVirtualPsbts` accepts an optional `request_id`. When it is
+  set, tapd stores the outcome and a repeated call with the same
+  request returns that result instead of funding the anchor again.
+  `GetCommitVirtualPsbtsStatus` reports whether the call is unknown,
+  still in progress, or completed, along with the lnd lock ID and
+  locked outpoints. Callers that leave `request_id` empty see the
+  previous stateless behavior.
+
 * [PR#2266](https://github.com/lightninglabs/taproot-assets/pull/2266)
   adds a `ListAnchorings` RPC (with REST binding) exposing the
   anchoring watcher's registry: each anchoring's site, sensed and
@@ -412,6 +420,11 @@
   asserts the swept assets remain spendable.
 
 ## Database
+
+* Database migration 73 adds `commit_virtual_psbt_idem`, which stores
+  the outcome of `CommitVirtualPsbts` calls that set a `request_id`.
+  Existing rows are unaffected and no backfill is required. Calls that
+  do not set a request ID do not write to the table.
 
 * [PR#2287](https://github.com/lightninglabs/taproot-assets/pull/2287)
   adds database migration 69, an opaque per-site match key and a

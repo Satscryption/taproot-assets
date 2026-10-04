@@ -1,6 +1,7 @@
 package tapconfig
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -190,6 +191,24 @@ type UniverseConnPool interface {
 	Close()
 }
 
+// CommitIdempotencyStore persists opaque CommitVirtualPsbts records
+// keyed by the caller-supplied request ID. The RPC server owns the
+// record encoding.
+//
+// InsertCommitRecord returns *tapdb.ErrSqlUniqueConstraintViolation
+// when the key is already present. FetchCommitRecord and
+// UpdateCommitRecord return tapdb.ErrNoCommitRecord when it is not.
+// DeleteCommitRecord of a missing key is a no-op.
+type CommitIdempotencyStore interface {
+	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	FetchCommitRecord(ctx context.Context, requestID []byte) ([]byte, error)
+
+	UpdateCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	DeleteCommitRecord(ctx context.Context, requestID []byte) error
+}
+
 // Config is the main config of the Taproot Assets server.
 type Config struct {
 	DebugLevel string
@@ -245,6 +264,12 @@ type Config struct {
 	ProofArchive proof.Archiver
 
 	AssetWallet tapfreighter.Wallet
+
+	// CommitIdempotency stores CommitVirtualPsbts outcomes keyed by
+	// the caller-supplied request ID. A nil store rejects calls that
+	// set a request ID. Calls that leave the request ID empty do not
+	// touch the store.
+	CommitIdempotency CommitIdempotencyStore
 
 	CoinSelect *tapfreighter.CoinSelect
 

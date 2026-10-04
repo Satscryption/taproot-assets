@@ -1118,6 +1118,8 @@ func genServerConfig(ctx context.Context, cfg *Config,
 		}
 	}
 
+	commitIdempotency := tapdb.NewCommitVirtualPsbtStoreFromDB(db)
+
 	// nolint: lll
 	return &tapconfig.Config{
 		DebugLevel:               cfg.DebugLevel,
@@ -1136,6 +1138,7 @@ func genServerConfig(ctx context.Context, cfg *Config,
 		DefaultProofCourierAddr:  proofCourierAddr,
 		ProofArchive:             proofArchive,
 		AssetWallet:              assetWallet,
+		CommitIdempotency:        commitIdempotency,
 		CoinSelect:               coinSelect,
 		ChainPorter:              chainPorter,
 		DisableSweepOrphanUtxos:  cfg.Wallet.DisableSweepOrphanUtxos,
