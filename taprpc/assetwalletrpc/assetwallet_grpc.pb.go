@@ -42,8 +42,9 @@ type AssetWalletClient interface {
 	// call made with a request_id. It says whether that call is still in
 	// progress or completed, and lists the lnd lock ID and locked outpoints
 	// recorded for it. An unknown request_id is reported as unknown rather
-	// than an error. The funded PSBTs themselves are returned by repeating
-	// CommitVirtualPsbts with the same request.
+	// than an error. A pending row stays pending after its leases expire.
+	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
+	// completed, and funds again once a pending call's leases have expired.
 	GetCommitVirtualPsbtsStatus(ctx context.Context, in *GetCommitVirtualPsbtsStatusRequest, opts ...grpc.CallOption) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the
@@ -285,8 +286,9 @@ type AssetWalletServer interface {
 	// call made with a request_id. It says whether that call is still in
 	// progress or completed, and lists the lnd lock ID and locked outpoints
 	// recorded for it. An unknown request_id is reported as unknown rather
-	// than an error. The funded PSBTs themselves are returned by repeating
-	// CommitVirtualPsbts with the same request.
+	// than an error. A pending row stays pending after its leases expire.
+	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
+	// completed, and funds again once a pending call's leases have expired.
 	GetCommitVirtualPsbtsStatus(context.Context, *GetCommitVirtualPsbtsStatusRequest) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the

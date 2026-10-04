@@ -414,7 +414,7 @@
     },
     "/v1/taproot-assets/wallet/virtual-psbt/commit/status": {
       "post": {
-        "summary": "GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts\ncall made with a request_id. It says whether that call is still in\nprogress or completed, and lists the lnd lock ID and locked outpoints\nrecorded for it. An unknown request_id is reported as unknown rather\nthan an error. The funded PSBTs themselves are returned by repeating\nCommitVirtualPsbts with the same request.",
+        "summary": "GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts\ncall made with a request_id. It says whether that call is still in\nprogress or completed, and lists the lnd lock ID and locked outpoints\nrecorded for it. An unknown request_id is reported as unknown rather\nthan an error. A pending row stays pending after its leases expire.\nRepeating CommitVirtualPsbts returns the stored PSBTs when the call\ncompleted, and funds again once a pending call's leases have expired.",
         "operationId": "AssetWallet_GetCommitVirtualPsbtsStatus",
         "responses": {
           "200": {
@@ -644,7 +644,7 @@
         "request_id": {
           "type": "string",
           "format": "byte",
-          "description": "Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the\nRPC is unchanged and nothing is stored. When set, tapd records the\noutcome under this key. A later call with the same key and the same\nrequest returns that stored response and does not fund again. The same\nkey with a different request is rejected. A repeat while the first call\nis still running, or before its outcome was recorded, is rejected; use\nGetCommitVirtualPsbtsStatus to read the lock ID and leased outpoints.\nIf custom_lock_id is empty, tapd derives a 32-byte lock ID as\nSHA-256(request_id) and uses that for the lnd lease."
+          "description": "Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the\nRPC is unchanged and nothing is stored. When set, tapd records the\noutcome under this key. A later call with the same key and the same\nrequest returns that stored response and does not fund again. The same\nkey with a different request is rejected. A repeat while the first call\nis still running, or while lnd still holds its input leases, is\nrejected; use GetCommitVirtualPsbtsStatus to read the lock ID and\nleased outpoints. After those leases expire, the same request funds\nagain. If custom_lock_id is empty, tapd derives a 32-byte lock ID as\nSHA-256(request_id) and uses that for the lnd lease."
         }
       }
     },
@@ -695,7 +695,7 @@
         "COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED"
       ],
       "default": "COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN",
-      "description": " - COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN: No CommitVirtualPsbts call with this request_id has been recorded.\n - COMMIT_VIRTUAL_PSBTS_STATUS_PENDING: The call has been claimed and has not yet recorded a final response.\nLeased outpoints are present only after funding has returned. A repeat\nof CommitVirtualPsbts will not fund again.\n - COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED: The call completed. Repeating CommitVirtualPsbts with the same request\nreturns the stored response."
+      "description": " - COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN: No CommitVirtualPsbts call with this request_id has been recorded.\n - COMMIT_VIRTUAL_PSBTS_STATUS_PENDING: The call has been claimed and has not yet recorded a final response.\nLeased outpoints are present only after funding has returned. A repeat\nof CommitVirtualPsbts does not fund again while the call is in progress\nor while lnd still holds its leases. After those leases expire, the\nsame request funds again.\n - COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED: The call completed. Repeating CommitVirtualPsbts with the same request\nreturns the stored response."
     },
     "assetwalletrpcDeclareScriptKeyRequest": {
       "type": "object",
