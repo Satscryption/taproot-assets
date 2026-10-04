@@ -2,6 +2,7 @@ package supplyverifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -16,8 +17,22 @@ import (
 
 const (
 	// defaultPullTimeout is the default timeout for a supply commitment
+	// pull. Fetch retries run under this deadline.
 	defaultPullTimeout = 30 * time.Second
+
+	// maxAncestorChain is the most predecessor supply commitments one
+	// push will load and insert. The walk also stops on a repeated
+	// outpoint and on context cancellation. A longer gap is not
+	// partially inserted: the push fails and a later attempt retries
+	// the same chain from the start.
+	maxAncestorChain = 256
 )
+
+// errSupplyChainRemainder is returned when a gap is longer than
+// maxAncestorChain. It is not inserted as a prefix: the server is left
+// unchanged by this repair, and the caller's retry walks the same chain.
+var errSupplyChainRemainder = errors.New("supply commitment predecessor " +
+	"chain exceeds the repair limit")
 
 // UniverseClient is an interface that represents a client connection to a
 // remote universe server.
@@ -62,6 +77,17 @@ type UniverseFederationView interface {
 	UniverseServers(ctx context.Context) ([]universe.ServerAddr, error)
 }
 
+// SupplyCommitHistory loads a supply commitment this node already
+// stores, including the leaves and chain proof needed to push it. The
+// outpoint is the commitment output a successor spends.
+type SupplyCommitHistory interface {
+	// FetchSupplyCommitPush returns the push payload for the supply
+	// commitment that created outpoint.
+	FetchSupplyCommitPush(ctx context.Context, assetSpec asset.Specifier,
+		outpoint wire.OutPoint) (supplycommit.RootCommitment,
+		supplycommit.SupplyLeaves, supplycommit.ChainProof, error)
+}
+
 // SupplySyncerConfig is a configuration struct for creating a new
 // SupplySyncer instance.
 type SupplySyncerConfig struct {
@@ -75,6 +101,19 @@ type SupplySyncerConfig struct {
 	// UniverseFederationView is used to fetch the list of known
 	// universe servers in the federation.
 	UniverseFederationView UniverseFederationView
+
+	// History loads predecessor supply commitments when a server
+	// rejects an insert because it has not seen the spent commitment.
+	// A nil History leaves that rejection unrepaired.
+	History SupplyCommitHistory
+
+	// Retry overrides backoff for universe dial, fetch, and insert.
+	// Nil selects fn.DefaultRetryConfig: 10 retries after the first
+	// attempt, starting at 100ms and doubling up to 5s. Cancellation
+	// of the context ends the sequence. ErrCommitmentNotFound and
+	// ErrPrevCommitmentNotFound are returned on the first occurrence
+	// instead of being retried.
+	Retry *fn.RetryConfig
 }
 
 // SupplySyncer is a struct that is responsible for retrieving supply leaves
@@ -92,7 +131,243 @@ func NewSupplySyncer(cfg SupplySyncerConfig) SupplySyncer {
 	}
 }
 
-// pushUniServer pushes the supply commitment to a specific universe server.
+// retryConfig returns the backoff for universe dial, fetch, and insert.
+func (s *SupplySyncer) retryConfig() fn.RetryConfig {
+	if s.cfg.Retry != nil {
+		return *s.cfg.Retry
+	}
+
+	return fn.DefaultRetryConfig()
+}
+
+// terminalSyncErr reports errors that must not be retried. A missing
+// commitment is a definitive answer. A missing predecessor is repaired
+// by inserting earlier commitments, not by repeating the same insert.
+// Cancellation stops the sequence immediately.
+func terminalSyncErr(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrCommitmentNotFound) ||
+		errors.Is(err, ErrPrevCommitmentNotFound)
+}
+
+// retrySupplyOp calls op until it succeeds, the context is cancelled, a
+// definitive supply-commit error is returned, or the retry budget is
+// spent. The wait between attempts is capped and select-bound to ctx.
+func (s *SupplySyncer) retrySupplyOp(ctx context.Context,
+	op func() error) error {
+
+	cfg := s.retryConfig()
+	backoff := cfg.InitialBackoff
+
+	var err error
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		err = op()
+		if err == nil {
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if terminalSyncErr(ctx, err) || attempt == cfg.MaxRetries {
+			return err
+		}
+
+		if cfg.MaxBackoff > 0 && backoff > cfg.MaxBackoff {
+			backoff = cfg.MaxBackoff
+		}
+
+		log.Debugf("Supply sync attempt %d failed; retrying in %s: "+
+			"%v", attempt+1, backoff, err)
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+
+		case <-timer.C:
+		}
+
+		next := time.Duration(float64(backoff) * cfg.BackoffMultiplier)
+		if cfg.BackoffMultiplier <= 0 {
+			next = backoff
+		}
+		if cfg.MaxBackoff > 0 && next > cfg.MaxBackoff {
+			next = cfg.MaxBackoff
+		}
+		backoff = next
+	}
+
+	return err
+}
+
+// insertOnce dials the server and inserts one supply commitment. A
+// missing-predecessor error is returned as soon as it is observed so
+// the caller can repair the chain. The dial and the insert share one
+// retry budget: a fresh client is opened on every attempt.
+func (s *SupplySyncer) insertOnce(ctx context.Context,
+	serverAddr universe.ServerAddr, assetSpec asset.Specifier,
+	commitment supplycommit.RootCommitment,
+	leaves supplycommit.SupplyLeaves,
+	chainProof supplycommit.ChainProof) error {
+
+	return s.retrySupplyOp(ctx, func() error {
+		client, err := s.cfg.ClientFactory(serverAddr)
+		if err != nil {
+			return fmt.Errorf("unable to create universe "+
+				"client: %w", err)
+		}
+
+		defer func() {
+			if closeErr := client.Close(); closeErr != nil {
+				log.Errorf("unable to close universe "+
+					"client: %v", closeErr)
+			}
+		}()
+
+		err = client.InsertSupplyCommit(
+			ctx, assetSpec, commitment, leaves, chainProof,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to insert supply "+
+				"leaves: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// ancestorPush is one predecessor loaded from local history.
+type ancestorPush struct {
+	commitment supplycommit.RootCommitment
+	leaves     supplycommit.SupplyLeaves
+	chainProof supplycommit.ChainProof
+}
+
+// loadAncestors walks the spent-commitment links of commitment back to
+// the first commitment that spends nothing. The returned slice is
+// oldest first and does not include commitment itself.
+func (s *SupplySyncer) loadAncestors(ctx context.Context,
+	assetSpec asset.Specifier, commitment supplycommit.RootCommitment) (
+	[]ancestorPush, error) {
+
+	if s.cfg.History == nil {
+		return nil, fmt.Errorf("unable to load missing supply "+
+			"commitments: no local history: %w",
+			ErrPrevCommitmentNotFound)
+	}
+
+	var newestFirst []ancestorPush
+	seen := make(map[wire.OutPoint]struct{})
+	current := commitment
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		if current.SpentCommitment.IsNone() {
+			break
+		}
+
+		spent, err := current.SpentCommitment.UnwrapOrErr(
+			fmt.Errorf("supply commitment %s was rejected for "+
+				"a missing predecessor but does not spend "+
+				"one", current.CommitPoint()),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, dup := seen[spent]; dup {
+			return nil, fmt.Errorf("supply commitment "+
+				"predecessor cycle at %s", spent)
+		}
+		seen[spent] = struct{}{}
+
+		if len(seen) > maxAncestorChain {
+			return nil, fmt.Errorf("%w: more than %d predecessors",
+				errSupplyChainRemainder, maxAncestorChain)
+		}
+
+		priorCommit, priorLeaves, priorProof, err :=
+			s.cfg.History.FetchSupplyCommitPush(
+				ctx, assetSpec, spent,
+			)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load missing "+
+				"supply commitment %s: %w", spent, err)
+		}
+
+		if priorCommit.CommitPoint() != spent {
+			return nil, fmt.Errorf("local supply commitment "+
+				"for %s has outpoint %s", spent,
+				priorCommit.CommitPoint())
+		}
+
+		newestFirst = append(newestFirst, ancestorPush{
+			commitment: priorCommit,
+			leaves:     priorLeaves,
+			chainProof: priorProof,
+		})
+		current = priorCommit
+	}
+
+	for i, j := 0, len(newestFirst)-1; i < j; i, j = i+1, j-1 {
+		newestFirst[i], newestFirst[j] = newestFirst[j], newestFirst[i]
+	}
+
+	return newestFirst, nil
+}
+
+// insertMissingAncestors inserts the predecessors of commitment, oldest
+// first, so a server that has not seen the spent outpoint can accept
+// the original commitment afterwards.
+func (s *SupplySyncer) insertMissingAncestors(ctx context.Context,
+	serverAddr universe.ServerAddr, assetSpec asset.Specifier,
+	commitment supplycommit.RootCommitment) error {
+
+	ancestors, err := s.loadAncestors(ctx, assetSpec, commitment)
+	if err != nil {
+		return err
+	}
+
+	for idx := range ancestors {
+		ancestor := ancestors[idx]
+		log.Infof("Universe server %s is missing supply commitment "+
+			"%s; inserting it before %s", serverAddr.HostStr(),
+			ancestor.commitment.CommitPoint(),
+			commitment.CommitPoint())
+
+		err = s.insertOnce(
+			ctx, serverAddr, assetSpec, ancestor.commitment,
+			ancestor.leaves, ancestor.chainProof,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to insert missing supply "+
+				"commitment %s: %w",
+				ancestor.commitment.CommitPoint(), err)
+		}
+	}
+
+	return nil
+}
+
+// pushUniServer pushes the supply commitment to a specific universe
+// server. A rejection for a missing predecessor inserts the earlier
+// commitments this node has, oldest first, and then retries the insert.
 func (s *SupplySyncer) pushUniServer(ctx context.Context,
 	assetSpec asset.Specifier, commitment supplycommit.RootCommitment,
 	updateLeaves supplycommit.SupplyLeaves,
@@ -102,25 +377,26 @@ func (s *SupplySyncer) pushUniServer(ctx context.Context,
 	log.Debugf("Pushing supply commitment to server: %s, asset: %s",
 		serverAddr.HostStr(), assetSpec.String())
 
-	// Create a client for the specific universe server address.
-	client, err := s.cfg.ClientFactory(serverAddr)
-	if err != nil {
-		return fmt.Errorf("unable to create universe client: %w", err)
+	err := s.insertOnce(
+		ctx, serverAddr, assetSpec, commitment, updateLeaves,
+		chainProof,
+	)
+	if errors.Is(err, ErrPrevCommitmentNotFound) {
+		repairErr := s.insertMissingAncestors(
+			ctx, serverAddr, assetSpec, commitment,
+		)
+		if repairErr != nil {
+			return repairErr
+		}
+
+		err = s.insertOnce(
+			ctx, serverAddr, assetSpec, commitment, updateLeaves,
+			chainProof,
+		)
 	}
 
-	// Ensure the client is properly closed when we're done.
-	defer func() {
-		if closeErr := client.Close(); closeErr != nil {
-			log.Errorf("unable to close universe client: %v",
-				closeErr)
-		}
-	}()
-
-	err = client.InsertSupplyCommit(
-		ctx, assetSpec, commitment, updateLeaves, chainProof,
-	)
 	if err != nil {
-		return fmt.Errorf("unable to insert supply leaves: %w", err)
+		return err
 	}
 
 	// Log the successful insertion to the remote universe.
@@ -260,27 +536,35 @@ func (s *SupplySyncer) pullUniServer(ctx context.Context,
 		"spent_outpoint=%v", serverAddr.HostStr(), assetSpec.String(),
 		spentCommitOutpoint.IsSome())
 
-	// Create a client for the specific universe server address.
-	client, err := s.cfg.ClientFactory(serverAddr)
-	if err != nil {
-		return zero, fmt.Errorf("unable to create universe client: %w",
-			err)
-	}
-
-	// Ensure the client is properly closed when we're done.
-	defer func() {
-		if closeErr := client.Close(); closeErr != nil {
-			log.Errorf("Unable to close supply syncer pull "+
-				"universe client: %v", closeErr)
+	var result supplycommit.FetchSupplyCommitResult
+	err := s.retrySupplyOp(ctx, func() error {
+		client, err := s.cfg.ClientFactory(serverAddr)
+		if err != nil {
+			return fmt.Errorf("unable to create universe "+
+				"client: %w", err)
 		}
-	}()
 
-	result, err := client.FetchSupplyCommit(
-		ctx, assetSpec, spentCommitOutpoint,
-	)
+		defer func() {
+			if closeErr := client.Close(); closeErr != nil {
+				log.Errorf("Unable to close supply syncer "+
+					"pull universe client: %v", closeErr)
+			}
+		}()
+
+		fetched, err := client.FetchSupplyCommit(
+			ctx, assetSpec, spentCommitOutpoint,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to fetch supply "+
+				"commitment: %w", err)
+		}
+
+		result = fetched
+
+		return nil
+	})
 	if err != nil {
-		return zero, fmt.Errorf("unable to fetch supply commitment: %w",
-			err)
+		return zero, err
 	}
 
 	log.Infof("Successfully pulled supply commitment from server: %s, "+

@@ -3,6 +3,7 @@ package rpcserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcd/wire"
@@ -15,6 +16,8 @@ import (
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
 	"github.com/lightninglabs/taproot-assets/universe/supplyverifier"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // RpcSupplySync is an implementation of the universe.SupplySyncer interface
@@ -102,7 +105,7 @@ func (r *RpcSupplySync) InsertSupplyCommit(ctx context.Context,
 
 	_, err = r.conn.InsertSupplyCommit(ctx, req)
 	if err != nil {
-		return fmt.Errorf("unable to insert supply commitment: %w", err)
+		return mapSupplyInsertErr(err)
 	}
 
 	srvrLog.Infof("[RpcSupplySync.InsertSupplyCommit]: succeeded in "+
@@ -159,8 +162,7 @@ func (r *RpcSupplySync) FetchSupplyCommit(ctx context.Context,
 
 	resp, err := r.conn.FetchSupplyCommit(ctx, req)
 	if err != nil {
-		return zero, fmt.Errorf("unable to fetch supply commitment: %w",
-			err)
+		return zero, mapSupplyFetchErr(err)
 	}
 
 	// Unmarshal the chain data to get the root commitment.
@@ -258,6 +260,54 @@ func (r *RpcSupplySync) Close() error {
 		return r.conn.ClientConn.Close()
 	}
 	return nil
+}
+
+// insertSupplyCommitStatus maps a supply-commit insert error onto a
+// gRPC status. FailedPrecondition is reserved for a missing predecessor
+// (ErrPrevCommitmentNotFound) and is not used for any other outcome of
+// this RPC. The sync client maps that code back to the sentinel.
+func insertSupplyCommitStatus(err error) error {
+	if errors.Is(err, supplyverifier.ErrPrevCommitmentNotFound) {
+		return status.Errorf(codes.FailedPrecondition,
+			"failed to insert supply commitment: %v", err)
+	}
+
+	return fmt.Errorf("failed to insert supply commitment: %w", err)
+}
+
+// fetchSupplyCommitStatus maps a supply-commit fetch error onto a gRPC
+// status. NotFound is reserved for an absent commitment
+// (ErrCommitmentNotFound). The sync client maps that code back to the
+// sentinel so a miss is not retried as a transient failure.
+func fetchSupplyCommitStatus(err error) error {
+	if errors.Is(err, supplyverifier.ErrCommitmentNotFound) {
+		return status.Errorf(codes.NotFound,
+			"failed to fetch supply commit: %v", err)
+	}
+
+	return fmt.Errorf("failed to fetch supply commit: %w", err)
+}
+
+// mapSupplyInsertErr converts the InsertSupplyCommit RPC error into a
+// local error. Detection uses the status code, not the message text.
+func mapSupplyInsertErr(err error) error {
+	if status.Code(err) == codes.FailedPrecondition {
+		return fmt.Errorf("unable to insert supply commitment: %w",
+			supplyverifier.ErrPrevCommitmentNotFound)
+	}
+
+	return fmt.Errorf("unable to insert supply commitment: %w", err)
+}
+
+// mapSupplyFetchErr converts the FetchSupplyCommit RPC error into a
+// local error. Detection uses the status code, not the message text.
+func mapSupplyFetchErr(err error) error {
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("unable to fetch supply commitment: %w",
+			supplyverifier.ErrCommitmentNotFound)
+	}
+
+	return fmt.Errorf("unable to fetch supply commitment: %w", err)
 }
 
 // marshalSupplyCommitChainData converts a supplycommit.RootCommitment and

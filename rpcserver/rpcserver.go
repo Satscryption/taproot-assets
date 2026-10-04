@@ -4830,8 +4830,7 @@ func (r *RPCServer) FetchSupplyCommit(ctx context.Context,
 		ctx, assetSpec, locator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch supply commit: %w",
-			err)
+		return nil, fetchSupplyCommitStatus(err)
 	}
 	rootCommit := commit.Commitment
 
@@ -5471,8 +5470,7 @@ func (r *RPCServer) InsertSupplyCommit(ctx context.Context,
 		ctx, assetSpec, *rootCommitment, *supplyLeaves,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to insert supply commitment: %w",
-			err)
+		return nil, insertSupplyCommitStatus(err)
 	}
 
 	return &unirpc.InsertSupplyCommitResponse{}, nil
