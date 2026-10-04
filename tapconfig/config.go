@@ -199,6 +199,11 @@ type UniverseConnPool interface {
 // when the key is already present. FetchCommitRecord and
 // UpdateCommitRecord return tapdb.ErrNoCommitRecord when it is not.
 // DeleteCommitRecord of a missing key is a no-op.
+//
+// SwapCommitRecord and DeleteCommitRecordIf change the row only when
+// the stored bytes still equal expected. They return
+// tapdb.ErrCommitRecordChanged when they do not, and
+// tapdb.ErrNoCommitRecord when the key is absent.
 type CommitIdempotencyStore interface {
 	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
 
@@ -207,6 +212,12 @@ type CommitIdempotencyStore interface {
 	UpdateCommitRecord(ctx context.Context, requestID, record []byte) error
 
 	DeleteCommitRecord(ctx context.Context, requestID []byte) error
+
+	SwapCommitRecord(ctx context.Context, requestID, expected,
+		next []byte) error
+
+	DeleteCommitRecordIf(ctx context.Context, requestID,
+		expected []byte) error
 }
 
 // Config is the main config of the Taproot Assets server.

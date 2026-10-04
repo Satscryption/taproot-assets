@@ -3275,12 +3275,21 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 		)
 
 		// From now on, if we error out, we need to make sure we unlock
-		// the UTXOs that lnd just locked for us.
+		// the UTXOs that lnd just locked for us. A release that
+		// fails leaves the pending idempotency row in place. A
+		// replaced attempt must not unlock outputs a newer attempt
+		// may already have leased under the same lock ID.
 		defer func() {
 			if success {
 				return
 			}
+			if hooks != nil && hooks.attemptReplaced {
+				hooks.retainPending = true
 
+				return
+			}
+
+			var releaseErr error
 			for idx, utxo := range lockedUTXO {
 				var lockID wtxmgr.LockID
 				copy(lockID[:], utxo.Id)
@@ -3290,7 +3299,11 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 				if err != nil {
 					rpcsLog.Errorf("Error unlocking lnd "+
 						"UTXO %v: %v", op, err)
+					releaseErr = err
 				}
+			}
+			if releaseErr != nil && hooks != nil {
+				hooks.retainPending = true
 			}
 		}()
 
@@ -3302,6 +3315,7 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 					lockedUTXO, req.CustomLockId,
 				),
 				outpointsFromWire(lockedOutpoints),
+				earliestUtxoLeaseExpiry(lockedUTXO),
 			)
 			if err != nil {
 				return nil, fmt.Errorf("recording funded "+
