@@ -3,6 +3,8 @@ package supplycommit
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -516,6 +518,10 @@ func TestManagerIdleTickLoop(t *testing.T) {
 
 	groupKey := test.RandPubKey(t)
 
+	// regErr, when set, is returned by the first epoch registration.
+	// A later registration succeeds. Subtests run sequentially.
+	var regErr error
+
 	setup := func(t *testing.T, cfg ManagerCfg) (*Manager, chan int32,
 		chan struct{}) {
 
@@ -528,6 +534,11 @@ func TestManagerIdleTickLoop(t *testing.T) {
 
 		blocks := make(chan int32)
 		errs := make(chan error)
+		if regErr != nil {
+			chain.On(
+				"RegisterBlockEpochNtfn", mock.Anything,
+			).Return(nil, nil, regErr).Once()
+		}
 		chain.On(
 			"RegisterBlockEpochNtfn", mock.Anything,
 		).Return(blocks, errs, nil).Maybe()
@@ -596,6 +607,9 @@ func TestManagerIdleTickLoop(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		m, _, _ := setup(t, ManagerCfg{})
 		require.NoError(t, m.Start())
+		// A second start must not subscribe after the first
+		// decided the ticker is disabled.
+		require.NoError(t, m.Start())
 		defer func() { require.NoError(t, m.Stop()) }()
 
 		// No epoch registration happens, and nothing ticks.
@@ -610,11 +624,265 @@ func TestManagerIdleTickLoop(t *testing.T) {
 		chain := &mockChainBridge{}
 		chain.On(
 			"RegisterBlockEpochNtfn", mock.Anything,
-		).Return(nil, nil, errors.New("no chain")).Once()
+		).Return(nil, nil, errors.New("no chain")).Twice()
 		cfg.Chain = chain
 
 		m := NewManager(cfg)
 		require.ErrorContains(t, m.Start(), "no chain")
+		// The failed attempt must not latch. A later Start keeps
+		// reporting the error and tries to subscribe again.
+		require.ErrorContains(t, m.Start(), "no chain")
+		chain.AssertNumberOfCalls(
+			t, "RegisterBlockEpochNtfn", 2,
+		)
 		require.NoError(t, m.Stop())
 	})
+
+	t.Run("retries_after_registration_error", func(t *testing.T) {
+		regErr = errors.New("no chain")
+		t.Cleanup(func() { regErr = nil })
+
+		m, blocks, ticked := setup(t, ManagerCfg{
+			IdleCommitInterval: 6,
+		})
+		require.ErrorContains(t, m.Start(), "no chain")
+		require.NoError(t, m.Start())
+		// Success latches. A further Start does not subscribe
+		// again.
+		require.NoError(t, m.Start())
+		defer func() { require.NoError(t, m.Stop()) }()
+
+		chain := m.cfg.Chain.(*mockChainBridge)
+		registered := chain.AssertNumberOfCalls(
+			t, "RegisterBlockEpochNtfn", 2,
+		)
+		if !registered {
+			return
+		}
+
+		blocks <- 1000
+
+		select {
+		case <-ticked:
+		case <-time.After(testTimeout):
+			t.Fatal("no idle tick after registration retry")
+		}
+	})
+}
+
+// idleLoopHarness is a manager whose only job is the block-epoch loop.
+// Fetch counts show whether a tick was dispatched.
+type idleLoopHarness struct {
+	m       *Manager
+	blocks  chan int32
+	errs    chan error
+	fetches *atomic.Int32
+}
+
+func newIdleLoopHarness(t *testing.T) *idleLoopHarness {
+	t.Helper()
+
+	chain := &mockChainBridge{}
+	lookup := &MockAssetLookup{}
+	blocks := make(chan int32)
+	errs := make(chan error)
+	chain.On(
+		"RegisterBlockEpochNtfn", mock.Anything,
+	).Return(blocks, errs, nil).Once()
+
+	fetches := new(atomic.Int32)
+	lookup.On(
+		"FetchSupplyCommitAssets", mock.Anything, true,
+	).Run(func(mock.Arguments) {
+		fetches.Add(1)
+	}).Return([]btcec.PublicKey{}, nil).Maybe()
+
+	m := NewManager(ManagerCfg{
+		IdleCommitInterval: 6,
+		Chain:              chain,
+		AssetLookup:        lookup,
+	})
+	require.NoError(t, m.Start())
+	t.Cleanup(func() {
+		require.NoError(t, m.Stop())
+	})
+
+	return &idleLoopHarness{
+		m:       m,
+		blocks:  blocks,
+		errs:    errs,
+		fetches: fetches,
+	}
+}
+
+// waitIdleLoopExit blocks until the ticker goroutine and its context
+// watcher have both left.
+func waitIdleLoopExit(t *testing.T, h *idleLoopHarness) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		h.m.Wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("idle tick loop did not exit, fetches=%d",
+			h.fetches.Load())
+	}
+}
+
+// TestIdleTickLoopBlockStream checks that a closed epoch stream stops
+// the ticker, while a real height of zero is still delivered, and that
+// quit and epoch errors still stop the loop.
+func TestIdleTickLoopBlockStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("closed stream", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		// Closing the stream must not be read as height 0, and
+		// the loop must leave without a call to Stop.
+		close(h.blocks)
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+
+	t.Run("height zero", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		h.blocks <- 0
+		require.Eventually(t, func() bool {
+			return h.fetches.Load() == 1
+		}, time.Second, 5*time.Millisecond)
+		require.EqualValues(t, 1, h.fetches.Load())
+	})
+
+	t.Run("quit", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		require.NoError(t, h.m.Stop())
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+
+	t.Run("epoch error", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		h.errs <- errors.New("lost chain")
+		waitIdleLoopExit(t, h)
+		require.Zero(t, h.fetches.Load())
+	})
+}
+
+// gateStateLog counts FetchState calls and blocks each one until
+// release is closed. The block sits inside creation, before the
+// machine is cached.
+type gateStateLog struct {
+	mockStateMachineStore
+
+	calls   atomic.Int32
+	release <-chan struct{}
+}
+
+// FetchState implements StateMachineStore.
+func (g *gateStateLog) FetchState(context.Context, asset.Specifier) (State,
+	lfn.Option[SupplyStateTransition], error) {
+
+	g.calls.Add(1)
+	<-g.release
+
+	return &DefaultState{}, lfn.None[SupplyStateTransition](), nil
+}
+
+// TestFetchStateMachineCreatedOnce checks that two callers asking for
+// an uncached group start one state machine. The idle ticker and
+// SendEvent share this path. Two callers already raced on main; the
+// cache mutex only covers a single Get or Set.
+func TestFetchStateMachineCreatedOnce(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	var closed sync.Once
+	closeRelease := func() {
+		closed.Do(func() { close(release) })
+	}
+	defer closeRelease()
+
+	groupKey := test.RandPubKey(t)
+	spec := asset.NewSpecifierFromGroupKey(*groupKey)
+
+	lookup := &MockAssetLookup{}
+	lookup.On(
+		"QueryAssetGroupByGroupKey", mock.Anything, mock.Anything,
+	).Return(&asset.AssetGroup{
+		Genesis: &asset.Genesis{Tag: "once"},
+	}, nil).Maybe()
+	lookup.On(
+		"FetchAssetMetaForAsset", mock.Anything, mock.Anything,
+	).Return(&proof.MetaReveal{
+		UniverseCommitments: true,
+		DelegationKey:       fn.Some(*test.RandPubKey(t)),
+	}, nil).Maybe()
+	lookup.On(
+		"FetchInternalKeyLocator", mock.Anything, mock.Anything,
+	).Return(keychain.KeyLocator{}, nil).Maybe()
+
+	stateLog := &gateStateLog{release: release}
+	m := NewManager(ManagerCfg{
+		AssetLookup:    lookup,
+		StateLog:       stateLog,
+		DaemonAdapters: &managerDaemon{newMockDaemonAdapters()},
+	})
+	require.NoError(t, m.Start())
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	var (
+		wg         sync.WaitGroup
+		sm1, sm2   *StateMachine
+		err1, err2 error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sm1, err1 = m.fetchStateMachine(spec)
+	}()
+
+	// The first caller is held inside creation, before the cache
+	// insert. Only then start the second, so it observes the miss.
+	require.Eventually(t, func() bool {
+		return stateLog.calls.Load() >= 1
+	}, time.Second, 5*time.Millisecond)
+
+	go func() {
+		defer wg.Done()
+		sm2, err2 = m.fetchStateMachine(spec)
+	}()
+
+	// Give the second caller time to pass the cache check. It
+	// shares the in-flight create, so it must not start another
+	// machine. Without that, it calls FetchState too.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if stateLog.calls.Load() > 1 {
+			t.Fatalf("created %d state machines while the "+
+				"first was still starting",
+				stateLog.calls.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	closeRelease()
+	wg.Wait()
+
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	require.EqualValues(t, 1, stateLog.calls.Load())
+	require.Same(t, sm1, sm2)
+
+	cached, ok := m.smCache.Get(*groupKey)
+	require.True(t, ok)
+	require.Same(t, sm1, cached)
 }
