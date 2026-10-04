@@ -14,6 +14,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
+	"github.com/lightninglabs/taproot-assets/universe/supplyverifier"
 	lfn "github.com/lightningnetwork/lnd/fn/v2"
 )
 
@@ -400,6 +401,51 @@ func (s *SupplyCommitMachine) FetchCommitmentPushData(ctx context.Context,
 	return commitment, updates, chainProof, nil
 }
 
+// FetchSupplyCommitPush loads the push payload for the supply
+// commitment that created outpoint. The syncer uses it to insert a
+// predecessor the remote universe has not seen.
+func (s *SupplyCommitMachine) FetchSupplyCommitPush(ctx context.Context,
+	assetSpec asset.Specifier, outpoint wire.OutPoint) (
+	supplycommit.RootCommitment, supplycommit.SupplyLeaves,
+	supplycommit.ChainProof, error) {
+
+	var (
+		zeroCommit supplycommit.RootCommitment
+		zeroLeaves supplycommit.SupplyLeaves
+		zeroProof  supplycommit.ChainProof
+	)
+
+	groupKey, err := assetSpec.UnwrapGroupKeyOrErr()
+	if err != nil {
+		return zeroCommit, zeroLeaves, zeroProof, fmt.Errorf(
+			"asset specifier missing group key: %w", err)
+	}
+
+	commitment, updates, chainProof, err := s.FetchCommitmentPushData(
+		ctx, groupKey, outpoint.Hash,
+	)
+	if err != nil {
+		return zeroCommit, zeroLeaves, zeroProof, err
+	}
+
+	if commitment.TxOutIdx != outpoint.Index {
+		return zeroCommit, zeroLeaves, zeroProof, fmt.Errorf(
+			"supply commitment %v is at output %d, not %d",
+			outpoint.Hash, commitment.TxOutIdx, outpoint.Index)
+	}
+
+	leaves, err := supplycommit.NewSupplyLeavesFromEvents(updates)
+	if err != nil {
+		return zeroCommit, zeroLeaves, zeroProof, err
+	}
+
+	return commitment, leaves, chainProof, nil
+}
+
 // A compile-time assertion that the supply-commit store provides the
 // supply site's persistence surface.
 var _ supplycommit.SupplyAnchoringLog = (*SupplyCommitMachine)(nil)
+
+// A compile-time assertion that the supply-commit store can feed the
+// syncer's missing-predecessor repair.
+var _ supplyverifier.SupplyCommitHistory = (*SupplyCommitMachine)(nil)
