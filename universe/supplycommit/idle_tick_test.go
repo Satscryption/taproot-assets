@@ -734,20 +734,23 @@ func waitIdleLoopExit(t *testing.T, h *idleLoopHarness) {
 	}
 }
 
-// TestIdleTickLoopBlockStream checks that a closed epoch stream stops
-// the ticker, while a real height of zero is still delivered, and that
-// quit and epoch errors still stop the loop.
+// TestIdleTickLoopBlockStream checks that a closed epoch stream is not
+// read as a stream of height-0 blocks, while a real height of zero is
+// still delivered, and that quit still stops the loop.
 func TestIdleTickLoopBlockStream(t *testing.T) {
 	t.Parallel()
 
 	t.Run("closed stream", func(t *testing.T) {
 		h := newIdleLoopHarness(t)
 
-		// Closing the stream must not be read as height 0, and
-		// the loop must leave without a call to Stop.
+		// Closing the stream must not be read as height 0.
+		// The ticker backs off before resubscribing, so this
+		// window observes the hot loop if that check is lost.
 		close(h.blocks)
-		waitIdleLoopExit(t, h)
+		time.Sleep(idleEpochRetryInitial / 2)
 		require.Zero(t, h.fetches.Load())
+		require.NoError(t, h.m.Stop())
+		waitIdleLoopExit(t, h)
 	})
 
 	t.Run("height zero", func(t *testing.T) {
@@ -771,10 +774,245 @@ func TestIdleTickLoopBlockStream(t *testing.T) {
 	t.Run("epoch error", func(t *testing.T) {
 		h := newIdleLoopHarness(t)
 
+		// An error ends the subscription. It must not be read
+		// as a block, and the ticker must still shut down.
 		h.errs <- errors.New("lost chain")
+		time.Sleep(idleEpochRetryInitial / 2)
+		require.Zero(t, h.fetches.Load())
+		require.NoError(t, h.m.Stop())
 		waitIdleLoopExit(t, h)
+	})
+}
+
+// TestIdleEpochResubscribe checks that a finished block-epoch
+// subscription is opened again, that a failed registration waits, and
+// that shutdown during that wait leaves the ticker.
+func TestIdleEpochResubscribe(t *testing.T) {
+	t.Parallel()
+
+	t.Run("resumes after close", func(t *testing.T) {
+		assertIdleEpochResumes(t, func(blocks chan int32,
+			_ chan error) {
+
+			close(blocks)
+		})
+	})
+
+	t.Run("resumes after error", func(t *testing.T) {
+		assertIdleEpochResumes(t, func(_ chan int32, errs chan error) {
+			errs <- errors.New("lost chain")
+		})
+	})
+
+	t.Run("resumes after error stream close", func(t *testing.T) {
+		assertIdleEpochResumes(t, func(_ chan int32, errs chan error) {
+			close(errs)
+		})
+	})
+
+	t.Run("backoff after register failure", func(t *testing.T) {
+		chain := &mockChainBridge{}
+		lookup := &MockAssetLookup{}
+		fetches := new(atomic.Int32)
+		lookup.On(
+			"FetchSupplyCommitAssets", mock.Anything, true,
+		).Run(func(mock.Arguments) {
+			fetches.Add(1)
+		}).Return([]btcec.PublicKey{}, nil).Maybe()
+
+		firstBlocks := make(chan int32)
+		firstErrs := make(chan error)
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Return(firstBlocks, firstErrs, nil).Once()
+
+		var attempts []time.Time
+		var mu sync.Mutex
+		record := func(mock.Arguments) {
+			mu.Lock()
+			attempts = append(attempts, time.Now())
+			mu.Unlock()
+		}
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Run(record).Return(
+			nil, nil, errors.New("notifier down"),
+		).Once()
+
+		resumed := make(chan int32)
+		resumedErrs := make(chan error)
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Run(record).Return(resumed, resumedErrs, nil).Once()
+
+		m := NewManager(ManagerCfg{
+			IdleCommitInterval: 6,
+			Chain:              chain,
+			AssetLookup:        lookup,
+		})
+		require.NoError(t, m.Start())
+		defer func() { require.NoError(t, m.Stop()) }()
+
+		closedAt := time.Now()
+		close(firstBlocks)
+
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(attempts) >= 2
+		}, 5*time.Second, 10*time.Millisecond)
+
+		mu.Lock()
+		first := attempts[0]
+		second := attempts[1]
+		mu.Unlock()
+
+		// The failed registration and the successful retry are
+		// separated by the grown backoff, and the first attempt
+		// itself waits out the initial delay. A retry that keeps
+		// the initial delay stays under this gap.
+		require.GreaterOrEqual(t, first.Sub(closedAt),
+			idleEpochRetryInitial/2)
+		gap := second.Sub(first)
+		require.GreaterOrEqual(t, gap,
+			idleEpochRetryInitial+idleEpochRetryInitial/2)
+		require.Less(t, gap, idleEpochRetryMax)
+
+		resumed <- 40
+		require.Eventually(t, func() bool {
+			return fetches.Load() == 1
+		}, time.Second, 5*time.Millisecond)
+	})
+
+	t.Run("quit during backoff", func(t *testing.T) {
+		h := newIdleLoopHarness(t)
+
+		exited := make(chan struct{})
+		go func() {
+			h.m.Wg.Wait()
+			close(exited)
+		}()
+
+		close(h.blocks)
+		select {
+		case <-exited:
+			t.Fatal("ticker exited when the epoch stream closed")
+		case <-time.After(idleEpochRetryInitial / 2):
+		}
+
+		require.NoError(t, h.m.Stop())
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ticker did not exit on quit during backoff")
+		}
 		require.Zero(t, h.fetches.Load())
 	})
+
+	t.Run("ctx during backoff", func(t *testing.T) {
+		chain := &mockChainBridge{}
+		chain.On(
+			"RegisterBlockEpochNtfn", mock.Anything,
+		).Run(func(mock.Arguments) {
+			t.Errorf("resubscribed after the ticker context " +
+				"was cancelled")
+		}).Return(nil, nil, errors.New("should not run")).Maybe()
+
+		m := NewManager(ManagerCfg{
+			IdleCommitInterval: 6,
+			Chain:              chain,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		blocks := make(chan int32)
+		errs := make(chan error)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			m.idleTickLoop(ctx, blocks, errs, func() {})
+		}()
+
+		close(blocks)
+		select {
+		case <-done:
+			t.Fatal("ticker exited when the epoch stream closed")
+		case <-time.After(idleEpochRetryInitial / 2):
+		}
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ticker did not exit on ctx cancel during " +
+				"backoff")
+		}
+	})
+}
+
+// assertIdleEpochResumes ends the first epoch subscription and checks
+// that a later block on the replacement subscription is ticked.
+func assertIdleEpochResumes(t *testing.T, endStream func(chan int32,
+	chan error)) {
+
+	t.Helper()
+
+	chain := &mockChainBridge{}
+	lookup := &MockAssetLookup{}
+	fetches := new(atomic.Int32)
+	regs := new(atomic.Int32)
+	lookup.On(
+		"FetchSupplyCommitAssets", mock.Anything, true,
+	).Run(func(mock.Arguments) {
+		fetches.Add(1)
+	}).Return([]btcec.PublicKey{}, nil).Maybe()
+
+	firstBlocks := make(chan int32)
+	firstErrs := make(chan error)
+	chain.On(
+		"RegisterBlockEpochNtfn", mock.Anything,
+	).Run(func(mock.Arguments) {
+		regs.Add(1)
+	}).Return(firstBlocks, firstErrs, nil).Once()
+
+	nextBlocks := make(chan int32)
+	nextErrs := make(chan error)
+	chain.On(
+		"RegisterBlockEpochNtfn", mock.Anything,
+	).Run(func(mock.Arguments) {
+		regs.Add(1)
+	}).Return(nextBlocks, nextErrs, nil).Once()
+
+	m := NewManager(ManagerCfg{
+		IdleCommitInterval: 6,
+		Chain:              chain,
+		AssetLookup:        lookup,
+	})
+	require.NoError(t, m.Start())
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	endStream(firstBlocks, firstErrs)
+
+	require.Eventually(t, func() bool {
+		return regs.Load() >= 2
+	}, 5*time.Second, 10*time.Millisecond)
+
+	nextBlocks <- 25
+	require.Eventually(t, func() bool {
+		return fetches.Load() == 1
+	}, time.Second, 5*time.Millisecond)
+}
+
+// TestIdleEpochBackoffCap checks that a resubscribe delay grows and then
+// stays at the cap.
+func TestIdleEpochBackoffCap(t *testing.T) {
+	t.Parallel()
+
+	delay := time.Duration(0)
+	for i := 0; i < 40; i++ {
+		delay = nextIdleEpochBackoff(delay)
+		require.LessOrEqual(t, delay, idleEpochRetryMax)
+	}
+	require.Equal(t, idleEpochRetryMax, delay)
 }
 
 // gateStateLog counts FetchState calls and blocks each one until
