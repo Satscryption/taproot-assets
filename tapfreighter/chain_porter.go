@@ -164,6 +164,20 @@ type ChainPorter struct {
 	// subscriberMtx guards the subscribers map.
 	subscriberMtx sync.Mutex
 
+	// publishMu guards pre-anchored in-flight shipments and the
+	// process-local request ID bindings.
+	publishMu sync.Mutex
+
+	// preAnchoredFlights coalesces concurrent publishes of one anchor
+	// transaction so a retry cannot start a second state machine.
+	preAnchoredFlights map[chainhash.Hash]*preAnchoredFlight
+
+	// publishRequestIDs binds a caller request ID to the anchor
+	// transaction it was first used with. The binding lasts for the
+	// life of the process. After a restart the anchor transaction,
+	// which the retry still carries, is the durable key.
+	publishRequestIDs map[string]chainhash.Hash
+
 	*fn.ContextGuard
 }
 
@@ -178,11 +192,47 @@ func NewChainPorter(cfg *ChainPorterConfig) *ChainPorter {
 		outboundParcels: make(chan Parcel),
 		subscribers:     subscribers,
 		waiters:         tapreorg.NewDeliveryWaiters(),
+		preAnchoredFlights: make(
+			map[chainhash.Hash]*preAnchoredFlight,
+		),
+		publishRequestIDs: make(map[string]chainhash.Hash),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: tapgarden.DefaultTimeout,
 			Quit:           make(chan struct{}),
 		},
 	}
+}
+
+// ErrPublishRequestIDReused is returned when a publish request ID is
+// presented again for a different anchor transaction than the one it was
+// first bound to.
+var ErrPublishRequestIDReused = errors.New("publish request id already " +
+	"used for a different anchor transaction")
+
+// preAnchoredFlight is one in-flight pre-anchored publish. Followers
+// wait on done and share the leader's result.
+type preAnchoredFlight struct {
+	done chan struct{}
+	resp *OutboundParcel
+	err  error
+}
+
+func newPreAnchoredFlight() *preAnchoredFlight {
+	return &preAnchoredFlight{
+		done: make(chan struct{}),
+	}
+}
+
+func (f *preAnchoredFlight) wait() (*OutboundParcel, error) {
+	<-f.done
+
+	return f.resp, f.err
+}
+
+func (f *preAnchoredFlight) finish(resp *OutboundParcel, err error) {
+	f.resp = resp
+	f.err = err
+	close(f.done)
 }
 
 // Start kicks off the chain porter and any goroutines it needs to carry out
@@ -468,6 +518,99 @@ func (p *ChainPorter) RequestShipment(req Parcel) (*OutboundParcel, error) {
 		return nil, fmt.Errorf("failed to validate parcel: %w", err)
 	}
 
+	// A pre-anchored publish is the custom-anchor terminal step. A retry
+	// after a lost response must return the transfer already logged for
+	// that anchor instead of running the state machine again.
+	anchored, ok := req.(*PreAnchoredParcel)
+	if ok {
+		return p.requestPreAnchoredShipment(anchored)
+	}
+
+	return p.enqueueShipment(req)
+}
+
+// requestPreAnchoredShipment reconciles a pre-anchored publish with a
+// transfer already logged for its anchor, and coalesces concurrent
+// publishes of that anchor onto one shipment.
+func (p *ChainPorter) requestPreAnchoredShipment(
+	parcel *PreAnchoredParcel) (*OutboundParcel, error) {
+
+	txHash := parcel.anchorTx.FinalTx.TxHash()
+
+	p.publishMu.Lock()
+	if err := p.bindPublishRequestID(parcel.requestID, txHash); err != nil {
+		p.publishMu.Unlock()
+
+		return nil, err
+	}
+	if flight := p.preAnchoredFlights[txHash]; flight != nil {
+		p.publishMu.Unlock()
+
+		return flight.wait()
+	}
+
+	flight := newPreAnchoredFlight()
+	p.preAnchoredFlights[txHash] = flight
+	p.publishMu.Unlock()
+
+	resp, err := p.shipPreAnchored(parcel)
+
+	p.publishMu.Lock()
+	flight.finish(resp, err)
+	delete(p.preAnchoredFlights, txHash)
+	p.publishMu.Unlock()
+
+	return resp, err
+}
+
+// bindPublishRequestID records that id belongs to txHash. The caller must
+// hold publishMu. An empty id is not bound. Reuse for a different anchor
+// is rejected.
+func (p *ChainPorter) bindPublishRequestID(id []byte,
+	txHash chainhash.Hash) error {
+
+	if len(id) == 0 {
+		return nil
+	}
+
+	key := string(id)
+	prev, ok := p.publishRequestIDs[key]
+	if ok && prev != txHash {
+		return fmt.Errorf("%w", ErrPublishRequestIDReused)
+	}
+
+	p.publishRequestIDs[key] = txHash
+
+	return nil
+}
+
+// shipPreAnchored returns the transfer already logged for the parcel's
+// anchor, or enqueues a new shipment when none is logged.
+func (p *ChainPorter) shipPreAnchored(
+	parcel *PreAnchoredParcel) (*OutboundParcel, error) {
+
+	ctx, cancel := p.WithCtxQuit()
+	defer cancel()
+
+	txHash := parcel.anchorTx.FinalTx.TxHash()
+	existing, err := p.QueryParcels(ctx, fn.Some(txHash), false)
+	if err != nil {
+		return nil, fmt.Errorf("unable to query logged transfer: %w",
+			err)
+	}
+	if len(existing) > 0 {
+		log.Infof("Anchor transaction %v already logged; returning "+
+			"the existing transfer", txHash)
+
+		return existing[0], nil
+	}
+
+	return p.enqueueShipment(parcel)
+}
+
+// enqueueShipment hands a parcel to the porter state machine and waits
+// for its initial response.
+func (p *ChainPorter) enqueueShipment(req Parcel) (*OutboundParcel, error) {
 	if !fn.SendOrQuit(p.outboundParcels, req, p.Quit) {
 		return nil, fmt.Errorf("ChainPorter shutting down")
 	}
