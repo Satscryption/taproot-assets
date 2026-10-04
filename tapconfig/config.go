@@ -218,6 +218,12 @@ type CommitIdempotencyStore interface {
 
 	DeleteCommitRecordIf(ctx context.Context, requestID,
 		expected []byte) error
+
+	// ListCommitRecords returns every stored request ID and record.
+	// Order is undefined. Callers use it to see whether a lock ID is
+	// shared with another request before adopting that lock's leases.
+	ListCommitRecords(ctx context.Context) ([]tapdb.CommitRecordRow,
+		error)
 }
 
 // Config is the main config of the Taproot Assets server.

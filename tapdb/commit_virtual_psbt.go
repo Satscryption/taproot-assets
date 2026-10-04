@@ -19,6 +19,12 @@ var ErrCommitRecordChanged = errors.New(
 	"commit idempotency record changed",
 )
 
+// CommitRecordRow is one stored CommitVirtualPsbts idempotency record.
+type CommitRecordRow struct {
+	RequestID []byte
+	Record    []byte
+}
+
 // CommitVirtualPsbtQueries is the subset of sqlc methods that manage the
 // commit_virtual_psbt_idem table.
 type CommitVirtualPsbtQueries interface {
@@ -38,6 +44,9 @@ type CommitVirtualPsbtQueries interface {
 
 	DeleteCommitVirtualPsbtIf(ctx context.Context,
 		arg sqlc.DeleteCommitVirtualPsbtIfParams) (int64, error)
+
+	ListCommitVirtualPsbts(ctx context.Context) (
+		[]sqlc.CommitVirtualPsbtIdem, error)
 }
 
 // BatchedCommitVirtualPsbtStore is the transactional surface for commit
@@ -163,6 +172,43 @@ func (s *CommitVirtualPsbtStore) UpdateCommitRecord(ctx context.Context,
 	}
 
 	return nil
+}
+
+// ListCommitRecords returns every stored request ID and record. Order
+// is undefined.
+func (s *CommitVirtualPsbtStore) ListCommitRecords(ctx context.Context) (
+	[]CommitRecordRow, error) {
+
+	var rows []CommitRecordRow
+	err := s.db.ExecTx(
+		ctx, ReadTxOption(), func(q CommitVirtualPsbtQueries) error {
+			listed, err := q.ListCommitVirtualPsbts(ctx)
+			if err != nil {
+				return fmt.Errorf(
+					"list commit records: %w", err,
+				)
+			}
+
+			rows = make([]CommitRecordRow, 0, len(listed))
+			for _, row := range listed {
+				rows = append(rows, CommitRecordRow{
+					RequestID: append(
+						[]byte(nil), row.RequestID...,
+					),
+					Record: append(
+						[]byte(nil), row.Record...,
+					),
+				})
+			}
+
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return rows, nil
 }
 
 // DeleteCommitRecord removes the record for the key. Deleting a missing

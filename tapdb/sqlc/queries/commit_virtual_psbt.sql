@@ -10,6 +10,10 @@ SELECT record
 FROM commit_virtual_psbt_idem
 WHERE request_id = $1;
 
+-- name: ListCommitVirtualPsbts :many
+SELECT request_id, record
+FROM commit_virtual_psbt_idem;
+
 -- name: UpdateCommitVirtualPsbt :execrows
 UPDATE commit_virtual_psbt_idem
 SET record = $2

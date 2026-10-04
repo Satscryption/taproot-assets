@@ -91,12 +91,34 @@ func (w *leaseWallet) ListLeases(context.Context) (
 }
 
 func newLeaseServer(store tapconfig.CommitIdempotencyStore,
-	wallet *leaseWallet) *RPCServer {
+	wallet lndclient.WalletKitClient) *RPCServer {
 
 	srv := newIdempotencyServer(store)
 	srv.cfg.Lnd = &lndclient.LndServices{WalletKit: wallet}
 
 	return srv
+}
+
+// releaseWallet records ReleaseOutput calls. ListLeases still comes
+// from the embedded lease wallet.
+type releaseWallet struct {
+	leaseWallet
+
+	mu       sync.Mutex
+	released []wire.OutPoint
+	lockIDs  []wtxmgr.LockID
+}
+
+func (w *releaseWallet) ReleaseOutput(_ context.Context, id wtxmgr.LockID,
+	op wire.OutPoint) error {
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.released = append(w.released, op)
+	w.lockIDs = append(w.lockIDs, id)
+
+	return nil
 }
 
 func testLockID(raw []byte) wtxmgr.LockID {
@@ -233,6 +255,23 @@ func (m *memCommitStore) SwapCommitRecord(_ context.Context, id, expected,
 	m.rows[string(id)] = append([]byte(nil), next...)
 
 	return nil
+}
+
+func (m *memCommitStore) ListCommitRecords(context.Context) (
+	[]tapdb.CommitRecordRow, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rows := make([]tapdb.CommitRecordRow, 0, len(m.rows))
+	for id, record := range m.rows {
+		rows = append(rows, tapdb.CommitRecordRow{
+			RequestID: append([]byte(nil), id...),
+			Record:    append([]byte(nil), record...),
+		})
+	}
+
+	return rows, nil
 }
 
 func (m *memCommitStore) DeleteCommitRecordIf(_ context.Context, id,
@@ -727,9 +766,13 @@ func TestCommitVirtualPsbtsIdempotentSurvivesNewStore(t *testing.T) {
 	require.Equal(t, testLeaseLock, statusResp.LockId)
 }
 
-// TestCommitVirtualPsbtsStalePendingFundsAgain tests that a pending row
-// left behind by a crash after funding is funded again once lnd no
-// longer leases the recorded outpoints.
+// TestCommitVirtualPsbtsStalePendingFundsAgain tests a crash after
+// onFunded succeeds and before onResult stores the PSBT. onFunded has
+// already written the leased outpoints onto the pending row, and the
+// funded packet existed only in memory. Once lnd no longer leases
+// those outpoints, a repeat of CommitVirtualPsbts takes the request
+// over and funds again. It does not stay Aborted, and the request ID
+// is not stranded for good.
 func TestCommitVirtualPsbtsStalePendingFundsAgain(t *testing.T) {
 	t.Parallel()
 
@@ -1033,6 +1076,178 @@ func TestCommitVirtualPsbtsReplacedAttemptDoesNotFinish(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, commitStatusPending, rec.Status)
 	require.Equal(t, replacementLock, rec.LockID)
+}
+
+// TestCommitVirtualPsbtsReplacedAttemptReleasesOwnOutputs tests that a
+// delayed attempt, whose row a retry has replaced, releases the
+// outpoints it acquired and leaves the replacement's outpoints locked.
+// Both attempts use the same lnd lock ID.
+func TestCommitVirtualPsbtsReplacedAttemptReleasesOwnOutputs(t *testing.T) {
+	t.Parallel()
+
+	store := newMemCommitStore()
+	wallet := &releaseWallet{}
+	srv := newLeaseServer(store, wallet)
+	req := commitIDRequest([]byte("replaced-release"))
+	own := testLeaseOutpoint()
+	shared := &taprpc.OutPoint{
+		Txid:        bytes.Repeat([]byte{0x55}, 32),
+		OutputIndex: 4,
+	}
+
+	once := func(_ context.Context, _ *wrpc.CommitVirtualPsbtsRequest,
+		hooks *commitVirtualPsbtsHooks) (
+		*wrpc.CommitVirtualPsbtsResponse, error) {
+
+		ensureCommitLockID(req)
+		hash, err := hashCommitRequest(req)
+		require.NoError(t, err)
+
+		replacement, err := encodeCommitRecord(&commitRecord{
+			Status:      commitStatusPending,
+			RequestHash: hash,
+			LockID:      append([]byte(nil), req.CustomLockId...),
+			Outpoints:   []*taprpc.OutPoint{shared},
+			CreatedAt:   time.Unix(1_700_000_000, 0),
+		})
+		require.NoError(t, err)
+		require.NoError(t, store.UpdateCommitRecord(
+			context.Background(), req.RequestId, replacement,
+		))
+
+		err = hooks.onFunded(
+			append([]byte(nil), req.CustomLockId...),
+			[]*taprpc.OutPoint{own, shared}, time.Time{},
+		)
+		require.ErrorIs(t, err, errCommitAttemptReplaced)
+
+		return nil, err
+	}
+
+	_, err := srv.commitVirtualPsbts(context.Background(), req, once)
+	require.ErrorIs(t, err, errCommitAttemptReplaced)
+
+	wallet.mu.Lock()
+	released := append([]wire.OutPoint(nil), wallet.released...)
+	lockIDs := append([]wtxmgr.LockID(nil), wallet.lockIDs...)
+	wallet.mu.Unlock()
+
+	require.Len(t, released, 1)
+	require.Equal(t, own.OutputIndex, released[0].Index)
+	require.Equal(t, own.Txid, released[0].Hash[:])
+	require.Len(t, lockIDs, 1)
+	require.Equal(t, testLockID(req.CustomLockId), lockIDs[0])
+
+	raw, err := store.FetchCommitRecord(
+		context.Background(), req.RequestId,
+	)
+	require.NoError(t, err)
+	rec, err := decodeCommitRecord(raw)
+	require.NoError(t, err)
+	require.Len(t, rec.Outpoints, 1)
+	require.True(t, proto.Equal(shared, rec.Outpoints[0]))
+}
+
+// TestCommitVirtualPsbtsSharedLockDoesNotAdoptForeignLease tests that
+// a pending row does not record or keep leases it cannot attribute to
+// itself when another request uses the same caller-chosen lock ID.
+func TestCommitVirtualPsbtsSharedLockDoesNotAdoptForeignLease(
+	t *testing.T) {
+
+	t.Parallel()
+
+	lock := append([]byte(nil), testCustomLock...)
+	foreign := &taprpc.OutPoint{
+		Txid:        bytes.Repeat([]byte{0x66}, 32),
+		OutputIndex: 2,
+	}
+	own := &taprpc.OutPoint{
+		Txid:        bytes.Repeat([]byte{0x77}, 32),
+		OutputIndex: 3,
+	}
+
+	t.Run("recorded neighbor", func(t *testing.T) {
+		store := newMemCommitStore()
+		wallet := &leaseWallet{
+			leases: []lndclient.LeaseDescriptor{
+				describedLease(
+					lock, foreign,
+					time.Now().Add(time.Hour),
+				),
+				describedLease(
+					lock, own, time.Now().Add(time.Hour),
+				),
+			},
+		}
+		srv := newLeaseServer(store, wallet)
+
+		other := commitIDRequest([]byte("other-recorded"))
+		insertPendingCommit(
+			t, store, other, lock,
+			[]*taprpc.OutPoint{foreign},
+		)
+
+		req := commitIDRequest([]byte("this-recorded"))
+		insertPendingCommit(t, store, req, lock, nil)
+
+		statusResp, err := srv.GetCommitVirtualPsbtsStatus(
+			context.Background(),
+			&wrpc.GetCommitVirtualPsbtsStatusRequest{
+				RequestId: req.RequestId,
+			},
+		)
+		require.NoError(t, err)
+		require.Equal(t, commitStatusPendingProto, statusResp.Status)
+		require.Len(t, statusResp.LndLockedUtxos, 1)
+		require.True(t, proto.Equal(own, statusResp.LndLockedUtxos[0]))
+	})
+
+	t.Run("unrecorded neighbor", func(t *testing.T) {
+		store := newMemCommitStore()
+		wallet := &leaseWallet{
+			leases: []lndclient.LeaseDescriptor{
+				describedLease(
+					lock, foreign,
+					time.Now().Add(time.Hour),
+				),
+			},
+		}
+		srv := newLeaseServer(store, wallet)
+
+		other := commitIDRequest([]byte("other-open"))
+		insertPendingCommit(t, store, other, lock, nil)
+
+		req := commitIDRequest([]byte("this-open"))
+		ensureCommitLockID(req)
+		hash, err := hashCommitRequest(req)
+		require.NoError(t, err)
+		raw, err := encodeCommitRecord(&commitRecord{
+			Status:      commitStatusPending,
+			RequestHash: hash,
+			LockID:      append([]byte(nil), lock...),
+			CreatedAt:   time.Now().Add(-time.Hour),
+			LeaseExpiry: time.Now().Add(-time.Minute),
+		})
+		require.NoError(t, err)
+		require.NoError(t, store.InsertCommitRecord(
+			context.Background(), req.RequestId, raw,
+		))
+
+		var calls atomic.Int32
+		_, err = srv.commitVirtualPsbts(
+			context.Background(), req, successOnce(&calls),
+		)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, calls.Load())
+
+		raw, err = store.FetchCommitRecord(
+			context.Background(), other.RequestId,
+		)
+		require.NoError(t, err)
+		otherRec, err := decodeCommitRecord(raw)
+		require.NoError(t, err)
+		require.Empty(t, otherRec.Outpoints)
+	})
 }
 
 // encodeCommitRecordV1 writes the original record layout, which has no
