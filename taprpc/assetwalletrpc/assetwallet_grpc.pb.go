@@ -50,7 +50,9 @@ type AssetWalletClient interface {
 	// the same request_id when they set one) or by calling ListTransfers with
 	// the anchor txid. An empty request_id still reconciles by the anchor
 	// transaction. A request_id must not be reused for a different anchor
-	// transaction.
+	// transaction while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails, and it is not kept across a daemon restart.
 	PublishAndLogTransfer(ctx context.Context, in *PublishAndLogRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
@@ -275,7 +277,9 @@ type AssetWalletServer interface {
 	// the same request_id when they set one) or by calling ListTransfers with
 	// the anchor txid. An empty request_id still reconciles by the anchor
 	// transaction. A request_id must not be reused for a different anchor
-	// transaction.
+	// transaction while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails, and it is not kept across a daemon restart.
 	PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified

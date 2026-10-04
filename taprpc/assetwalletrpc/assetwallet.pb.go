@@ -987,8 +987,11 @@ type PublishAndLogRequest struct {
 	// Optional caller-chosen idempotency key for this publish. A retry that
 	// repeats the key with the same anchor transaction returns the transfer
 	// already logged for that anchor. Reusing the key for a different anchor
-	// transaction is rejected. An empty key still reconciles by the anchor
-	// transaction, so a lost response can be retried safely.
+	// transaction is rejected while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails and is not kept across a daemon restart. An empty
+	// key still reconciles by the anchor transaction, so a lost response can
+	// be retried safely.
 	RequestId     []byte `protobuf:"bytes,8,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
