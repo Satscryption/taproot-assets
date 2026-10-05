@@ -7,12 +7,13 @@
 package assetwalletrpc
 
 import (
-	taprpc "github.com/lightninglabs/taproot-assets/taprpc"
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	taprpc "github.com/lightninglabs/taproot-assets/taprpc"
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -140,7 +141,8 @@ const (
 	// same request funds again.
 	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_PENDING CommitVirtualPsbtsStatus = 1
 	// The call completed. Repeating CommitVirtualPsbts with the same request
-	// returns the stored response.
+	// returns the stored response while it is still inside the retention
+	// window. Replay of request_id is only guaranteed within that window.
 	CommitVirtualPsbtsStatus_COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED CommitVirtualPsbtsStatus = 2
 )
 
@@ -749,11 +751,16 @@ type CommitVirtualPsbtsRequest struct {
 	// Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the
 	// RPC is unchanged and nothing is stored. When set, tapd records the
 	// outcome under this key. A later call with the same key and the same
-	// request returns that stored response and does not fund again. The same
-	// key with a different request is rejected. A repeat while the first call
-	// is still running, or while lnd still holds its input leases, is
-	// rejected; use GetCommitVirtualPsbtsStatus to read the lock ID and
-	// leased outpoints. After those leases expire, the same request funds
+	// request returns that stored response and does not fund again. Replay
+	// of a completed or failed outcome is only guaranteed within the
+	// retention window (wallet.commit-virtual-psbt-retention, 24h by
+	// default). After that window the stored response may be removed and
+	// the same request funds again. Pending requests are not removed by
+	// the window. The same key with a different request is rejected. A
+	// repeat while the first call is still running, or while lnd still
+	// holds its input leases, is rejected; use
+	// GetCommitVirtualPsbtsStatus to read the lock ID and leased
+	// outpoints. After those leases expire, the same request funds
 	// again. If custom_lock_id is empty, tapd derives a 32-byte lock ID as
 	// SHA-256(request_id) and uses that for the lnd lease.
 	RequestId     []byte `protobuf:"bytes,12,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`

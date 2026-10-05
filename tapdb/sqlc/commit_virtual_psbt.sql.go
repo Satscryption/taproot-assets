@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"database/sql"
 )
 
 const DeleteCommitVirtualPsbt = `-- name: DeleteCommitVirtualPsbt :exec
@@ -74,15 +75,20 @@ SELECT request_id, record
 FROM commit_virtual_psbt_idem
 `
 
-func (q *Queries) ListCommitVirtualPsbts(ctx context.Context) ([]CommitVirtualPsbtIdem, error) {
+type ListCommitVirtualPsbtsRow struct {
+	RequestID []byte
+	Record    []byte
+}
+
+func (q *Queries) ListCommitVirtualPsbts(ctx context.Context) ([]ListCommitVirtualPsbtsRow, error) {
 	rows, err := q.db.QueryContext(ctx, ListCommitVirtualPsbts)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []CommitVirtualPsbtIdem
+	var items []ListCommitVirtualPsbtsRow
 	for rows.Next() {
-		var i CommitVirtualPsbtIdem
+		var i ListCommitVirtualPsbtsRow
 		if err := rows.Scan(&i.RequestID, &i.Record); err != nil {
 			return nil, err
 		}
@@ -97,21 +103,76 @@ func (q *Queries) ListCommitVirtualPsbts(ctx context.Context) ([]CommitVirtualPs
 	return items, nil
 }
 
+const ListUnstampedCommitVirtualPsbts = `-- name: ListUnstampedCommitVirtualPsbts :many
+SELECT request_id, record
+FROM commit_virtual_psbt_idem
+WHERE finished_at IS NULL
+`
+
+type ListUnstampedCommitVirtualPsbtsRow struct {
+	RequestID []byte
+	Record    []byte
+}
+
+func (q *Queries) ListUnstampedCommitVirtualPsbts(ctx context.Context) ([]ListUnstampedCommitVirtualPsbtsRow, error) {
+	rows, err := q.db.QueryContext(ctx, ListUnstampedCommitVirtualPsbts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUnstampedCommitVirtualPsbtsRow
+	for rows.Next() {
+		var i ListUnstampedCommitVirtualPsbtsRow
+		if err := rows.Scan(&i.RequestID, &i.Record); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const PurgeFinishedCommitVirtualPsbts = `-- name: PurgeFinishedCommitVirtualPsbts :execrows
+DELETE FROM commit_virtual_psbt_idem
+WHERE finished_at IS NOT NULL
+  AND finished_at < $1
+`
+
+func (q *Queries) PurgeFinishedCommitVirtualPsbts(ctx context.Context, finishedBefore sql.NullTime) (int64, error) {
+	result, err := q.db.ExecContext(ctx, PurgeFinishedCommitVirtualPsbts, finishedBefore)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const SwapCommitVirtualPsbt = `-- name: SwapCommitVirtualPsbt :execrows
 UPDATE commit_virtual_psbt_idem
-SET record = $1
-WHERE request_id = $2
-  AND record = $3
+SET record = $1,
+    finished_at = COALESCE($2, finished_at)
+WHERE request_id = $3
+  AND record = $4
 `
 
 type SwapCommitVirtualPsbtParams struct {
 	NextRecord     []byte
+	FinishedAt     sql.NullTime
 	RequestID      []byte
 	ExpectedRecord []byte
 }
 
 func (q *Queries) SwapCommitVirtualPsbt(ctx context.Context, arg SwapCommitVirtualPsbtParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, SwapCommitVirtualPsbt, arg.NextRecord, arg.RequestID, arg.ExpectedRecord)
+	result, err := q.db.ExecContext(ctx, SwapCommitVirtualPsbt,
+		arg.NextRecord,
+		arg.FinishedAt,
+		arg.RequestID,
+		arg.ExpectedRecord,
+	)
 	if err != nil {
 		return 0, err
 	}

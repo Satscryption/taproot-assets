@@ -168,14 +168,18 @@ func insertPendingCommit(t *testing.T, store *memCommitStore,
 
 // memCommitStore is an in-memory CommitIdempotencyStore.
 type memCommitStore struct {
-	mu      sync.Mutex
-	rows    map[string][]byte
-	inserts atomic.Int32
-	deletes atomic.Int32
+	mu       sync.Mutex
+	rows     map[string][]byte
+	finished map[string]time.Time
+	inserts  atomic.Int32
+	deletes  atomic.Int32
 }
 
 func newMemCommitStore() *memCommitStore {
-	return &memCommitStore{rows: make(map[string][]byte)}
+	return &memCommitStore{
+		rows:     make(map[string][]byte),
+		finished: make(map[string]time.Time),
+	}
 }
 
 func (m *memCommitStore) InsertCommitRecord(_ context.Context, id,
@@ -234,17 +238,19 @@ func (m *memCommitStore) DeleteCommitRecord(_ context.Context,
 
 	m.deletes.Add(1)
 	delete(m.rows, string(id))
+	delete(m.finished, string(id))
 
 	return nil
 }
 
 func (m *memCommitStore) SwapCommitRecord(_ context.Context, id, expected,
-	next []byte) error {
+	next []byte, finishedAt *time.Time) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	current, ok := m.rows[string(id)]
+	key := string(id)
+	current, ok := m.rows[key]
 	if !ok {
 		return tapdb.ErrNoCommitRecord
 	}
@@ -252,9 +258,54 @@ func (m *memCommitStore) SwapCommitRecord(_ context.Context, id, expected,
 		return tapdb.ErrCommitRecordChanged
 	}
 
-	m.rows[string(id)] = append([]byte(nil), next...)
+	m.rows[key] = append([]byte(nil), next...)
+	if finishedAt != nil {
+		m.finished[key] = finishedAt.UTC()
+	}
 
 	return nil
+}
+
+func (m *memCommitStore) PurgeFinishedCommitRecords(_ context.Context,
+	before time.Time) (int64, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var deleted int64
+	for id, at := range m.finished {
+		if !at.Before(before) {
+			continue
+		}
+
+		delete(m.rows, id)
+		delete(m.finished, id)
+		m.deletes.Add(1)
+		deleted++
+	}
+
+	return deleted, nil
+}
+
+func (m *memCommitStore) ListUnstampedCommitRecords(context.Context) (
+	[]tapdb.CommitRecordRow, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rows := make([]tapdb.CommitRecordRow, 0, len(m.rows))
+	for id, record := range m.rows {
+		if _, ok := m.finished[id]; ok {
+			continue
+		}
+
+		rows = append(rows, tapdb.CommitRecordRow{
+			RequestID: append([]byte(nil), id...),
+			Record:    append([]byte(nil), record...),
+		})
+	}
+
+	return rows, nil
 }
 
 func (m *memCommitStore) ListCommitRecords(context.Context) (
@@ -290,6 +341,7 @@ func (m *memCommitStore) DeleteCommitRecordIf(_ context.Context, id,
 
 	m.deletes.Add(1)
 	delete(m.rows, string(id))
+	delete(m.finished, string(id))
 
 	return nil
 }

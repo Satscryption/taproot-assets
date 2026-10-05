@@ -3,6 +3,7 @@ package tapdb
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -72,7 +73,7 @@ func TestCommitVirtualPsbtStoreCompareAndSwap(t *testing.T) {
 	require.NoError(t, store.InsertCommitRecord(ctx, requestID, first))
 
 	err := store.SwapCommitRecord(
-		ctx, requestID, []byte("other"), []byte("nope"),
+		ctx, requestID, []byte("other"), []byte("nope"), nil,
 	)
 	require.ErrorIs(t, err, ErrCommitRecordChanged)
 
@@ -82,7 +83,7 @@ func TestCommitVirtualPsbtStoreCompareAndSwap(t *testing.T) {
 
 	next := []byte("second")
 	require.NoError(t, store.SwapCommitRecord(
-		ctx, requestID, first, next,
+		ctx, requestID, first, next, nil,
 	))
 
 	got, err = store.FetchCommitRecord(ctx, requestID)
@@ -99,4 +100,71 @@ func TestCommitVirtualPsbtStoreCompareAndSwap(t *testing.T) {
 
 	err = store.DeleteCommitRecordIf(ctx, requestID, next)
 	require.ErrorIs(t, err, ErrNoCommitRecord)
+}
+
+// TestCommitVirtualPsbtStorePurgesFinished tests that completed and
+// failed rows older than the cutoff are deleted and that pending rows
+// are kept even when their blob is updated.
+func TestCommitVirtualPsbtStorePurgesFinished(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := NewCommitVirtualPsbtStoreFromDB(NewTestDB(t))
+
+	pendingID := []byte("pending-id")
+	pending := []byte("pending")
+	require.NoError(t, store.InsertCommitRecord(ctx, pendingID, pending))
+	require.NoError(t, store.SwapCommitRecord(
+		ctx, pendingID, pending, []byte("pending-2"), nil,
+	))
+
+	oldAt := time.Now().Add(-48 * time.Hour).UTC()
+	require.NoError(t, store.InsertCommitRecord(
+		ctx, []byte("old-ok"), []byte("claim"),
+	))
+	require.NoError(t, store.SwapCommitRecord(
+		ctx, []byte("old-ok"), []byte("claim"),
+		[]byte("old-completed"), &oldAt,
+	))
+
+	failedAt := time.Now().Add(-48 * time.Hour).UTC()
+	require.NoError(t, store.InsertCommitRecord(
+		ctx, []byte("failed"), []byte("claim"),
+	))
+	require.NoError(t, store.SwapCommitRecord(
+		ctx, []byte("failed"), []byte("claim"),
+		[]byte("failed-outcome"), &failedAt,
+	))
+
+	recentAt := time.Now().UTC()
+	require.NoError(t, store.InsertCommitRecord(
+		ctx, []byte("new-ok"), []byte("claim"),
+	))
+	require.NoError(t, store.SwapCommitRecord(
+		ctx, []byte("new-ok"), []byte("claim"),
+		[]byte("new-completed"), &recentAt,
+	))
+
+	cutoff := time.Now().Add(-24 * time.Hour).UTC()
+	deleted, err := store.PurgeFinishedCommitRecords(ctx, cutoff)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, deleted)
+
+	_, err = store.FetchCommitRecord(ctx, []byte("old-ok"))
+	require.ErrorIs(t, err, ErrNoCommitRecord)
+	_, err = store.FetchCommitRecord(ctx, []byte("failed"))
+	require.ErrorIs(t, err, ErrNoCommitRecord)
+
+	got, err := store.FetchCommitRecord(ctx, []byte("new-ok"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("new-completed"), got)
+
+	got, err = store.FetchCommitRecord(ctx, pendingID)
+	require.NoError(t, err)
+	require.Equal(t, []byte("pending-2"), got)
+
+	unstamped, err := store.ListUnstampedCommitRecords(ctx)
+	require.NoError(t, err)
+	require.Len(t, unstamped, 1)
+	require.Equal(t, pendingID, unstamped[0].RequestID)
 }

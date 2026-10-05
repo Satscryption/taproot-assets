@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 )
@@ -46,7 +47,19 @@ type CommitVirtualPsbtQueries interface {
 		arg sqlc.DeleteCommitVirtualPsbtIfParams) (int64, error)
 
 	ListCommitVirtualPsbts(ctx context.Context) (
-		[]sqlc.CommitVirtualPsbtIdem, error)
+		[]sqlc.ListCommitVirtualPsbtsRow, error)
+
+	// PurgeFinishedCommitVirtualPsbts deletes terminal rows whose
+	// finish time is strictly before the cutoff. Pending rows have
+	// a null finish time and are left in place.
+	PurgeFinishedCommitVirtualPsbts(ctx context.Context,
+		finishedBefore sql.NullTime) (int64, error)
+
+	// ListUnstampedCommitVirtualPsbts returns rows with no finish
+	// time. Pending rows are in this set, as are terminal rows
+	// written before finish times were stored.
+	ListUnstampedCommitVirtualPsbts(ctx context.Context) (
+		[]sqlc.ListUnstampedCommitVirtualPsbtsRow, error)
 }
 
 // BatchedCommitVirtualPsbtStore is the transactional surface for commit
@@ -225,15 +238,23 @@ func (s *CommitVirtualPsbtStore) DeleteCommitRecord(ctx context.Context,
 
 // SwapCommitRecord replaces the stored record when it still equals
 // expected. ErrCommitRecordChanged is returned when it does not, and
-// ErrNoCommitRecord when the key is absent.
+// ErrNoCommitRecord when the key is absent. A non-nil finishedAt stamps
+// the row as a terminal outcome. Nil leaves the stored finish time
+// unchanged, which keeps a pending row unstamped.
 func (s *CommitVirtualPsbtStore) SwapCommitRecord(ctx context.Context,
-	requestID, expected, next []byte) error {
+	requestID, expected, next []byte, finishedAt *time.Time) error {
+
+	var finished sql.NullTime
+	if finishedAt != nil {
+		finished = sqlTime(finishedAt.UTC())
+	}
 
 	return s.db.ExecTx(
 		ctx, WriteTxOption(), func(q CommitVirtualPsbtQueries) error {
 			n, err := q.SwapCommitVirtualPsbt(
 				ctx, sqlc.SwapCommitVirtualPsbtParams{
 					NextRecord:     next,
+					FinishedAt:     finished,
 					RequestID:      requestID,
 					ExpectedRecord: expected,
 				},
@@ -276,6 +297,75 @@ func (s *CommitVirtualPsbtStore) DeleteCommitRecordIf(ctx context.Context,
 			return commitRecordMiss(ctx, q, requestID)
 		},
 	)
+}
+
+// PurgeFinishedCommitRecords deletes completed and failed records
+// whose finish time is strictly before before. Pending records are
+// kept. It returns how many rows were deleted.
+func (s *CommitVirtualPsbtStore) PurgeFinishedCommitRecords(
+	ctx context.Context, before time.Time) (int64, error) {
+
+	var deleted int64
+	err := s.db.ExecTx(
+		ctx, WriteTxOption(), func(q CommitVirtualPsbtQueries) error {
+			n, err := q.PurgeFinishedCommitVirtualPsbts(
+				ctx, sqlTime(before.UTC()),
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"purge finished commit records: %w",
+					err,
+				)
+			}
+
+			deleted = n
+
+			return nil
+		},
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	return deleted, nil
+}
+
+// ListUnstampedCommitRecords returns rows that have no finish time.
+// Order is undefined.
+func (s *CommitVirtualPsbtStore) ListUnstampedCommitRecords(
+	ctx context.Context) ([]CommitRecordRow, error) {
+
+	var rows []CommitRecordRow
+	err := s.db.ExecTx(
+		ctx, ReadTxOption(), func(q CommitVirtualPsbtQueries) error {
+			listed, err := q.ListUnstampedCommitVirtualPsbts(ctx)
+			if err != nil {
+				return fmt.Errorf(
+					"list unstamped commit records: %w",
+					err,
+				)
+			}
+
+			rows = make([]CommitRecordRow, 0, len(listed))
+			for _, row := range listed {
+				rows = append(rows, CommitRecordRow{
+					RequestID: append(
+						[]byte(nil), row.RequestID...,
+					),
+					Record: append(
+						[]byte(nil), row.Record...,
+					),
+				})
+			}
+
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return rows, nil
 }
 
 // commitRecordMiss explains a compare-and-swap that matched no row.

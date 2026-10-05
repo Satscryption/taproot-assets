@@ -369,7 +369,7 @@ type Querier interface {
 	InsertUniverseServer(ctx context.Context, arg InsertUniverseServerParams) error
 	LinkDanglingSupplyUpdateEvents(ctx context.Context, arg LinkDanglingSupplyUpdateEventsParams) error
 	ListClaimedOutpoints(ctx context.Context, arg ListClaimedOutpointsParams) ([]ListClaimedOutpointsRow, error)
-	ListCommitVirtualPsbts(ctx context.Context) ([]CommitVirtualPsbtIdem, error)
+	ListCommitVirtualPsbts(ctx context.Context) ([]ListCommitVirtualPsbtsRow, error)
 	ListLiveReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
 	// The observability surface's list query: a pure row projection with
 	// an aggregated candidate count — no per-row follow-up queries and
@@ -381,6 +381,7 @@ type Querier interface {
 	ListReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
 	ListReorgPendingDeliveries(ctx context.Context, now int64) ([]ReorgAnchoring, error)
 	ListReorgPendingEffects(ctx context.Context, arg ListReorgPendingEffectsParams) ([]ReorgOutbox, error)
+	ListUnstampedCommitVirtualPsbts(ctx context.Context) ([]ListUnstampedCommitVirtualPsbtsRow, error)
 	LogProofTransferAttempt(ctx context.Context, arg LogProofTransferAttemptParams) error
 	LogServerSync(ctx context.Context, arg LogServerSyncParams) error
 	// Returns the anchoring row for (site_id, match_key), or no rows if
@@ -414,6 +415,7 @@ type Querier interface {
 	// independently receive-owned, including for a self-send that is also owned
 	// by the porter.
 	ProofAnchorSiteOwnership(ctx context.Context, anchorTxid []byte) (ProofAnchorSiteOwnershipRow, error)
+	PurgeFinishedCommitVirtualPsbts(ctx context.Context, finishedBefore sql.NullTime) (int64, error)
 	QueryAddr(ctx context.Context, arg QueryAddrParams) (QueryAddrRow, error)
 	// We use a LEFT JOIN here as not every asset has a group key, so this'll
 	// generate rows that have NULL values for the group key fields if an asset

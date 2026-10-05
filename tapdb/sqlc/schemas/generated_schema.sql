@@ -466,7 +466,11 @@ CREATE TABLE commit_virtual_psbt_idem (
 
     -- record holds the pending or completed commit outcome.
     record BLOB NOT NULL
-);
+, finished_at TIMESTAMP);
+
+CREATE INDEX commit_virtual_psbt_idem_finished_at_idx
+    ON commit_virtual_psbt_idem (finished_at)
+    WHERE finished_at IS NOT NULL;
 
 CREATE INDEX creation_time_idx ON addr_events(creation_time);
 

@@ -224,8 +224,9 @@ type ChainTxn struct {
 }
 
 type CommitVirtualPsbtIdem struct {
-	RequestID []byte
-	Record    []byte
+	RequestID  []byte
+	Record     []byte
+	FinishedAt sql.NullTime
 }
 
 type FederationGlobalSyncConfig struct {

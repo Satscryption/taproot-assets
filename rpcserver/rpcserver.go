@@ -224,6 +224,10 @@ type RPCServer struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// commitNow, when set, is the clock for CommitVirtualPsbts
+	// retention. Production leaves it nil and uses time.Now.
+	commitNow func() time.Time
 }
 
 // NewRPCServer creates a new RPC sever.
@@ -250,6 +254,14 @@ func (r *RPCServer) Start(cfg *tapconfig.Config) error {
 	r.proofQueryRateLimiter = rate.NewLimiter(
 		r.cfg.UniverseQueriesPerSecond, r.cfg.UniverseQueriesBurst,
 	)
+
+	// Drop completed and failed commit outcomes that are already past
+	// the retention window. A failure here does not block startup;
+	// the next commit or status call tries again.
+	if err := r.purgeExpiredCommitRecords(); err != nil {
+		rpcsLog.Errorf("Error purging expired commit records: %v",
+			err)
+	}
 
 	// All of our dependencies are now wired up, so we can flip the ready
 	// flag. This must happen last: the atomic store also acts as the

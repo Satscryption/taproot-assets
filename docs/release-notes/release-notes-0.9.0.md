@@ -224,7 +224,11 @@
   `GetCommitVirtualPsbtsStatus` reports whether the call is unknown,
   still in progress, or completed, along with the lnd lock ID and
   locked outpoints. Callers that leave `request_id` empty see the
-  previous stateless behavior.
+  previous stateless behavior. Completed and failed outcomes, including
+  the stored response, are kept for
+  `--wallet.commit-virtual-psbt-retention` (default 24h). Replaying
+  `request_id` is only guaranteed within that window. Pending requests
+  are not removed by it.
 
 * [PR#2266](https://github.com/lightninglabs/taproot-assets/pull/2266)
   adds a `ListAnchorings` RPC (with REST binding) exposing the
@@ -425,6 +429,12 @@
   the outcome of `CommitVirtualPsbts` calls that set a `request_id`.
   Existing rows are unaffected and no backfill is required. Calls that
   do not set a request ID do not write to the table.
+
+* Database migration 74 adds nullable `finished_at` to
+  `commit_virtual_psbt_idem` and an index on it. Completed and failed
+  rows older than the retention window are deleted. Pending rows leave
+  the column null and are not purged. Existing rows stay null and no
+  backfill is required.
 
 * [PR#2287](https://github.com/lightninglabs/taproot-assets/pull/2287)
   adds database migration 69, an opaque per-site match key and a
