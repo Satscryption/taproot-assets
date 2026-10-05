@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -141,6 +142,12 @@ const (
 	burnOverrideConfirmationName  = "override_confirmation_destroy_assets"
 	scriptKeyTypeName             = "script_key_type"
 	scriptKeyTypeAll              = "all_script_key_types"
+
+	// maxCustomAnchorPsbtSize is the maximum caller-funded PSBT the CLI
+	// reads from disk. It mirrors the unexported server limit
+	// rpcserver.maxCustomAnchorPsbtSize (4 MiB). The server constant is
+	// not exported, so the CLI enforces the same bound while reading.
+	maxCustomAnchorPsbtSize = 4 * 1024 * 1024
 )
 
 var mintAssetCommand = cli.Command{
@@ -558,7 +565,7 @@ func fundBatchRequest(ctx *cli.Context) (*mintrpc.FundBatchRequest, error) {
 	}
 	if path := ctx.String(anchorPsbtName); path != "" {
 		anchorPath := tapcfg.CleanAndExpandPath(path)
-		req.AnchorPsbt, err = os.ReadFile(anchorPath)
+		req.AnchorPsbt, err = readBoundedPsbtFile(anchorPath)
 		if err != nil {
 			return nil, err
 		}
@@ -740,7 +747,9 @@ func ensureOutputPsbtWritable(path string) error {
 }
 
 // writePreparedBatchPsbt stores the committed PSBT at path. An empty path
-// means the caller only wants the JSON response.
+// means the caller only wants the JSON response. The packet is written to
+// a temporary file in the destination directory, synced, and renamed over
+// path so a write error leaves an existing file intact.
 func writePreparedBatchPsbt(path string,
 	resp *mintrpc.PrepareBatchResponse) error {
 
@@ -751,12 +760,81 @@ func writePreparedBatchPsbt(path string,
 		return fmt.Errorf("prepare response has no batch")
 	}
 
-	err := os.WriteFile(path, resp.Batch.BatchPsbt, 0o600)
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".tapcli-output-psbt-*")
 	if err != nil {
 		return fmt.Errorf("unable to write prepared PSBT: %w", err)
 	}
 
+	tempName := temp.Name()
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = os.Remove(tempName)
+		}
+	}()
+
+	if _, err := temp.Write(resp.Batch.BatchPsbt); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("unable to write prepared PSBT: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("unable to write prepared PSBT: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("unable to write prepared PSBT: %w", err)
+	}
+	//nolint:gosec // G703: path is the requested --output_psbt.
+	if err := os.Rename(tempName, path); err != nil {
+		return fmt.Errorf("unable to write prepared PSBT: %w", err)
+	}
+	keepTemp = true
+
 	return nil
+}
+
+// readBoundedPsbtFile opens path and returns its contents. Non-regular
+// files are rejected so a device such as /dev/zero cannot grow the
+// allocation without a bound. The read stops at maxCustomAnchorPsbtSize.
+func readBoundedPsbtFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Size() > maxCustomAnchorPsbtSize {
+		return nil, psbtFileTooLarge(path)
+	}
+
+	// Stat can under-report a file that grows during the read. Stop one
+	// byte past the limit so that growth cannot allocate without a bound.
+	limited := io.LimitReader(f, maxCustomAnchorPsbtSize+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxCustomAnchorPsbtSize {
+		return nil, psbtFileTooLarge(path)
+	}
+
+	return data, nil
+}
+
+// psbtFileTooLarge reports that path is larger than the server PSBT limit.
+func psbtFileTooLarge(path string) error {
+	return fmt.Errorf(
+		"%s exceeds maximum size of %d bytes", path,
+		maxCustomAnchorPsbtSize,
+	)
 }
 
 var sealBatchCommand = cli.Command{
@@ -897,7 +975,7 @@ func finalizeBatchRequest(ctx *cli.Context) (*mintrpc.FinalizeBatchRequest,
 	}
 	if path := ctx.String(signedPsbtName); path != "" {
 		signedPath := tapcfg.CleanAndExpandPath(path)
-		req.SignedPsbt, err = os.ReadFile(signedPath)
+		req.SignedPsbt, err = readBoundedPsbtFile(signedPath)
 		if err != nil {
 			return nil, err
 		}

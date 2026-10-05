@@ -54,3 +54,31 @@ func TestFinalizeBatchRejectsEmptySignedPsbtFile(t *testing.T) {
 	require.ErrorContains(t, err, "empty")
 	require.ErrorContains(t, err, "--"+signedPsbtName)
 }
+
+// TestFinalizeBatchRejectsOversizedSignedPsbt ensures a regular
+// --signed_psbt larger than the server's 4 MiB limit is rejected.
+// os.ReadFile would otherwise allocate the whole file before
+// FinalizeBatch checks the limit.
+func TestFinalizeBatchRejectsOversizedSignedPsbt(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "signed.psbt")
+	size := int64(maxCustomAnchorPsbtSize) + 1
+	writeSparseFile(t, path, size)
+
+	ctx := finalizeBatchCLIContext(t, []string{
+		"--" + signedPsbtName, path,
+	})
+	req, err := finalizeBatchRequest(ctx)
+	summary := "<nil>"
+	if req != nil {
+		summary = fmt.Sprintf("signed_len=%d", len(req.SignedPsbt))
+	}
+	require.Error(
+		t, err, "accepted oversized --%s (%d bytes): %s",
+		signedPsbtName, size, summary,
+	)
+	require.Nil(t, req)
+	require.ErrorContains(t, err, "maximum size")
+	require.ErrorContains(t, err, "4194304")
+}

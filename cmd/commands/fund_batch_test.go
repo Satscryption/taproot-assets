@@ -159,3 +159,57 @@ func TestFundBatchRejectsEmptyAnchorPsbtFile(t *testing.T) {
 	require.ErrorContains(t, err, "empty")
 	require.ErrorContains(t, err, "--"+anchorPsbtName)
 }
+
+// writeSparseFile creates path with the given logical size.
+func writeSparseFile(t *testing.T, path string, size int64) {
+	t.Helper()
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(size))
+	require.NoError(t, f.Close())
+}
+
+// TestFundBatchRejectsOversizedAnchorPsbt ensures a regular --anchor_psbt
+// larger than the server's 4 MiB limit is rejected. os.ReadFile would
+// otherwise allocate the whole file before FundBatch checks the limit.
+func TestFundBatchRejectsOversizedAnchorPsbt(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 4*1024*1024, maxCustomAnchorPsbtSize)
+
+	path := filepath.Join(t.TempDir(), "anchor.psbt")
+	size := int64(maxCustomAnchorPsbtSize) + 1
+	writeSparseFile(t, path, size)
+
+	ctx := fundBatchCLIContext(t, []string{
+		"--" + anchorPsbtName, path,
+	})
+	req, err := fundBatchRequest(ctx)
+	summary := "<nil>"
+	if req != nil {
+		summary = fmt.Sprintf("anchor_len=%d", len(req.AnchorPsbt))
+	}
+	require.Error(
+		t, err, "accepted oversized --%s (%d bytes): %s",
+		anchorPsbtName, size, summary,
+	)
+	require.Nil(t, req)
+	require.ErrorContains(t, err, "maximum size")
+	require.ErrorContains(t, err, "4194304")
+}
+
+// TestFundBatchAcceptsMaxSizeAnchorPsbt allows a file at the 4 MiB limit.
+func TestFundBatchAcceptsMaxSizeAnchorPsbt(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "anchor.psbt")
+	writeSparseFile(t, path, int64(maxCustomAnchorPsbtSize))
+
+	ctx := fundBatchCLIContext(t, []string{
+		"--" + anchorPsbtName, path,
+	})
+	req, err := fundBatchRequest(ctx)
+	require.NoError(t, err)
+	require.Len(t, req.AnchorPsbt, maxCustomAnchorPsbtSize)
+}
