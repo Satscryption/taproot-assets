@@ -210,9 +210,12 @@ type UniverseConnPool interface {
 //
 // PurgeFinishedCommitRecords deletes terminal rows whose finish time
 // is strictly before the cutoff and returns how many were removed.
-// Pending rows are not deleted. ListUnstampedCommitRecords returns
-// rows that have no finish time, which is every pending row and any
-// terminal row written before finish times were stored.
+// It does not look at lnd leases. Pending rows are not deleted.
+// ListFinishedCommitRecords returns those same terminal rows so the
+// caller can skip ones whose outpoints are still leased.
+// ListUnstampedCommitRecords returns rows that have no finish time,
+// which is every pending row and any terminal row written before
+// finish times were stored.
 type CommitIdempotencyStore interface {
 	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
 
@@ -230,6 +233,9 @@ type CommitIdempotencyStore interface {
 
 	PurgeFinishedCommitRecords(ctx context.Context, before time.Time) (
 		int64, error)
+
+	ListFinishedCommitRecords(ctx context.Context, before time.Time) (
+		[]tapdb.CommitRecordRow, error)
 
 	ListUnstampedCommitRecords(ctx context.Context) (
 		[]tapdb.CommitRecordRow, error)

@@ -141,14 +141,13 @@ type commitRecord struct {
 // In addition, the BTC level anchor transaction is funded and prepared up to
 // the point where it is ready to be signed.
 //
-// When the request sets a request ID, a repeat of the same request returns
-// the stored response and does not fund again. A repeat while that call
-// is still running, or while lnd still leases its inputs, is rejected.
-// A repeat of the same body after those leases are gone funds again.
-// The same key with a different body is rejected. A completed or failed
-// outcome is kept only for the retention window, so a replay is only
-// guaranteed inside that window. GetCommitVirtualPsbtsStatus reports an
-// in-progress or completed call and the lnd leases it holds.
+// When the request sets a request ID, a completed or failed outcome is
+// returned as-is only inside the retention window. A repeat while that
+// call is still running, or while lnd still leases its inputs, is
+// rejected. After those leases expire, the pending row is deleted and
+// the same request funds again. The same key with a different body is
+// rejected. GetCommitVirtualPsbtsStatus reports an in-progress or
+// completed call and the lnd leases it holds.
 func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 	req *wrpc.CommitVirtualPsbtsRequest) (*wrpc.CommitVirtualPsbtsResponse,
 	error) {
@@ -218,10 +217,12 @@ func (r *RPCServer) commitVirtualPsbts(ctx context.Context,
 
 // GetCommitVirtualPsbtsStatus reports the recorded outcome of a
 // CommitVirtualPsbts call. An unknown request ID is a successful response
-// with status unknown. A pending row stays pending after its leases
-// expire, and the outpoints in the response are the ones recorded for
-// that commit. When funding has returned but the row lists no outpoints
-// and lnd still holds the lock, those leases are recorded and returned.
+// with status unknown. This call does not delete a pending row. A repeat
+// of CommitVirtualPsbts deletes that row once its leases have expired
+// and funds again. The outpoints in the response are the ones recorded
+// for that commit. When funding has returned but the row lists no
+// outpoints and lnd still holds the lock, those leases are recorded and
+// returned.
 func (r *RPCServer) GetCommitVirtualPsbtsStatus(ctx context.Context,
 	req *wrpc.GetCommitVirtualPsbtsStatusRequest) (
 	*wrpc.GetCommitVirtualPsbtsStatusResponse, error) {
@@ -758,9 +759,13 @@ func (r *RPCServer) commitResponseRetention() time.Duration {
 
 // purgeExpiredCommitRecords deletes completed and failed commit
 // records older than the retention window. Pending records are kept.
-// Rows written before finish times were stored are judged by the time
-// the attempt was claimed, and a recent one is stamped so later purges
-// do not read its response again.
+// A finished row whose recorded outpoints are still leased under its
+// lock ID is kept until ListLeases no longer reports them, so a window
+// shorter than the lease cannot drop the stored response while lnd
+// holds the inputs. Once the lease is gone the next purge deletes the
+// row. Rows written before finish times were stored are judged by the
+// time the attempt was claimed, and a recent one is stamped so later
+// purges do not read its response again.
 func (r *RPCServer) purgeExpiredCommitRecords() error {
 	if r == nil || r.cfg == nil || r.cfg.CommitIdempotency == nil {
 		return nil
@@ -771,9 +776,10 @@ func (r *RPCServer) purgeExpiredCommitRecords() error {
 
 	before := r.commitClock().Add(-r.commitResponseRetention())
 	store := r.cfg.CommitIdempotency
-	deleted, err := store.PurgeFinishedCommitRecords(ctx, before)
+
+	finished, err := store.ListFinishedCommitRecords(ctx, before)
 	if err != nil {
-		return fmt.Errorf("purge finished commit records: %w", err)
+		return fmt.Errorf("list finished commit records: %w", err)
 	}
 
 	rows, err := store.ListUnstampedCommitRecords(ctx)
@@ -781,12 +787,42 @@ func (r *RPCServer) purgeExpiredCommitRecords() error {
 		return fmt.Errorf("list unstamped commit records: %w", err)
 	}
 
-	for _, row := range rows {
-		rec, err := decodeCommitRecord(row.Record)
-		if err != nil {
+	type expiredCommit struct {
+		row tapdb.CommitRecordRow
+		rec *commitRecord
+	}
+
+	expired := make([]expiredCommit, 0, len(finished))
+	var deleted int64
+	for _, row := range finished {
+		rec, decErr := decodeCommitRecord(row.Record)
+		if decErr != nil {
 			rpcsLog.Errorf("Error decoding commit record %x "+
 				"during retention purge: %v",
-				row.RequestID, err)
+				row.RequestID, decErr)
+
+			removed, delErr := deleteExpiredCommitRow(
+				ctx, store, row.RequestID, row.Record,
+			)
+			if delErr != nil {
+				return delErr
+			}
+			if removed {
+				deleted++
+			}
+
+			continue
+		}
+
+		expired = append(expired, expiredCommit{row: row, rec: rec})
+	}
+
+	for _, row := range rows {
+		rec, decErr := decodeCommitRecord(row.Record)
+		if decErr != nil {
+			rpcsLog.Errorf("Error decoding commit record %x "+
+				"during retention purge: %v",
+				row.RequestID, decErr)
 
 			continue
 		}
@@ -794,9 +830,9 @@ func (r *RPCServer) purgeExpiredCommitRecords() error {
 			continue
 		}
 
-		finished := rec.CreatedAt
-		if !finished.IsZero() && !finished.Before(before) {
-			stamp := finished.UTC()
+		finishedAt := rec.CreatedAt
+		if !finishedAt.IsZero() && !finishedAt.Before(before) {
+			stamp := finishedAt.UTC()
 			err = store.SwapCommitRecord(
 				ctx, row.RequestID, row.Record, row.Record,
 				&stamp,
@@ -813,20 +849,39 @@ func (r *RPCServer) purgeExpiredCommitRecords() error {
 			continue
 		}
 
-		err = store.DeleteCommitRecordIf(
-			ctx, row.RequestID, row.Record,
+		expired = append(expired, expiredCommit{row: row, rec: rec})
+	}
+
+	var (
+		leases   []lndclient.LeaseDescriptor
+		leaseErr error
+	)
+	if len(expired) > 0 {
+		leases, leaseErr = r.commitLeases(ctx)
+		if leaseErr != nil &&
+			!errors.Is(leaseErr, errLeasesUnavailable) {
+
+			rpcsLog.Errorf("Error listing wallet leases during "+
+				"commit retention purge: %v", leaseErr)
+		}
+	}
+
+	for _, item := range expired {
+		if r.finishedCommitStillLeased(
+			item.rec, leases, leaseErr,
+		) {
+
+			continue
+		}
+
+		removed, delErr := deleteExpiredCommitRow(
+			ctx, store, item.row.RequestID, item.row.Record,
 		)
-		switch {
-		case err == nil:
+		if delErr != nil {
+			return delErr
+		}
+		if removed {
 			deleted++
-
-		case errors.Is(err, tapdb.ErrNoCommitRecord),
-			errors.Is(err, tapdb.ErrCommitRecordChanged):
-
-		default:
-			return fmt.Errorf(
-				"delete expired commit record: %w", err,
-			)
 		}
 	}
 
@@ -835,6 +890,55 @@ func (r *RPCServer) purgeExpiredCommitRecords() error {
 	}
 
 	return nil
+}
+
+// deleteExpiredCommitRow removes one commit row when its bytes still
+// match. A concurrent update or a missing row is not an error. removed
+// is true only when this call deleted the row.
+func deleteExpiredCommitRow(ctx context.Context,
+	store tapconfig.CommitIdempotencyStore, requestID, raw []byte) (
+	bool, error) {
+
+	err := store.DeleteCommitRecordIf(ctx, requestID, raw)
+	switch {
+	case err == nil:
+		return true, nil
+
+	case errors.Is(err, tapdb.ErrNoCommitRecord),
+		errors.Is(err, tapdb.ErrCommitRecordChanged):
+
+		return false, nil
+
+	default:
+		return false, fmt.Errorf(
+			"delete expired commit record: %w", err,
+		)
+	}
+}
+
+// finishedCommitStillLeased reports whether this finished attempt's
+// recorded outpoints are still leased under its lock ID. A daemon with
+// no wallet keeps the time-based purge. A failed listing keeps the row
+// only until the stored lease deadline, so a stuck wallet cannot
+// retain finished rows without bound.
+func (r *RPCServer) finishedCommitStillLeased(rec *commitRecord,
+	leases []lndclient.LeaseDescriptor, leaseErr error) bool {
+
+	if rec == nil || len(rec.Outpoints) == 0 {
+		return false
+	}
+	if errors.Is(leaseErr, errLeasesUnavailable) {
+		return false
+	}
+	if leaseErr != nil {
+		if rec.LeaseExpiry.IsZero() {
+			return false
+		}
+
+		return r.commitClock().Before(rec.LeaseExpiry)
+	}
+
+	return outpointsStillLeased(rec, leases)
 }
 
 // commitInputLock is the mutex for one lnd lock ID and the number of

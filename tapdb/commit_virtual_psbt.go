@@ -55,6 +55,12 @@ type CommitVirtualPsbtQueries interface {
 	PurgeFinishedCommitVirtualPsbts(ctx context.Context,
 		finishedBefore sql.NullTime) (int64, error)
 
+	// ListFinishedCommitVirtualPsbtsBefore returns terminal rows
+	// whose finish time is strictly before the cutoff.
+	ListFinishedCommitVirtualPsbtsBefore(ctx context.Context,
+		finishedBefore sql.NullTime) (
+		[]sqlc.ListFinishedCommitVirtualPsbtsBeforeRow, error)
+
 	// ListUnstampedCommitVirtualPsbts returns rows with no finish
 	// time. Pending rows are in this set, as are terminal rows
 	// written before finish times were stored.
@@ -300,8 +306,9 @@ func (s *CommitVirtualPsbtStore) DeleteCommitRecordIf(ctx context.Context,
 }
 
 // PurgeFinishedCommitRecords deletes completed and failed records
-// whose finish time is strictly before before. Pending records are
-// kept. It returns how many rows were deleted.
+// whose finish time is strictly before before. It does not look at
+// lnd leases. The retention sweep skips rows that are still leased.
+// Pending records are kept. It returns how many rows were deleted.
 func (s *CommitVirtualPsbtStore) PurgeFinishedCommitRecords(
 	ctx context.Context, before time.Time) (int64, error) {
 
@@ -328,6 +335,47 @@ func (s *CommitVirtualPsbtStore) PurgeFinishedCommitRecords(
 	}
 
 	return deleted, nil
+}
+
+// ListFinishedCommitRecords returns completed and failed records whose
+// finish time is strictly before before. Pending records are omitted.
+// Order is undefined.
+func (s *CommitVirtualPsbtStore) ListFinishedCommitRecords(
+	ctx context.Context, before time.Time) ([]CommitRecordRow, error) {
+
+	var rows []CommitRecordRow
+	err := s.db.ExecTx(
+		ctx, ReadTxOption(), func(q CommitVirtualPsbtQueries) error {
+			listed, err := q.ListFinishedCommitVirtualPsbtsBefore(
+				ctx, sqlTime(before.UTC()),
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"list finished commit records: %w",
+					err,
+				)
+			}
+
+			rows = make([]CommitRecordRow, 0, len(listed))
+			for _, row := range listed {
+				rows = append(rows, CommitRecordRow{
+					RequestID: append(
+						[]byte(nil), row.RequestID...,
+					),
+					Record: append(
+						[]byte(nil), row.Record...,
+					),
+				})
+			}
+
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return rows, nil
 }
 
 // ListUnstampedCommitRecords returns rows that have no finish time.

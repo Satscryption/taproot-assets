@@ -146,6 +146,10 @@ func TestCommitVirtualPsbtStorePurgesFinished(t *testing.T) {
 	))
 
 	cutoff := time.Now().Add(-24 * time.Hour).UTC()
+	finished, err := store.ListFinishedCommitRecords(ctx, cutoff)
+	require.NoError(t, err)
+	require.Len(t, finished, 2)
+
 	deleted, err := store.PurgeFinishedCommitRecords(ctx, cutoff)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, deleted)

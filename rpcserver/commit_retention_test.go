@@ -1,12 +1,15 @@
 package rpcserver
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/lightninglabs/lndclient"
+	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	wrpc "github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
 	"github.com/stretchr/testify/require"
@@ -158,6 +161,87 @@ func TestCommitVirtualPsbtsRetentionDropsCompleted(t *testing.T) {
 	}
 }
 
+// TestCommitVirtualPsbtsShortRetentionKeepsLiveLease tests that a
+// finished row older than a short retention window is kept while lnd
+// still leases its recorded outpoints, and deleted once that lease is
+// gone. A finished row with no live lease is removed on that same
+// purge, so retention does not grow without bound.
+func TestCommitVirtualPsbtsShortRetentionKeepsLiveLease(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
+	clock := &stubClock{now: start}
+	store := newMemCommitStore()
+	utxo := testLeaseOutpoint()
+	wallet := &leaseWallet{
+		leases: []lndclient.LeaseDescriptor{
+			describedLease(
+				testLeaseLock, utxo, start.Add(time.Hour),
+			),
+		},
+	}
+	srv := newRetentionServer(store, clock, time.Minute)
+	srv.cfg.Lnd = &lndclient.LndServices{WalletKit: wallet}
+
+	var calls atomic.Int32
+	once := successOnce(&calls)
+	req := commitIDRequest([]byte("short-leased"))
+	ctx := context.Background()
+
+	first, err := srv.commitVirtualPsbts(ctx, req, once)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, calls.Load())
+
+	// Stamped row with no live lease. The clock jump below puts it
+	// past the short window, so the purge removes it.
+	freeReq := commitIDRequest([]byte("short-free"))
+	freeUtxo := &taprpc.OutPoint{
+		Txid:        bytes.Repeat([]byte{0x44}, 32),
+		OutputIndex: 1,
+	}
+	freeLock := bytes.Repeat([]byte{0x55}, 32)
+	insertCompletedRecord(
+		t, store, freeReq, start, freeLock, freeUtxo, &start,
+	)
+
+	// Legacy completed row: no finish stamp, but the same live lease.
+	legacyReq := commitIDRequest([]byte("short-legacy"))
+	insertCompletedRecord(
+		t, store, legacyReq, start, testLeaseLock, utxo, nil,
+	)
+
+	clock.Add(2 * time.Minute)
+
+	second, err := srv.commitVirtualPsbts(ctx, req, once)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, calls.Load())
+	require.True(t, proto.Equal(first, second))
+
+	_, err = store.FetchCommitRecord(ctx, freeReq.RequestId)
+	require.ErrorIs(t, err, tapdb.ErrNoCommitRecord)
+
+	legacy, err := store.FetchCommitRecord(ctx, legacyReq.RequestId)
+	require.NoError(t, err)
+	require.NotEmpty(t, legacy)
+
+	var freeCalls atomic.Int32
+	_, err = srv.commitVirtualPsbts(
+		ctx, freeReq, successOnce(&freeCalls),
+	)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, freeCalls.Load())
+
+	wallet.leases = nil
+
+	third, err := srv.commitVirtualPsbts(ctx, req, once)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, calls.Load())
+	require.True(t, proto.Equal(first, third))
+
+	_, err = store.FetchCommitRecord(ctx, legacyReq.RequestId)
+	require.ErrorIs(t, err, tapdb.ErrNoCommitRecord)
+}
+
 func blockingSuccess(calls *atomic.Int32, blocked,
 	release chan struct{}) commitOnceFunc {
 
@@ -218,5 +302,45 @@ func insertCompletedUnstamped(t *testing.T, store *memCommitStore,
 	require.NoError(t, err)
 	require.NoError(t, store.InsertCommitRecord(
 		context.Background(), req.RequestId, raw,
+	))
+}
+
+// insertCompletedRecord stores a completed outcome. A non-nil finished
+// time stamps the row the way a normal completion does. A nil time
+// leaves it unstamped, which is the legacy layout.
+func insertCompletedRecord(t *testing.T, store *memCommitStore,
+	req *wrpc.CommitVirtualPsbtsRequest, created time.Time,
+	lock []byte, utxo *taprpc.OutPoint, finished *time.Time) {
+
+	t.Helper()
+
+	ensureCommitLockID(req)
+	hash, err := hashCommitRequest(req)
+	require.NoError(t, err)
+
+	resp, err := proto.Marshal(cannedCommitResponse(
+		[]*taprpc.OutPoint{utxo},
+	))
+	require.NoError(t, err)
+
+	raw, err := encodeCommitRecord(&commitRecord{
+		Status:      commitStatusCompleted,
+		RequestHash: hash,
+		LockID:      append([]byte(nil), lock...),
+		Outpoints:   []*taprpc.OutPoint{utxo},
+		Response:    resp,
+		CreatedAt:   created,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.InsertCommitRecord(
+		context.Background(), req.RequestId, raw,
+	))
+	if finished == nil {
+		return
+	}
+
+	stamp := finished.UTC()
+	require.NoError(t, store.SwapCommitRecord(
+		context.Background(), req.RequestId, raw, raw, &stamp,
 	))
 }
