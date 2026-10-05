@@ -287,6 +287,27 @@ func (m *memCommitStore) PurgeFinishedCommitRecords(_ context.Context,
 	return deleted, nil
 }
 
+func (m *memCommitStore) ListFinishedCommitRecords(_ context.Context,
+	before time.Time) ([]tapdb.CommitRecordRow, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rows := make([]tapdb.CommitRecordRow, 0)
+	for id, at := range m.finished {
+		if !at.Before(before) {
+			continue
+		}
+
+		rows = append(rows, tapdb.CommitRecordRow{
+			RequestID: append([]byte(nil), id...),
+			Record:    append([]byte(nil), m.rows[id]...),
+		})
+	}
+
+	return rows, nil
+}
+
 func (m *memCommitStore) ListUnstampedCommitRecords(context.Context) (
 	[]tapdb.CommitRecordRow, error) {
 

@@ -103,6 +103,41 @@ func (q *Queries) ListCommitVirtualPsbts(ctx context.Context) ([]ListCommitVirtu
 	return items, nil
 }
 
+const ListFinishedCommitVirtualPsbtsBefore = `-- name: ListFinishedCommitVirtualPsbtsBefore :many
+SELECT request_id, record
+FROM commit_virtual_psbt_idem
+WHERE finished_at IS NOT NULL
+  AND finished_at < $1
+`
+
+type ListFinishedCommitVirtualPsbtsBeforeRow struct {
+	RequestID []byte
+	Record    []byte
+}
+
+func (q *Queries) ListFinishedCommitVirtualPsbtsBefore(ctx context.Context, finishedBefore sql.NullTime) ([]ListFinishedCommitVirtualPsbtsBeforeRow, error) {
+	rows, err := q.db.QueryContext(ctx, ListFinishedCommitVirtualPsbtsBefore, finishedBefore)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListFinishedCommitVirtualPsbtsBeforeRow
+	for rows.Next() {
+		var i ListFinishedCommitVirtualPsbtsBeforeRow
+		if err := rows.Scan(&i.RequestID, &i.Record); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ListUnstampedCommitVirtualPsbts = `-- name: ListUnstampedCommitVirtualPsbts :many
 SELECT request_id, record
 FROM commit_virtual_psbt_idem

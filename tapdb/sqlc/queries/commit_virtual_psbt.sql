@@ -35,6 +35,12 @@ DELETE FROM commit_virtual_psbt_idem
 WHERE finished_at IS NOT NULL
   AND finished_at < sqlc.arg('finished_before');
 
+-- name: ListFinishedCommitVirtualPsbtsBefore :many
+SELECT request_id, record
+FROM commit_virtual_psbt_idem
+WHERE finished_at IS NOT NULL
+  AND finished_at < sqlc.arg('finished_before');
+
 -- name: ListUnstampedCommitVirtualPsbts :many
 SELECT request_id, record
 FROM commit_virtual_psbt_idem
