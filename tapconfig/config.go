@@ -1,6 +1,7 @@
 package tapconfig
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -190,6 +191,67 @@ type UniverseConnPool interface {
 	Close()
 }
 
+// CommitIdempotencyStore persists opaque CommitVirtualPsbts records
+// keyed by the caller-supplied request ID. The RPC server owns the
+// record encoding.
+//
+// InsertCommitRecord returns *tapdb.ErrSqlUniqueConstraintViolation
+// when the key is already present. FetchCommitRecord and
+// UpdateCommitRecord return tapdb.ErrNoCommitRecord when it is not.
+// DeleteCommitRecord of a missing key is a no-op.
+//
+// SwapCommitRecord and DeleteCommitRecordIf change the row only when
+// the stored bytes still equal expected. They return
+// tapdb.ErrCommitRecordChanged when they do not, and
+// tapdb.ErrNoCommitRecord when the key is absent. SwapCommitRecord
+// with a non-nil finish time marks the row as a terminal outcome
+// (completed or failed). A nil finish time leaves the stored time
+// unchanged.
+//
+// PurgeFinishedCommitRecords deletes terminal rows whose finish time
+// is strictly before the cutoff and returns how many were removed.
+// It does not look at lnd leases. Pending rows are not deleted.
+// ListFinishedCommitRecords returns those same terminal rows so the
+// caller can skip ones whose outpoints are still leased.
+// ListUnstampedCommitRecords returns rows that have no finish time,
+// which is every pending row and any terminal row written before
+// finish times were stored.
+type CommitIdempotencyStore interface {
+	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	FetchCommitRecord(ctx context.Context, requestID []byte) ([]byte, error)
+
+	UpdateCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	DeleteCommitRecord(ctx context.Context, requestID []byte) error
+
+	SwapCommitRecord(ctx context.Context, requestID, expected,
+		next []byte, finishedAt *time.Time) error
+
+	DeleteCommitRecordIf(ctx context.Context, requestID,
+		expected []byte) error
+
+	PurgeFinishedCommitRecords(ctx context.Context, before time.Time) (
+		int64, error)
+
+	ListFinishedCommitRecords(ctx context.Context, before time.Time) (
+		[]tapdb.CommitRecordRow, error)
+
+	ListUnstampedCommitRecords(ctx context.Context) (
+		[]tapdb.CommitRecordRow, error)
+
+	// ListCommitRecords returns every stored request ID and record.
+	// Order is undefined. Callers use it to see whether a lock ID is
+	// shared with another request before adopting that lock's leases.
+	ListCommitRecords(ctx context.Context) ([]tapdb.CommitRecordRow,
+		error)
+}
+
+// DefaultCommitVirtualPsbtRetention is how long a completed or failed
+// CommitVirtualPsbts outcome is kept when the operator does not choose
+// a window. Pending requests are not removed by this window.
+const DefaultCommitVirtualPsbtRetention = 24 * time.Hour
+
 // Config is the main config of the Taproot Assets server.
 type Config struct {
 	DebugLevel string
@@ -245,6 +307,19 @@ type Config struct {
 	ProofArchive proof.Archiver
 
 	AssetWallet tapfreighter.Wallet
+
+	// CommitIdempotency stores CommitVirtualPsbts outcomes keyed by
+	// the caller-supplied request ID. A nil store rejects calls that
+	// set a request ID. Calls that leave the request ID empty do not
+	// touch the store.
+	CommitIdempotency CommitIdempotencyStore
+
+	// CommitVirtualPsbtRetention is how long a completed or failed
+	// CommitVirtualPsbts outcome, including its stored response, is
+	// kept. Pending rows are not removed because of this window.
+	// Replaying request_id is only guaranteed within the window.
+	// Zero selects DefaultCommitVirtualPsbtRetention.
+	CommitVirtualPsbtRetention time.Duration
 
 	CoinSelect *tapfreighter.CoinSelect
 

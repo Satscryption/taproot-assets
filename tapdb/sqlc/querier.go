@@ -101,6 +101,8 @@ type Querier interface {
 	DeleteAuthMailboxMessageByIDAndReceiver(ctx context.Context, arg DeleteAuthMailboxMessageByIDAndReceiverParams) (int64, error)
 	DeleteAuxCloseInfo(ctx context.Context, chanPoint []byte) error
 	DeleteBurnsByTransferID(ctx context.Context, transferID int64) error
+	DeleteCommitVirtualPsbt(ctx context.Context, requestID []byte) error
+	DeleteCommitVirtualPsbtIf(ctx context.Context, arg DeleteCommitVirtualPsbtIfParams) (int64, error)
 	DeleteExpiredUTXOLeases(ctx context.Context, now sql.NullTime) error
 	DeleteFederationProofSyncLog(ctx context.Context, arg DeleteFederationProofSyncLogParams) error
 	DeleteManagedUTXO(ctx context.Context, outpoint []byte) error
@@ -196,6 +198,7 @@ type Querier interface {
 	// independent of the size of the subtree beneath the node.
 	FetchChildren(ctx context.Context, arg FetchChildrenParams) ([]MssmtNode, error)
 	FetchChildrenSelfJoin(ctx context.Context, arg FetchChildrenSelfJoinParams) ([]FetchChildrenSelfJoinRow, error)
+	FetchCommitVirtualPsbt(ctx context.Context, requestID []byte) ([]byte, error)
 	FetchGenesisByAssetID(ctx context.Context, assetID []byte) (GenesisInfoView, error)
 	FetchGenesisByGroupKey(ctx context.Context, tweakedGroupKey []byte) (GenesisInfoView, error)
 	FetchGenesisByID(ctx context.Context, genAssetID int64) (FetchGenesisByIDRow, error)
@@ -324,6 +327,7 @@ type Querier interface {
 	InsertAuthMailboxMessage(ctx context.Context, arg InsertAuthMailboxMessageParams) (int64, error)
 	InsertBranch(ctx context.Context, arg InsertBranchParams) error
 	InsertBurn(ctx context.Context, arg InsertBurnParams) (int64, error)
+	InsertCommitVirtualPsbt(ctx context.Context, arg InsertCommitVirtualPsbtParams) error
 	InsertCompactedLeaf(ctx context.Context, arg InsertCompactedLeafParams) error
 	InsertLeaf(ctx context.Context, arg InsertLeafParams) error
 	InsertNewProofEvent(ctx context.Context, arg InsertNewProofEventParams) error
@@ -365,6 +369,8 @@ type Querier interface {
 	InsertUniverseServer(ctx context.Context, arg InsertUniverseServerParams) error
 	LinkDanglingSupplyUpdateEvents(ctx context.Context, arg LinkDanglingSupplyUpdateEventsParams) error
 	ListClaimedOutpoints(ctx context.Context, arg ListClaimedOutpointsParams) ([]ListClaimedOutpointsRow, error)
+	ListCommitVirtualPsbts(ctx context.Context) ([]ListCommitVirtualPsbtsRow, error)
+	ListFinishedCommitVirtualPsbtsBefore(ctx context.Context, finishedBefore sql.NullTime) ([]ListFinishedCommitVirtualPsbtsBeforeRow, error)
 	ListLiveReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
 	// The observability surface's list query: a pure row projection with
 	// an aggregated candidate count — no per-row follow-up queries and
@@ -376,6 +382,7 @@ type Querier interface {
 	ListReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
 	ListReorgPendingDeliveries(ctx context.Context, now int64) ([]ReorgAnchoring, error)
 	ListReorgPendingEffects(ctx context.Context, arg ListReorgPendingEffectsParams) ([]ReorgOutbox, error)
+	ListUnstampedCommitVirtualPsbts(ctx context.Context) ([]ListUnstampedCommitVirtualPsbtsRow, error)
 	LogProofTransferAttempt(ctx context.Context, arg LogProofTransferAttemptParams) error
 	LogServerSync(ctx context.Context, arg LogServerSyncParams) error
 	// Returns the anchoring row for (site_id, match_key), or no rows if
@@ -409,6 +416,7 @@ type Querier interface {
 	// independently receive-owned, including for a self-send that is also owned
 	// by the porter.
 	ProofAnchorSiteOwnership(ctx context.Context, anchorTxid []byte) (ProofAnchorSiteOwnershipRow, error)
+	PurgeFinishedCommitVirtualPsbts(ctx context.Context, finishedBefore sql.NullTime) (int64, error)
 	QueryAddr(ctx context.Context, arg QueryAddrParams) (QueryAddrRow, error)
 	// We use a LEFT JOIN here as not every asset has a group key, so this'll
 	// generate rows that have NULL values for the group key fields if an asset
@@ -550,6 +558,7 @@ type Querier interface {
 	// buried foreign transaction — so reviving it would resume a transfer
 	// whose anchor can never confirm.
 	SupersededTransfersSpendingPoint(ctx context.Context, arg SupersededTransfersSpendingPointParams) ([]int64, error)
+	SwapCommitVirtualPsbt(ctx context.Context, arg SwapCommitVirtualPsbtParams) (int64, error)
 	// The asset row a transfer output materialized into, if any: the
 	// convergence guard for re-applying a confirmation, and the target
 	// of compensation when the transfer is abandoned. The genesis filter
@@ -587,6 +596,7 @@ type Querier interface {
 	// given (now abandoned) transaction.
 	UnsweepManagedUTXOsByTxid(ctx context.Context, txid []byte) error
 	UpdateBatchGenesisTx(ctx context.Context, arg UpdateBatchGenesisTxParams) error
+	UpdateCommitVirtualPsbt(ctx context.Context, arg UpdateCommitVirtualPsbtParams) (int64, error)
 	UpdateMintingBatchState(ctx context.Context, arg UpdateMintingBatchStateParams) error
 	// The first certified foreclosure freezes the edge: certification is
 	// act-final, so later stagings — fresher parent forms, off-chain

@@ -143,6 +143,33 @@ func local_request_AssetWallet_CommitVirtualPsbts_0(ctx context.Context, marshal
 	return msg, metadata, err
 }
 
+func request_AssetWallet_GetCommitVirtualPsbtsStatus_0(ctx context.Context, marshaler runtime.Marshaler, client AssetWalletClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq GetCommitVirtualPsbtsStatusRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.GetCommitVirtualPsbtsStatus(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_AssetWallet_GetCommitVirtualPsbtsStatus_0(ctx context.Context, marshaler runtime.Marshaler, server AssetWalletServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq GetCommitVirtualPsbtsStatusRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	msg, err := server.GetCommitVirtualPsbtsStatus(ctx, &protoReq)
+	return msg, metadata, err
+}
+
 func request_AssetWallet_PublishAndLogTransfer_0(ctx context.Context, marshaler runtime.Marshaler, client AssetWalletClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
 		protoReq PublishAndLogRequest
@@ -550,6 +577,26 @@ func RegisterAssetWalletHandlerServer(ctx context.Context, mux *runtime.ServeMux
 		}
 		forward_AssetWallet_CommitVirtualPsbts_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodPost, pattern_AssetWallet_GetCommitVirtualPsbtsStatus_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus", runtime.WithHTTPPathPattern("/v1/taproot-assets/wallet/virtual-psbt/commit/status"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_AssetWallet_GetCommitVirtualPsbtsStatus_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AssetWallet_GetCommitVirtualPsbtsStatus_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_AssetWallet_PublishAndLogTransfer_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -878,6 +925,23 @@ func RegisterAssetWalletHandlerClient(ctx context.Context, mux *runtime.ServeMux
 		}
 		forward_AssetWallet_CommitVirtualPsbts_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodPost, pattern_AssetWallet_GetCommitVirtualPsbtsStatus_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus", runtime.WithHTTPPathPattern("/v1/taproot-assets/wallet/virtual-psbt/commit/status"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_AssetWallet_GetCommitVirtualPsbtsStatus_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AssetWallet_GetCommitVirtualPsbtsStatus_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_AssetWallet_PublishAndLogTransfer_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -1069,37 +1133,39 @@ func RegisterAssetWalletHandlerClient(ctx context.Context, mux *runtime.ServeMux
 }
 
 var (
-	pattern_AssetWallet_FundVirtualPsbt_0         = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "fund"}, ""))
-	pattern_AssetWallet_SignVirtualPsbt_0         = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "sign"}, ""))
-	pattern_AssetWallet_AnchorVirtualPsbts_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "anchor"}, ""))
-	pattern_AssetWallet_CommitVirtualPsbts_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "commit"}, ""))
-	pattern_AssetWallet_PublishAndLogTransfer_0   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "log-transfer"}, ""))
-	pattern_AssetWallet_NextInternalKey_0         = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "internal-key", "next"}, ""))
-	pattern_AssetWallet_NextScriptKey_0           = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "next"}, ""))
-	pattern_AssetWallet_QueryInternalKey_0        = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "taproot-assets", "wallet", "internal-key", "internal_key"}, ""))
-	pattern_AssetWallet_QueryScriptKey_0          = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "tweaked_script_key"}, ""))
-	pattern_AssetWallet_ProveAssetOwnership_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "ownership", "prove"}, ""))
-	pattern_AssetWallet_VerifyAssetOwnership_0    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "ownership", "verify"}, ""))
-	pattern_AssetWallet_RemoveUTXOLease_0         = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "utxo-lease", "delete"}, ""))
-	pattern_AssetWallet_DeclareScriptKey_0        = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "declare"}, ""))
-	pattern_AssetWallet_ExportAssetWalletBackup_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "backup", "export"}, ""))
-	pattern_AssetWallet_ImportAssetsFromBackup_0  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "backup", "import"}, ""))
+	pattern_AssetWallet_FundVirtualPsbt_0             = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "fund"}, ""))
+	pattern_AssetWallet_SignVirtualPsbt_0             = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "sign"}, ""))
+	pattern_AssetWallet_AnchorVirtualPsbts_0          = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "anchor"}, ""))
+	pattern_AssetWallet_CommitVirtualPsbts_0          = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "commit"}, ""))
+	pattern_AssetWallet_GetCommitVirtualPsbtsStatus_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4, 2, 5}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "commit", "status"}, ""))
+	pattern_AssetWallet_PublishAndLogTransfer_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "virtual-psbt", "log-transfer"}, ""))
+	pattern_AssetWallet_NextInternalKey_0             = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "internal-key", "next"}, ""))
+	pattern_AssetWallet_NextScriptKey_0               = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "next"}, ""))
+	pattern_AssetWallet_QueryInternalKey_0            = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "taproot-assets", "wallet", "internal-key", "internal_key"}, ""))
+	pattern_AssetWallet_QueryScriptKey_0              = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "tweaked_script_key"}, ""))
+	pattern_AssetWallet_ProveAssetOwnership_0         = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "ownership", "prove"}, ""))
+	pattern_AssetWallet_VerifyAssetOwnership_0        = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "ownership", "verify"}, ""))
+	pattern_AssetWallet_RemoveUTXOLease_0             = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "utxo-lease", "delete"}, ""))
+	pattern_AssetWallet_DeclareScriptKey_0            = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "script-key", "declare"}, ""))
+	pattern_AssetWallet_ExportAssetWalletBackup_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "backup", "export"}, ""))
+	pattern_AssetWallet_ImportAssetsFromBackup_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 2, 3, 2, 4}, []string{"v1", "taproot-assets", "wallet", "backup", "import"}, ""))
 )
 
 var (
-	forward_AssetWallet_FundVirtualPsbt_0         = runtime.ForwardResponseMessage
-	forward_AssetWallet_SignVirtualPsbt_0         = runtime.ForwardResponseMessage
-	forward_AssetWallet_AnchorVirtualPsbts_0      = runtime.ForwardResponseMessage
-	forward_AssetWallet_CommitVirtualPsbts_0      = runtime.ForwardResponseMessage
-	forward_AssetWallet_PublishAndLogTransfer_0   = runtime.ForwardResponseMessage
-	forward_AssetWallet_NextInternalKey_0         = runtime.ForwardResponseMessage
-	forward_AssetWallet_NextScriptKey_0           = runtime.ForwardResponseMessage
-	forward_AssetWallet_QueryInternalKey_0        = runtime.ForwardResponseMessage
-	forward_AssetWallet_QueryScriptKey_0          = runtime.ForwardResponseMessage
-	forward_AssetWallet_ProveAssetOwnership_0     = runtime.ForwardResponseMessage
-	forward_AssetWallet_VerifyAssetOwnership_0    = runtime.ForwardResponseMessage
-	forward_AssetWallet_RemoveUTXOLease_0         = runtime.ForwardResponseMessage
-	forward_AssetWallet_DeclareScriptKey_0        = runtime.ForwardResponseMessage
-	forward_AssetWallet_ExportAssetWalletBackup_0 = runtime.ForwardResponseMessage
-	forward_AssetWallet_ImportAssetsFromBackup_0  = runtime.ForwardResponseMessage
+	forward_AssetWallet_FundVirtualPsbt_0             = runtime.ForwardResponseMessage
+	forward_AssetWallet_SignVirtualPsbt_0             = runtime.ForwardResponseMessage
+	forward_AssetWallet_AnchorVirtualPsbts_0          = runtime.ForwardResponseMessage
+	forward_AssetWallet_CommitVirtualPsbts_0          = runtime.ForwardResponseMessage
+	forward_AssetWallet_GetCommitVirtualPsbtsStatus_0 = runtime.ForwardResponseMessage
+	forward_AssetWallet_PublishAndLogTransfer_0       = runtime.ForwardResponseMessage
+	forward_AssetWallet_NextInternalKey_0             = runtime.ForwardResponseMessage
+	forward_AssetWallet_NextScriptKey_0               = runtime.ForwardResponseMessage
+	forward_AssetWallet_QueryInternalKey_0            = runtime.ForwardResponseMessage
+	forward_AssetWallet_QueryScriptKey_0              = runtime.ForwardResponseMessage
+	forward_AssetWallet_ProveAssetOwnership_0         = runtime.ForwardResponseMessage
+	forward_AssetWallet_VerifyAssetOwnership_0        = runtime.ForwardResponseMessage
+	forward_AssetWallet_RemoveUTXOLease_0             = runtime.ForwardResponseMessage
+	forward_AssetWallet_DeclareScriptKey_0            = runtime.ForwardResponseMessage
+	forward_AssetWallet_ExportAssetWalletBackup_0     = runtime.ForwardResponseMessage
+	forward_AssetWallet_ImportAssetsFromBackup_0      = runtime.ForwardResponseMessage
 )

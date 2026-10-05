@@ -224,6 +224,10 @@ type RPCServer struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// commitNow, when set, is the clock for CommitVirtualPsbts
+	// retention. Production leaves it nil and uses time.Now.
+	commitNow func() time.Time
 }
 
 // NewRPCServer creates a new RPC sever.
@@ -250,6 +254,14 @@ func (r *RPCServer) Start(cfg *tapconfig.Config) error {
 	r.proofQueryRateLimiter = rate.NewLimiter(
 		r.cfg.UniverseQueriesPerSecond, r.cfg.UniverseQueriesBurst,
 	)
+
+	// Drop completed and failed commit outcomes that are already past
+	// the retention window. A failure here does not block startup;
+	// the next commit or status call tries again.
+	if err := r.purgeExpiredCommitRecords(); err != nil {
+		rpcsLog.Errorf("Error purging expired commit records: %v",
+			err)
+	}
 
 	// All of our dependencies are now wired up, so we can flip the ready
 	// flag. This must happen last: the atomic store also acts as the
@@ -3146,12 +3158,13 @@ func transitionProofOptions(
 	}
 }
 
-// CommitVirtualPsbts creates the output commitments and proofs for the given
-// virtual transactions by committing them to the BTC level anchor transaction.
-// In addition, the BTC level anchor transaction is funded and prepared up to
-// the point where it is ready to be signed.
-func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
-	req *wrpc.CommitVirtualPsbtsRequest) (*wrpc.CommitVirtualPsbtsResponse,
+// fundAndCommitVirtualPsbts creates the output commitments and proofs for
+// the given virtual transactions and funds the BTC level anchor. hooks may
+// be nil. When set, onFunded runs after lnd returns the leased inputs and
+// onResult runs with the finished response before those leases are kept.
+func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
+	req *wrpc.CommitVirtualPsbtsRequest,
+	hooks *commitVirtualPsbtsHooks) (*wrpc.CommitVirtualPsbtsResponse,
 	error) {
 
 	proofOpts, err := transitionProofOptions(req.TransitionProofVersion)
@@ -3203,6 +3216,12 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 	)
 
 	if !req.SkipFunding {
+		// Hold this lock ID until the RPC returns. FundPsbt, onFunded,
+		// and a later ReleaseOutput then cannot interleave with
+		// another attempt using the same lock ID.
+		unlockInputs := lockCommitInputs(req.CustomLockId)
+		defer unlockInputs()
+
 		// The change output and fee parameters of this RPC are
 		// identical to the walletrpc.FundPsbt, so we just map them 1:1
 		// and let lnd do the validation.
@@ -3274,12 +3293,23 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 		)
 
 		// From now on, if we error out, we need to make sure we unlock
-		// the UTXOs that lnd just locked for us.
+		// the UTXOs that lnd just locked for us. A release that
+		// fails leaves the pending idempotency row in place. When
+		// a retry has taken over, onFunded already released the
+		// outpoints that belong only to this attempt. The rest
+		// stay locked: they may be the replacement's leases under
+		// the same lock ID.
 		defer func() {
 			if success {
 				return
 			}
+			if hooks != nil && hooks.attemptReplaced {
+				hooks.retainPending = true
 
+				return
+			}
+
+			var releaseErr error
 			for idx, utxo := range lockedUTXO {
 				var lockID wtxmgr.LockID
 				copy(lockID[:], utxo.Id)
@@ -3289,9 +3319,40 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 				if err != nil {
 					rpcsLog.Errorf("Error unlocking lnd "+
 						"UTXO %v: %v", op, err)
+					releaseErr = err
 				}
 			}
+			if releaseErr != nil && hooks != nil {
+				hooks.retainPending = true
+			}
 		}()
+
+		// Persist the leases before any later error can return
+		// without telling the caller which outputs lnd locked.
+		//
+		// A crash after onFunded returns and before onResult
+		// stores the PSBT leaves this pending row with the
+		// outpoints below and drops the in-memory packet. That
+		// does not strand the request ID. Once lnd no longer
+		// leases those stored outpoints, CommitVirtualPsbts
+		// deletes the row and funds again instead of returning
+		// Aborted for good. The funded PSBT itself is not
+		// recovered; the retry is the recovery.
+		// TestCommitVirtualPsbtsStalePendingFundsAgain is that
+		// takeover.
+		if hooks != nil && hooks.onFunded != nil {
+			err = hooks.onFunded(
+				effectiveCommitLockID(
+					lockedUTXO, req.CustomLockId,
+				),
+				outpointsFromWire(lockedOutpoints),
+				earliestUtxoLeaseExpiry(lockedUTXO),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("recording funded "+
+					"leases: %w", err)
+			}
+		}
 	}
 
 	// We can now update the anchor outputs as we have the final
@@ -3364,6 +3425,16 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 		response.LndLockedUtxos[idx] = &taprpc.OutPoint{
 			Txid:        lockedOutpoints[idx].Hash[:],
 			OutputIndex: lockedOutpoints[idx].Index,
+		}
+	}
+
+	// Persist a successful result before cancelling lease cleanup, so a
+	// failure to store the outcome still releases the leases.
+	if hooks != nil && hooks.onResult != nil {
+		err = hooks.onResult(response)
+		if err != nil {
+			return nil, fmt.Errorf("recording commit result: %w",
+				err)
 		}
 	}
 

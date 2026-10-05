@@ -223,6 +223,12 @@ type ChainTxn struct {
 	TxIndex     sql.NullInt32
 }
 
+type CommitVirtualPsbtIdem struct {
+	RequestID  []byte
+	Record     []byte
+	FinishedAt sql.NullTime
+}
+
 type FederationGlobalSyncConfig struct {
 	ProofType       string
 	AllowSyncInsert bool

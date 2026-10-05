@@ -412,6 +412,39 @@
         ]
       }
     },
+    "/v1/taproot-assets/wallet/virtual-psbt/commit/status": {
+      "post": {
+        "summary": "GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts\ncall made with a request_id. It says whether that call is still in\nprogress or completed, and lists the lnd lock ID and locked outpoints\nrecorded for it. An unknown request_id is reported as unknown rather\nthan an error. Repeating CommitVirtualPsbts returns a completed or\nfailed stored response as-is while it is still inside the retention\nwindow. A repeat while the first call is still running, or while lnd\nstill holds its input leases, is rejected. After those leases expire,\nthe pending row is deleted and the same request funds again.",
+        "operationId": "AssetWallet_GetCommitVirtualPsbtsStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/assetwalletrpcGetCommitVirtualPsbtsStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/assetwalletrpcGetCommitVirtualPsbtsStatusRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AssetWallet"
+        ]
+      }
+    },
     "/v1/taproot-assets/wallet/virtual-psbt/fund": {
       "post": {
         "summary": "FundVirtualPsbt selects inputs from the available asset commitments to fund\na virtual transaction matching the template.",
@@ -606,6 +639,11 @@
         "transition_proof_version": {
           "$ref": "#/definitions/assetwalletrpcTransitionProofVersion",
           "description": "The version to use when generating the state transition proof suffixes.\nIf unset, the daemon's default proof version is used."
+        },
+        "request_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the\nRPC is unchanged and nothing is stored. When set, tapd records the\noutcome under this key. Only a completed or failed stored response is\nreturned as-is, and only inside the retention window\n(wallet.commit-virtual-psbt-retention, 24h by default). After that\nwindow the stored response may be removed and the same request funds\nagain. The same key with a different request is rejected. A repeat\nwhile the first call is still running, or while lnd still holds its\ninput leases, is rejected; use GetCommitVirtualPsbtsStatus to read\nthe lock ID and leased outpoints. After those leases expire, the\npending row is deleted and the same request funds again. If\ncustom_lock_id is empty, tapd derives a 32-byte lock ID as\nSHA-256(request_id) and uses that for the lnd lease."
         }
       }
     },
@@ -647,6 +685,16 @@
           "description": "The list of UTXO lock leases that were acquired for the inputs in the funded\nPSBT packet from lnd. Only inputs added to the PSBT by this RPC are locked,\ninputs that were already present in the PSBT are not locked."
         }
       }
+    },
+    "assetwalletrpcCommitVirtualPsbtsStatus": {
+      "type": "string",
+      "enum": [
+        "COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN",
+        "COMMIT_VIRTUAL_PSBTS_STATUS_PENDING",
+        "COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED"
+      ],
+      "default": "COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN",
+      "description": " - COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN: No CommitVirtualPsbts call with this request_id has been recorded.\n - COMMIT_VIRTUAL_PSBTS_STATUS_PENDING: The call has been claimed and has not yet recorded a final response.\nLeased outpoints are present only after funding has returned. A repeat\nof CommitVirtualPsbts does not fund again while the call is in progress\nor while lnd still holds its leases. After those leases expire, the\nsame request funds again.\n - COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED: The call completed. Repeating CommitVirtualPsbts with the same request\nreturns the stored response while it is still inside the retention\nwindow. Replay of request_id is only guaranteed within that window."
     },
     "assetwalletrpcDeclareScriptKeyRequest": {
       "type": "object",
@@ -723,6 +771,38 @@
             "format": "byte"
           },
           "description": "The list of passive virtual transactions that are anchored in the same BTC\nlevel anchor transaction inputs as the funded \"active\" asset above. These\nassets can be ignored when using the AnchorVirtualPsbts RPC, since they are\nretrieved, signed and committed automatically in that method. But the\npassive assets have to be included in the CommitVirtualPsbts RPC which is\nused when custom BTC level anchor transactions are created.\nThe main difference to the \"active\" asset above is that the passive assets\nwill not get their own entry in the transfer table of the database, since\nthey are just carried along and not directly affected by the direct user\naction."
+        }
+      }
+    },
+    "assetwalletrpcGetCommitVirtualPsbtsStatusRequest": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The request_id passed to CommitVirtualPsbts. Required, 1 to 64 bytes."
+        }
+      }
+    },
+    "assetwalletrpcGetCommitVirtualPsbtsStatusResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/assetwalletrpcCommitVirtualPsbtsStatus",
+          "description": "Whether the commit is unknown, still in progress, or completed."
+        },
+        "lock_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The lnd lock ID for the leases, when known. This is the request's\ncustom_lock_id (or the ID derived from request_id) until funding\nreturns, then the lock ID reported by lnd."
+        },
+        "lnd_locked_utxos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/taprpcOutPoint"
+          },
+          "description": "Outpoints leased for this commit. Empty until funding has returned.\nOnly inputs added by CommitVirtualPsbts are included."
         }
       }
     },

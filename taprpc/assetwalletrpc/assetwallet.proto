@@ -44,6 +44,20 @@ service AssetWallet {
         returns (CommitVirtualPsbtsResponse);
 
     /*
+    GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts
+    call made with a request_id. It says whether that call is still in
+    progress or completed, and lists the lnd lock ID and locked outpoints
+    recorded for it. An unknown request_id is reported as unknown rather
+    than an error. Repeating CommitVirtualPsbts returns a completed or
+    failed stored response as-is while it is still inside the retention
+    window. A repeat while the first call is still running, or while lnd
+    still holds its input leases, is rejected. After those leases expire,
+    the pending row is deleted and the same request funds again.
+    */
+    rpc GetCommitVirtualPsbtsStatus (GetCommitVirtualPsbtsStatusRequest)
+        returns (GetCommitVirtualPsbtsStatusResponse);
+
+    /*
     PublishAndLogTransfer accepts a fully committed and signed anchor
     transaction and publishes it to the Bitcoin network. It also logs the
     transfer of the given active and passive assets in the database and ships
@@ -377,6 +391,23 @@ message CommitVirtualPsbtsRequest {
     If unset, the daemon's default proof version is used.
     */
     TransitionProofVersion transition_proof_version = 11;
+
+    /*
+    Optional caller-chosen idempotency key, 1 to 64 bytes. When empty, the
+    RPC is unchanged and nothing is stored. When set, tapd records the
+    outcome under this key. Only a completed or failed stored response is
+    returned as-is, and only inside the retention window
+    (wallet.commit-virtual-psbt-retention, 24h by default). After that
+    window the stored response may be removed and the same request funds
+    again. The same key with a different request is rejected. A repeat
+    while the first call is still running, or while lnd still holds its
+    input leases, is rejected; use GetCommitVirtualPsbtsStatus to read
+    the lock ID and leased outpoints. After those leases expire, the
+    pending row is deleted and the same request funds again. If
+    custom_lock_id is empty, tapd derives a 32-byte lock ID as
+    SHA-256(request_id) and uses that for the lnd lease.
+    */
+    bytes request_id = 12;
 }
 
 message CommitVirtualPsbtsResponse {
@@ -417,6 +448,56 @@ message CommitVirtualPsbtsResponse {
     inputs that were already present in the PSBT are not locked.
     */
     repeated taprpc.OutPoint lnd_locked_utxos = 6;
+}
+
+enum CommitVirtualPsbtsStatus {
+    /*
+    No CommitVirtualPsbts call with this request_id has been recorded.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_UNKNOWN = 0;
+
+    /*
+    The call has been claimed and has not yet recorded a final response.
+    Leased outpoints are present only after funding has returned. A repeat
+    of CommitVirtualPsbts does not fund again while the call is in progress
+    or while lnd still holds its leases. After those leases expire, the
+    same request funds again.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_PENDING = 1;
+
+    /*
+    The call completed. Repeating CommitVirtualPsbts with the same request
+    returns the stored response while it is still inside the retention
+    window. Replay of request_id is only guaranteed within that window.
+    */
+    COMMIT_VIRTUAL_PSBTS_STATUS_COMPLETED = 2;
+}
+
+message GetCommitVirtualPsbtsStatusRequest {
+    /*
+    The request_id passed to CommitVirtualPsbts. Required, 1 to 64 bytes.
+    */
+    bytes request_id = 1;
+}
+
+message GetCommitVirtualPsbtsStatusResponse {
+    /*
+    Whether the commit is unknown, still in progress, or completed.
+    */
+    CommitVirtualPsbtsStatus status = 1;
+
+    /*
+    The lnd lock ID for the leases, when known. This is the request's
+    custom_lock_id (or the ID derived from request_id) until funding
+    returns, then the lock ID reported by lnd.
+    */
+    bytes lock_id = 2;
+
+    /*
+    Outpoints leased for this commit. Empty until funding has returned.
+    Only inputs added by CommitVirtualPsbts are included.
+    */
+    repeated taprpc.OutPoint lnd_locked_utxos = 3;
 }
 
 message PublishAndLogRequest {
