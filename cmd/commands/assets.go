@@ -584,14 +584,26 @@ func fundBatchRequest(ctx *cli.Context) (*mintrpc.FundBatchRequest, error) {
 			return nil, fmt.Errorf("asset anchor output index " +
 				"out of range")
 		}
-		changeIdx := ctx.Int64(changeOutputIndexName)
-		if changeIdx < 0 || changeIdx > math.MaxInt32 {
-			return nil, fmt.Errorf("change output index out of " +
-				"range")
-		}
 		req.AssetAnchorOutputIndex = uint32(assetIdx)
-		req.ChangeOutputIndex = int32(changeIdx)
+
+		// --change_output_index is an Int64 flag, so an omitted
+		// value is 0. That collides with the default asset
+		// anchor output and customGenesisPsbt rejects the
+		// batch. Mirror --pre_commit_output_index: copy the
+		// index only when the flag is set. Otherwise mark the
+		// packet as having no change output so the server
+		// stores -1. An explicit 0 still selects output 0.
 		req.NoChangeOutput = ctx.Bool(noChangeOutputName)
+		if ctx.IsSet(changeOutputIndexName) {
+			changeIdx := ctx.Int64(changeOutputIndexName)
+			if changeIdx < 0 || changeIdx > math.MaxInt32 {
+				return nil, fmt.Errorf("change output " +
+					"index out of range")
+			}
+			req.ChangeOutputIndex = int32(changeIdx)
+		} else if !req.NoChangeOutput {
+			req.NoChangeOutput = true
+		}
 		if ctx.IsSet(preCommitOutputIndexName) {
 			preCommitIdx := ctx.Uint64(preCommitOutputIndexName)
 			if preCommitIdx > math.MaxUint32 {

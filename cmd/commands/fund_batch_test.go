@@ -127,6 +127,51 @@ func TestFundBatchRejectsCustomAnchorFlagsWithoutPsbt(t *testing.T) {
 	})
 }
 
+// TestFundBatchUnsetChangeOutputMeansNoChange ensures --anchor_psbt
+// alone does not send change output index 0. The Int64 flag defaults
+// to 0, which is also the default asset anchor output, and
+// customGenesisPsbt rejects that collision. An explicit index of 0
+// still selects output 0.
+func TestFundBatchUnsetChangeOutputMeansNoChange(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "anchor.psbt")
+	require.NoError(t, os.WriteFile(
+		path, []byte{0x70, 0x73, 0x62, 0x74}, 0o600,
+	))
+
+	t.Run("omitted change index", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := fundBatchCLIContext(t, []string{
+			"--" + anchorPsbtName, path,
+		})
+		req, err := fundBatchRequest(ctx)
+		require.NoError(t, err)
+		require.Equal(
+			t, []byte{0x70, 0x73, 0x62, 0x74}, req.AnchorPsbt,
+		)
+		require.True(t, req.NoChangeOutput)
+		require.Zero(t, req.ChangeOutputIndex)
+		require.Zero(t, req.AssetAnchorOutputIndex)
+		require.Nil(t, req.PreCommitOutputIndex)
+	})
+
+	t.Run("explicit zero", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := fundBatchCLIContext(t, []string{
+			"--" + anchorPsbtName, path,
+			"--" + changeOutputIndexName + "=0",
+		})
+		req, err := fundBatchRequest(ctx)
+		require.NoError(t, err)
+		require.False(t, req.NoChangeOutput)
+		require.Zero(t, req.ChangeOutputIndex)
+		require.Zero(t, req.AssetAnchorOutputIndex)
+	})
+}
+
 // TestFundBatchRejectsEmptyAnchorPsbtFile ensures a zero-length
 // --anchor_psbt file is rejected before a funding request is built.
 // os.ReadFile succeeds on that file, and FundBatch treats an empty
