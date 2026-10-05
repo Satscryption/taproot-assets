@@ -4,6 +4,7 @@ package assetwalletrpc
 
 import (
 	context "context"
+
 	taprpc "github.com/lightninglabs/taproot-assets/taprpc"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
@@ -44,7 +45,9 @@ type AssetWalletClient interface {
 	// recorded for it. An unknown request_id is reported as unknown rather
 	// than an error. A pending row stays pending after its leases expire.
 	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
-	// completed, and funds again once a pending call's leases have expired.
+	// completed and the outcome is still inside the retention window, and
+	// funds again once a pending call's leases have expired or that window
+	// has passed.
 	GetCommitVirtualPsbtsStatus(ctx context.Context, in *GetCommitVirtualPsbtsStatusRequest, opts ...grpc.CallOption) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the
@@ -288,7 +291,9 @@ type AssetWalletServer interface {
 	// recorded for it. An unknown request_id is reported as unknown rather
 	// than an error. A pending row stays pending after its leases expire.
 	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
-	// completed, and funds again once a pending call's leases have expired.
+	// completed and the outcome is still inside the retention window, and
+	// funds again once a pending call's leases have expired or that window
+	// has passed.
 	GetCommitVirtualPsbtsStatus(context.Context, *GetCommitVirtualPsbtsStatusRequest) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the

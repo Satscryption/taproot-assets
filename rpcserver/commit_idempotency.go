@@ -145,8 +145,10 @@ type commitRecord struct {
 // the stored response and does not fund again. A repeat while that call
 // is still running, or while lnd still leases its inputs, is rejected.
 // A repeat of the same body after those leases are gone funds again.
-// The same key with a different body is rejected. GetCommitVirtualPsbtsStatus
-// reports an in-progress or completed call and the lnd leases it holds.
+// The same key with a different body is rejected. A completed or failed
+// outcome is kept only for the retention window, so a replay is only
+// guaranteed inside that window. GetCommitVirtualPsbtsStatus reports an
+// in-progress or completed call and the lnd leases it holds.
 func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 	req *wrpc.CommitVirtualPsbtsRequest) (*wrpc.CommitVirtualPsbtsResponse,
 	error) {
@@ -236,6 +238,10 @@ func (r *RPCServer) GetCommitVirtualPsbtsStatus(ctx context.Context,
 
 	store, err := r.commitStore()
 	if err != nil {
+		return nil, err
+	}
+
+	if err := r.purgeExpiredCommitRecords(); err != nil {
 		return nil, err
 	}
 
@@ -371,6 +377,12 @@ func (r *RPCServer) commitHooks(requestID []byte,
 func (r *RPCServer) claimCommit(ctx context.Context,
 	req *wrpc.CommitVirtualPsbtsRequest, hash [32]byte) (
 	*wrpc.CommitVirtualPsbtsResponse, bool, time.Time, error) {
+
+	// Drop outcomes that are past the retention window before this
+	// request is matched, so a replay outside the window funds again.
+	if err := r.purgeExpiredCommitRecords(); err != nil {
+		return nil, false, time.Time{}, err
+	}
 
 	// Two passes cover a compare-and-swap that loses to another
 	// retry. A fresh insert that loses the unique-key race does not
@@ -624,8 +636,17 @@ func (r *RPCServer) updateCommitRecord(requestID []byte, attempt time.Time,
 		return err
 	}
 
+	// Pending updates leave the finish time unset. Any other status
+	// is terminal (completed, or failed if one is stored) and starts
+	// the retention window.
+	var finishedAt *time.Time
+	if rec.Status != commitStatusPending {
+		stamped := r.commitClock()
+		finishedAt = &stamped
+	}
+
 	err = r.cfg.CommitIdempotency.SwapCommitRecord(
-		ctx, requestID, raw, encoded,
+		ctx, requestID, raw, encoded, finishedAt,
 	)
 	switch {
 	case err == nil:
@@ -714,15 +735,134 @@ func commitRecordContext() (context.Context, context.CancelFunc) {
 	)
 }
 
+// commitClock is the clock used to stamp and expire commit outcomes.
+func (r *RPCServer) commitClock() time.Time {
+	if r != nil && r.commitNow != nil {
+		return r.commitNow()
+	}
+
+	return time.Now()
+}
+
+// commitResponseRetention is how long a terminal commit outcome is
+// kept. Zero or a missing config uses the 24h default.
+func (r *RPCServer) commitResponseRetention() time.Duration {
+	if r == nil || r.cfg == nil ||
+		r.cfg.CommitVirtualPsbtRetention <= 0 {
+
+		return tapconfig.DefaultCommitVirtualPsbtRetention
+	}
+
+	return r.cfg.CommitVirtualPsbtRetention
+}
+
+// purgeExpiredCommitRecords deletes completed and failed commit
+// records older than the retention window. Pending records are kept.
+// Rows written before finish times were stored are judged by the time
+// the attempt was claimed, and a recent one is stamped so later purges
+// do not read its response again.
+func (r *RPCServer) purgeExpiredCommitRecords() error {
+	if r == nil || r.cfg == nil || r.cfg.CommitIdempotency == nil {
+		return nil
+	}
+
+	ctx, cancel := commitRecordContext()
+	defer cancel()
+
+	before := r.commitClock().Add(-r.commitResponseRetention())
+	store := r.cfg.CommitIdempotency
+	deleted, err := store.PurgeFinishedCommitRecords(ctx, before)
+	if err != nil {
+		return fmt.Errorf("purge finished commit records: %w", err)
+	}
+
+	rows, err := store.ListUnstampedCommitRecords(ctx)
+	if err != nil {
+		return fmt.Errorf("list unstamped commit records: %w", err)
+	}
+
+	for _, row := range rows {
+		rec, err := decodeCommitRecord(row.Record)
+		if err != nil {
+			rpcsLog.Errorf("Error decoding commit record %x "+
+				"during retention purge: %v",
+				row.RequestID, err)
+
+			continue
+		}
+		if rec.Status == commitStatusPending {
+			continue
+		}
+
+		finished := rec.CreatedAt
+		if !finished.IsZero() && !finished.Before(before) {
+			stamp := finished.UTC()
+			err = store.SwapCommitRecord(
+				ctx, row.RequestID, row.Record, row.Record,
+				&stamp,
+			)
+			if err != nil &&
+				!errors.Is(err, tapdb.ErrNoCommitRecord) &&
+				!errors.Is(err, tapdb.ErrCommitRecordChanged) {
+
+				return fmt.Errorf(
+					"stamp commit record: %w", err,
+				)
+			}
+
+			continue
+		}
+
+		err = store.DeleteCommitRecordIf(
+			ctx, row.RequestID, row.Record,
+		)
+		switch {
+		case err == nil:
+			deleted++
+
+		case errors.Is(err, tapdb.ErrNoCommitRecord),
+			errors.Is(err, tapdb.ErrCommitRecordChanged):
+
+		default:
+			return fmt.Errorf(
+				"delete expired commit record: %w", err,
+			)
+		}
+	}
+
+	if deleted > 0 {
+		rpcsLog.Infof("Purged %d expired commit records", deleted)
+	}
+
+	return nil
+}
+
+// commitInputLock is the mutex for one lnd lock ID and the number of
+// attempts that hold it or are waiting for it. The map drops the entry
+// when that count hits zero. A request_id without custom_lock_id uses
+// a fresh SHA-256 lock ID, so keeping every mutex would grow without
+// bound.
+type commitInputLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // commitInputLocks keys a mutex by lnd lock ID. Funding and the
 // release of a replaced attempt for that ID must not interleave.
-var commitInputLocks sync.Map
+// commitInputLockMu guards the map and each entry's refcount. It is
+// not held while an entry mutex is locked, so unlock can take it
+// after releasing the entry.
+var (
+	commitInputLockMu sync.Mutex
+	commitInputLocks  = make(map[string]*commitInputLock)
+)
 
 // lockCommitInputs serializes FundPsbt and onFunded for one lock ID
 // with the release of outpoints a replaced attempt acquired under
-// that same ID. The returned function unlocks. onFunded runs while
-// the lock is held, so releaseReplacedAttemptOutputs must not lock
-// again.
+// that same ID. The returned function unlocks. The caller holds the
+// mutex from FundPsbt until that function runs, which is the end of
+// the funded RPC. onFunded runs while the lock is held, so
+// releaseReplacedAttemptOutputs must not lock again.
 //
 // A lock ID that is not 32 bytes does not take a mutex. Those calls
 // do not share a caller-visible lock ID with a retry.
@@ -732,11 +872,28 @@ func lockCommitInputs(lockID []byte) func() {
 	}
 
 	key := string(lockID)
-	loaded, _ := commitInputLocks.LoadOrStore(key, new(sync.Mutex))
-	mu := loaded.(*sync.Mutex)
-	mu.Lock()
 
-	return mu.Unlock
+	commitInputLockMu.Lock()
+	entry := commitInputLocks[key]
+	if entry == nil {
+		entry = &commitInputLock{}
+		commitInputLocks[key] = entry
+	}
+	entry.refs++
+	commitInputLockMu.Unlock()
+
+	entry.mu.Lock()
+
+	return func() {
+		entry.mu.Unlock()
+
+		commitInputLockMu.Lock()
+		entry.refs--
+		if entry.refs == 0 && commitInputLocks[key] == entry {
+			delete(commitInputLocks, key)
+		}
+		commitInputLockMu.Unlock()
+	}
 }
 
 func validateCommitRequestID(id []byte) error {

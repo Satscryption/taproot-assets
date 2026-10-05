@@ -203,7 +203,16 @@ type UniverseConnPool interface {
 // SwapCommitRecord and DeleteCommitRecordIf change the row only when
 // the stored bytes still equal expected. They return
 // tapdb.ErrCommitRecordChanged when they do not, and
-// tapdb.ErrNoCommitRecord when the key is absent.
+// tapdb.ErrNoCommitRecord when the key is absent. SwapCommitRecord
+// with a non-nil finish time marks the row as a terminal outcome
+// (completed or failed). A nil finish time leaves the stored time
+// unchanged.
+//
+// PurgeFinishedCommitRecords deletes terminal rows whose finish time
+// is strictly before the cutoff and returns how many were removed.
+// Pending rows are not deleted. ListUnstampedCommitRecords returns
+// rows that have no finish time, which is every pending row and any
+// terminal row written before finish times were stored.
 type CommitIdempotencyStore interface {
 	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
 
@@ -214,10 +223,16 @@ type CommitIdempotencyStore interface {
 	DeleteCommitRecord(ctx context.Context, requestID []byte) error
 
 	SwapCommitRecord(ctx context.Context, requestID, expected,
-		next []byte) error
+		next []byte, finishedAt *time.Time) error
 
 	DeleteCommitRecordIf(ctx context.Context, requestID,
 		expected []byte) error
+
+	PurgeFinishedCommitRecords(ctx context.Context, before time.Time) (
+		int64, error)
+
+	ListUnstampedCommitRecords(ctx context.Context) (
+		[]tapdb.CommitRecordRow, error)
 
 	// ListCommitRecords returns every stored request ID and record.
 	// Order is undefined. Callers use it to see whether a lock ID is
@@ -225,6 +240,11 @@ type CommitIdempotencyStore interface {
 	ListCommitRecords(ctx context.Context) ([]tapdb.CommitRecordRow,
 		error)
 }
+
+// DefaultCommitVirtualPsbtRetention is how long a completed or failed
+// CommitVirtualPsbts outcome is kept when the operator does not choose
+// a window. Pending requests are not removed by this window.
+const DefaultCommitVirtualPsbtRetention = 24 * time.Hour
 
 // Config is the main config of the Taproot Assets server.
 type Config struct {
@@ -287,6 +307,13 @@ type Config struct {
 	// set a request ID. Calls that leave the request ID empty do not
 	// touch the store.
 	CommitIdempotency CommitIdempotencyStore
+
+	// CommitVirtualPsbtRetention is how long a completed or failed
+	// CommitVirtualPsbts outcome, including its stored response, is
+	// kept. Pending rows are not removed because of this window.
+	// Replaying request_id is only guaranteed within the window.
+	// Zero selects DefaultCommitVirtualPsbtRetention.
+	CommitVirtualPsbtRetention time.Duration
 
 	CoinSelect *tapfreighter.CoinSelect
 

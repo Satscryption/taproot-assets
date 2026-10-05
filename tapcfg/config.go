@@ -29,6 +29,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/rpcserver"
+	"github.com/lightninglabs/taproot-assets/tapconfig"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/cert"
@@ -334,6 +335,12 @@ type WalletConfig struct {
 	// UTXOs into anchor transactions created during sends and burns.
 	// Sweeping is enabled by default.
 	DisableSweepOrphanUtxos bool `long:"disable-sweep-orphan-utxos" description:"Disable sweeping orphaned UTXOs into anchor transactions created during sends and burns. Sweeping is enabled by default."`
+
+	// CommitVirtualPsbtRetention is how long a completed or failed
+	// CommitVirtualPsbts request_id and its stored response are kept.
+	// Pending requests are never removed by this window. Replaying
+	// request_id is only guaranteed within the window.
+	CommitVirtualPsbtRetention time.Duration `long:"commit-virtual-psbt-retention" description:"How long a completed or failed CommitVirtualPsbts request_id and its stored response are kept. Pending requests are never removed by this window. Replaying request_id is only guaranteed within this window. Valid time units are {s, m, h}."`
 }
 
 // BackupConfig holds the configuration for the on-disk asset wallet backup
@@ -580,7 +587,8 @@ func DefaultConfig() Config {
 			DisableSupplyVerifierChainWatch: false,
 		},
 		Wallet: &WalletConfig{
-			PsbtMaxFeeRatio: DefaultPsbtMaxFeeRatio,
+			PsbtMaxFeeRatio:            DefaultPsbtMaxFeeRatio,
+			CommitVirtualPsbtRetention: tapconfig.DefaultCommitVirtualPsbtRetention,
 		},
 		Backup: &BackupConfig{},
 		AddrBook: &AddrBookConfig{
@@ -1098,6 +1106,15 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 	case cfg.Wallet.PsbtMaxFeeRatio > 1.00:
 		return nil, fmt.Errorf("psbt-max-fee-ratio must be set in " +
 			"range of 0.00 to 1.00")
+	}
+
+	if cfg.Wallet.CommitVirtualPsbtRetention < 0 {
+		return nil, fmt.Errorf("wallet.commit-virtual-psbt-" +
+			"retention must not be negative")
+	}
+	if cfg.Wallet.CommitVirtualPsbtRetention == 0 {
+		cfg.Wallet.CommitVirtualPsbtRetention =
+			tapconfig.DefaultCommitVirtualPsbtRetention
 	}
 
 	// Validate the healthcheck config.
