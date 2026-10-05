@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -127,8 +128,12 @@ func TestPrepareBatchPreservesOutputOnWriteError(t *testing.T) {
 			"-test.v",
 			"-test.count=1",
 		)
+		// The child lowers RLIMIT_FSIZE. Do not forward
+		// GOCOVERDIR: a coverage meta write into that
+		// directory fails with "file too large".
 		cmd.Env = append(
-			os.Environ(), "TAPCLI_PREPARE_WRITE_LIMIT=1",
+			envWithoutGoCoverDir(os.Environ()),
+			"TAPCLI_PREPARE_WRITE_LIMIT=1",
 		)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -146,9 +151,22 @@ func TestPrepareBatchPreservesOutputOnWriteError(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, original, 0o600))
 
 	var lim syscall.Rlimit
+	require.NoError(t, syscall.Getrlimit(syscall.RLIMIT_FSIZE, &lim))
+
+	// Lower only the soft limit. The coverage runtime writes its
+	// meta file after this test returns, and that write fails
+	// with "file too large" while the limit is still in place.
+	// Leave the hard limit unchanged so the soft limit can be
+	// restored before that write.
+	soft := lim.Cur
 	lim.Cur = 32
-	lim.Max = 32
 	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_FSIZE, &lim))
+	defer func() {
+		lim.Cur = soft
+		require.NoError(t, syscall.Setrlimit(
+			syscall.RLIMIT_FSIZE, &lim,
+		))
+	}()
 
 	psbt := bytes.Repeat([]byte{0x70}, 256)
 	resp := &mintrpc.PrepareBatchResponse{
@@ -178,4 +196,20 @@ func TestPrepareBatchPreservesOutputOnWriteError(t *testing.T) {
 	entries, dirErr := os.ReadDir(dir)
 	require.NoError(t, dirErr)
 	require.Len(t, entries, 1)
+}
+
+// envWithoutGoCoverDir copies env without GOCOVERDIR. Re-execs that
+// lower RLIMIT_FSIZE must not inherit the parent's coverage
+// directory: the runtime writes a meta file there on exit, and that
+// write fails with "file too large".
+func envWithoutGoCoverDir(env []string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOCOVERDIR=") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+
+	return filtered
 }
