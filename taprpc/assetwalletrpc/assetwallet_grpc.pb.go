@@ -4,7 +4,6 @@ package assetwalletrpc
 
 import (
 	context "context"
-
 	taprpc "github.com/lightninglabs/taproot-assets/taprpc"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
@@ -43,11 +42,11 @@ type AssetWalletClient interface {
 	// call made with a request_id. It says whether that call is still in
 	// progress or completed, and lists the lnd lock ID and locked outpoints
 	// recorded for it. An unknown request_id is reported as unknown rather
-	// than an error. A pending row stays pending after its leases expire.
-	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
-	// completed and the outcome is still inside the retention window, and
-	// funds again once a pending call's leases have expired or that window
-	// has passed.
+	// than an error. Repeating CommitVirtualPsbts returns a completed or
+	// failed stored response as-is while it is still inside the retention
+	// window. A repeat while the first call is still running, or while lnd
+	// still holds its input leases, is rejected. After those leases expire,
+	// the pending row is deleted and the same request funds again.
 	GetCommitVirtualPsbtsStatus(ctx context.Context, in *GetCommitVirtualPsbtsStatusRequest, opts ...grpc.CallOption) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the
@@ -278,11 +277,11 @@ type AssetWalletServer interface {
 	// call made with a request_id. It says whether that call is still in
 	// progress or completed, and lists the lnd lock ID and locked outpoints
 	// recorded for it. An unknown request_id is reported as unknown rather
-	// than an error. A pending row stays pending after its leases expire.
-	// Repeating CommitVirtualPsbts returns the stored PSBTs when the call
-	// completed and the outcome is still inside the retention window, and
-	// funds again once a pending call's leases have expired or that window
-	// has passed.
+	// than an error. Repeating CommitVirtualPsbts returns a completed or
+	// failed stored response as-is while it is still inside the retention
+	// window. A repeat while the first call is still running, or while lnd
+	// still holds its input leases, is rejected. After those leases expire,
+	// the pending row is deleted and the same request funds again.
 	GetCommitVirtualPsbtsStatus(context.Context, *GetCommitVirtualPsbtsStatusRequest) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the

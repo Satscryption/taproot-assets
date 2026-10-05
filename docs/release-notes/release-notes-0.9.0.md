@@ -219,16 +219,18 @@
 ## RPC Additions
 
 * `CommitVirtualPsbts` accepts an optional `request_id`. When it is
-  set, tapd stores the outcome and a repeated call with the same
-  request returns that result instead of funding the anchor again.
-  `GetCommitVirtualPsbtsStatus` reports whether the call is unknown,
-  still in progress, or completed, along with the lnd lock ID and
-  locked outpoints. Callers that leave `request_id` empty see the
-  previous stateless behavior. Completed and failed outcomes, including
-  the stored response, are kept for
-  `--wallet.commit-virtual-psbt-retention` (default 24h). Replaying
-  `request_id` is only guaranteed within that window. Pending requests
-  are not removed by it.
+  set, tapd stores the outcome. A repeat while the first call is still
+  running, or while lnd still holds its input leases, is rejected;
+  `GetCommitVirtualPsbtsStatus` reports the lock ID and leased
+  outpoints. After those leases expire, the pending row is deleted and
+  the same `request_id` funds again
+  (`TestCommitVirtualPsbtsStalePendingFundsAgain`). Only a completed
+  or failed stored response is returned as-is, and only inside
+  `--wallet.commit-virtual-psbt-retention` (default 24h). After that
+  window the stored response may be removed and the same request funds
+  again, unless those outpoints are still leased, in which case the
+  row is kept until the lease ends. Callers that leave `request_id`
+  empty see the previous stateless behavior.
 
 * [PR#2266](https://github.com/lightninglabs/taproot-assets/pull/2266)
   adds a `ListAnchorings` RPC (with REST binding) exposing the
@@ -432,9 +434,11 @@
 
 * Database migration 74 adds nullable `finished_at` to
   `commit_virtual_psbt_idem` and an index on it. Completed and failed
-  rows older than the retention window are deleted. Pending rows leave
-  the column null and are not purged. Existing rows stay null and no
-  backfill is required.
+  rows older than the retention window are deleted once lnd no longer
+  leases their recorded outpoints. A finished row whose lease outlives
+  the window is kept until that lease ends, then removed on a later
+  purge. Pending rows leave the column null and are not purged.
+  Existing rows stay null and no backfill is required.
 
 * [PR#2287](https://github.com/lightninglabs/taproot-assets/pull/2287)
   adds database migration 69, an opaque per-site match key and a
