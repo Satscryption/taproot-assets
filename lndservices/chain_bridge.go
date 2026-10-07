@@ -5,18 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb"
-	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -31,7 +37,7 @@ var (
 	errTxNotFound = fmt.Errorf("transaction not found in proof file")
 )
 
-// LndRpcChainBridge is an implementation of the tapgarden.ChainBridge
+// LndRpcChainBridge is an implementation of the tapnode.ChainBridge
 // interface backed by an active remote lnd node.
 type LndRpcChainBridge struct {
 	// lnd is the active lnd services client.
@@ -92,6 +98,35 @@ func (l *LndRpcChainBridge) RegisterConfirmationsNtfn(ctx context.Context,
 		Confirmed: confChan,
 		Cancel:    cancel,
 	}, errChan, nil
+}
+
+// RegisterSpendNtfn registers an intent to be notified once the given
+// outpoint is spent by a confirmed transaction. Only confirmed spends
+// are reported. If reOrgChan is non-nil, the subscription stays open
+// after the first spend event and re-notifies with a fresh spend
+// detail if a (same or different) spending transaction confirms after
+// a re-org; a send on reOrgChan signals that the previously reported
+// spend was re-organized out of the chain. The subscription is torn
+// down by cancelling the passed context.
+func (l *LndRpcChainBridge) RegisterSpendNtfn(ctx context.Context,
+	outpoint *wire.OutPoint, pkScript []byte, heightHint uint32,
+	reOrgChan chan struct{}) (chan *chainntnfs.SpendDetail, chan error,
+	error) {
+
+	var opts []lndclient.NotifierOption
+	if reOrgChan != nil {
+		opts = append(opts, lndclient.WithReOrgChan(reOrgChan))
+	}
+
+	spendChan, errChan, err := l.lnd.ChainNotifier.RegisterSpendNtfn(
+		ctx, outpoint, pkScript, int32(heightHint), opts...,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to register for spend: "+
+			"%w", err)
+	}
+
+	return spendChan, errChan, nil
 }
 
 // RegisterBlockEpochNtfn registers an intent to be notified of each new block
@@ -336,6 +371,97 @@ func (l *LndRpcChainBridge) PublishTransaction(ctx context.Context,
 	return err
 }
 
+// ValidateAndPublishTransaction submits a transaction before tapd persists an
+// irreversible broadcast state. Only explicit, allowlisted TestMempoolAccept
+// rejections are definitive. Transport, context and unrecognized application
+// failures remain ambiguous.
+func (l *LndRpcChainBridge) ValidateAndPublishTransaction(ctx context.Context,
+	tx *wire.MsgTx, label string) error {
+
+	err := l.lnd.WalletKit.PublishTransaction(ctx, tx, label)
+	if err == nil {
+		return nil
+	}
+
+	return wrapValidateAndPublishError(err)
+}
+
+// wrapValidateAndPublishError adds operation context while retaining the
+// definitive marker, gRPC status and original error in the unwrap chain.
+func wrapValidateAndPublishError(err error) error {
+	publishErr := fmt.Errorf(
+		"unable to validate and publish transaction: %w", err,
+	)
+	if isDefinitivePublishError(err) {
+		return tapnode.NewDefinitivePublishError(publishErr)
+	}
+
+	return publishErr
+}
+
+// isDefinitivePublishError recognizes the stable TestMempoolAccept reject
+// reasons returned by the pinned WalletKit path. Transport and ambiguous
+// backend errors remain inconclusive.
+func isDefinitivePublishError(err error) bool {
+	rpcStatus, ok := status.FromError(err)
+	if !ok || rpcStatus.Code() != codes.Unknown {
+		return false
+	}
+
+	msg := rpcStatus.Message()
+	for _, reason := range ambiguousPublishReasons {
+		if strings.HasPrefix(msg, reason.Error()) {
+			return false
+		}
+	}
+
+	for _, reason := range definitivePublishReasons {
+		if strings.HasPrefix(msg, reason.Error()) {
+			return true
+		}
+	}
+
+	return strings.Contains(msg, lnwallet.ErrMempoolFee.Error())
+}
+
+var definitivePublishReasons = []chain.RPCErr{
+	chain.ErrInsufficientFee,
+	chain.ErrMempoolMinFeeNotMet,
+	chain.ErrMinRelayFeeNotMet,
+	chain.ErrMempoolChainTooLong,
+	chain.ErrEmptyOutput,
+	chain.ErrEmptyInput,
+	chain.ErrTxTooSmall,
+	chain.ErrDuplicateInput,
+	chain.ErrEmptyPrevOut,
+	chain.ErrBelowOutValue,
+	chain.ErrNegativeOutput,
+	chain.ErrLargeOutput,
+	chain.ErrLargeTotalOutput,
+	chain.ErrScriptVerifyFlag,
+	chain.ErrTooManySigOps,
+	chain.ErrOversizeTx,
+	chain.ErrNonStandardScript,
+	chain.ErrTxTooLarge,
+	chain.ErrDust,
+	chain.ErrNonFinal,
+	chain.ErrNonBIP68Final,
+	chain.ErrNonMandatoryScriptVerifyFlag,
+}
+
+var ambiguousPublishReasons = []chain.RPCErr{
+	chain.ErrMissingInputsOrSpent,
+	chain.ErrTxAlreadyKnown,
+	chain.ErrTxAlreadyConfirmed,
+	chain.ErrMempoolConflict,
+	chain.ErrReplacementAddsUnconfirmed,
+	chain.ErrTooManyReplacements,
+	chain.ErrConflictingTx,
+	chain.ErrTxAlreadyInMempool,
+	chain.ErrMissingInputs,
+	chain.ErrSameNonWitnessData,
+}
+
 // EstimateFee returns a fee estimate for the confirmation target.
 func (l *LndRpcChainBridge) EstimateFee(ctx context.Context,
 	confTarget uint32) (chainfee.SatPerKWeight, error) {
@@ -371,14 +497,19 @@ func (l *LndRpcChainBridge) GenProofChainLookup(
 }
 
 // A compile time assertion to ensure LndRpcChainBridge meets the
-// tapgarden.ChainBridge interface.
-var _ tapgarden.ChainBridge = (*LndRpcChainBridge)(nil)
+// tapnode.ChainBridge interface.
+var _ tapnode.ChainBridge = (*LndRpcChainBridge)(nil)
+var _ tapnode.DefinitivePublisher = (*LndRpcChainBridge)(nil)
+
+// A compile-time assertion that the chain bridge satisfies the chain
+// sensing contract the re-org watcher pins in its own package.
+var _ tapreorg.ChainNotifier = (*LndRpcChainBridge)(nil)
 
 // ProofChainLookup is an implementation of the asset.ChainLookup interface
 // that uses a proof file to look up block height information of previous inputs
 // while validating proofs.
 type ProofChainLookup struct {
-	chainBridge tapgarden.ChainBridge
+	chainBridge tapnode.ChainBridge
 
 	assetStore *tapdb.AssetStore
 
@@ -386,7 +517,7 @@ type ProofChainLookup struct {
 }
 
 // NewProofChainLookup creates a new ProofChainLookup instance.
-func NewProofChainLookup(chainBridge tapgarden.ChainBridge,
+func NewProofChainLookup(chainBridge tapnode.ChainBridge,
 	assetStore *tapdb.AssetStore, proofFile *proof.File) *ProofChainLookup {
 
 	return &ProofChainLookup{
