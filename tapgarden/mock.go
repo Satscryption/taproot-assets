@@ -593,6 +593,13 @@ type MockChainBridge struct {
 	BlocksMu sync.RWMutex
 	Blocks   map[chainhash.Hash]*wire.MsgBlock
 
+	// BlocksByHeight is an optional height-indexed block map used by tests
+	// that exercise GetBlockByHeight.
+	BlocksByHeight map[int64]*wire.MsgBlock
+
+	// TipHeight, when non-zero, overrides CurrentHeight.
+	TipHeight uint32
+
 	failFeeEstimates atomic.Bool
 	errConf          atomic.Int32
 	emptyConf        atomic.Int32
@@ -733,6 +740,16 @@ func (m *MockChainBridge) SetBlock(hash chainhash.Hash, block *wire.MsgBlock) {
 func (m *MockChainBridge) GetBlockByHeight(ctx context.Context,
 	blockHeight int64) (*wire.MsgBlock, error) {
 
+	if m.BlocksByHeight != nil {
+		block, ok := m.BlocksByHeight[blockHeight]
+		if !ok {
+			return nil, fmt.Errorf("unknown block height %d",
+				blockHeight)
+		}
+
+		return block, nil
+	}
+
 	return &wire.MsgBlock{}, nil
 }
 
@@ -761,6 +778,10 @@ func (m *MockChainBridge) VerifyBlock(_ context.Context,
 }
 
 func (m *MockChainBridge) CurrentHeight(_ context.Context) (uint32, error) {
+	if m.TipHeight != 0 {
+		return m.TipHeight, nil
+	}
+
 	return 0, nil
 }
 

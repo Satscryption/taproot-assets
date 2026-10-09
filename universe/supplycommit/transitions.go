@@ -1116,9 +1116,34 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 	// We're at the final step of the state machine. We'll broadcast the
 	// signed commit tx, then register for a confirmation for when it
 	// confirms.
+	case *CommitTickEvent:
+		ctx := context.Background()
+		transition, recovered, err := tryRecoverBroadcastConfirmation(
+			ctx, c, env,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if recovered {
+			return transition, nil
+		}
+
+		return &StateTransition{NextState: c}, nil
+
 	case *BroadcastEvent:
 		if c.SupplyTransition.NewCommitment.Txn == nil {
 			return nil, fmt.Errorf("commitment transaction is nil")
+		}
+
+		recCtx := context.Background()
+		transition, recovered, err := tryRecoverBroadcastConfirmation(
+			recCtx, c, env,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if recovered {
+			return transition, nil
 		}
 
 		commitTxid := c.SupplyTransition.NewCommitment.Txn.TxHash()
