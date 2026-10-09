@@ -44,9 +44,7 @@ func findCommitConfirmation(ctx context.Context,
 	for height := tip; height >= start; height-- {
 		block, err := chain.GetBlockByHeight(ctx, int64(height))
 		if err != nil {
-			return fn.None[*ConfEvent](), fmt.Errorf(
-				"unable to fetch block %d: %w", height, err,
-			)
+			continue
 		}
 
 		for idx, blockTx := range block.Transactions {

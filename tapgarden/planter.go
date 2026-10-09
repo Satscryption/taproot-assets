@@ -3560,7 +3560,18 @@ func (f *FundedMintAnchorPsbt) Copy() *FundedMintAnchorPsbt {
 			UnsignedTx: unsignedTx,
 			Inputs:     fn.CopySlice(f.Pkt.Inputs),
 			Outputs:    fn.CopySlice(f.Pkt.Outputs),
-			Unknowns:   fn.CopySlice(f.Pkt.Unknowns),
+		}
+		if f.Pkt.Unknowns != nil {
+			newMintAnchorPsbt.Pkt.Unknowns = make(
+				[]*psbt.Unknown, len(f.Pkt.Unknowns),
+			)
+			for idx, unknown := range f.Pkt.Unknowns {
+				newMintAnchorPsbt.Pkt.Unknowns[idx] =
+					&psbt.Unknown{
+						Key:   bytes.Clone(unknown.Key),
+						Value: bytes.Clone(unknown.Value),
+					}
+			}
 		}
 	}
 

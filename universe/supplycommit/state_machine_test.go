@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -490,7 +491,11 @@ func (h *supplyCommitTestHarness) expectBroadcastAndConfRegistration() {
 
 	h.mockChain.On("CurrentHeight", mock.Anything).Return(
 		uint32(123), nil,
-	).Once()
+	)
+
+	h.mockChain.On(
+		"GetBlockByHeight", mock.Anything, mock.Anything,
+	).Return(nil, fmt.Errorf("block not found"))
 
 	h.mockDaemon.On(
 		"RegisterConfirmationsNtfn", mock.Anything, mock.Anything,
