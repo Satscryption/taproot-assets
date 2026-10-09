@@ -62,6 +62,9 @@ type Planter interface {
 	// deriving all witnesses necessary to create the final genesis TX.
 	SealBatch(params SealParams) (*MintingBatch, error)
 
+	// PrepareBatch commits a custom-anchor batch and returns the PSBT to sign.
+	PrepareBatch() (*MintingBatch, error)
+
 	// FinalizeBatch signals that the asset minter should finalize
 	// the current batch, if one exists.
 	FinalizeBatch(params FinalizeParams) (*MintingBatch, error)

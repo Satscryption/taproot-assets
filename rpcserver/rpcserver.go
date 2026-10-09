@@ -139,6 +139,10 @@ const (
 	// return feedback when importing an address into the wallet. The import
 	// may continue in the background after the timeout expires.
 	addrImportTimeout = 20 * time.Second
+
+	// maxCustomAnchorPsbtSize bounds caller-controlled PSBT work performed
+	// synchronously by the mint gardener.
+	maxCustomAnchorPsbtSize = 4 * 1024 * 1024
 )
 
 type (
@@ -951,13 +955,53 @@ func checkFeeRateSanity(ctx context.Context, rpcFeeRate chainfee.SatPerKWeight,
 func (r *RPCServer) FundBatch(ctx context.Context,
 	req *mintrpc.FundBatchRequest) (*mintrpc.FundBatchResponse, error) {
 
-	feeRate, err := checkFeeRateSanity(
-		ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
-	)
-	if err != nil {
-		return nil, err
+	if len(req.AnchorPsbt) != 0 && req.FeeRate != 0 {
+		return nil, fmt.Errorf("fee rate cannot be combined with a " +
+			"caller-funded anchor PSBT")
 	}
-	feeRateOpt := fn.MaybeSome(feeRate)
+	if len(req.AnchorPsbt) == 0 && (req.AssetAnchorOutputIndex != 0 ||
+		req.ChangeOutputIndex != 0 || req.NoChangeOutput ||
+		req.PreCommitOutputIndex != nil) {
+
+		return nil, fmt.Errorf(
+			"custom anchor output controls require anchor_psbt",
+		)
+	}
+	if req.NoChangeOutput && req.ChangeOutputIndex != 0 {
+		return nil, fmt.Errorf("no_change_output conflicts with " +
+			"change_output_index")
+	}
+
+	var anchorPsbt *psbt.Packet
+	if len(req.AnchorPsbt) != 0 {
+		if len(req.AnchorPsbt) > maxCustomAnchorPsbtSize {
+			return nil, fmt.Errorf(
+				"anchor PSBT exceeds maximum size of %d bytes",
+				maxCustomAnchorPsbtSize,
+			)
+		}
+		var err error
+		anchorPsbt, err = psbt.NewFromRawBytes(
+			bytes.NewReader(req.AnchorPsbt), false,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"unable to parse anchor PSBT: %w", err,
+			)
+		}
+	}
+
+	var feeRateOpt fn.Option[chainfee.SatPerKWeight]
+	if anchorPsbt == nil {
+		feeRate, err := checkFeeRateSanity(
+			ctx, chainfee.SatPerKWeight(req.FeeRate),
+			r.cfg.Lnd.WalletKit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		feeRateOpt = fn.MaybeSome(feeRate)
+	}
 
 	tapTreeOpt, err := rpcutils.UnmarshalTapscriptSibling(
 		req.GetFullTree(), req.GetBranch(),
@@ -966,9 +1010,22 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 		return nil, err
 	}
 
+	changeOutputIndex := req.ChangeOutputIndex
+	if req.NoChangeOutput {
+		changeOutputIndex = -1
+	}
+	preCommitIdx := fn.None[uint32]()
+	if req.PreCommitOutputIndex != nil {
+		preCommitIdx = fn.Some(req.GetPreCommitOutputIndex())
+	}
+
 	fundBatchResp, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
-		FeeRate:        feeRateOpt,
-		SiblingTapTree: tapTreeOpt,
+		FeeRate:              feeRateOpt,
+		SiblingTapTree:       tapTreeOpt,
+		AnchorPsbt:           anchorPsbt,
+		AssetAnchorOutIdx:    req.AssetAnchorOutputIndex,
+		ChangeOutputIndex:    changeOutputIndex,
+		PreCommitOutputIndex: preCommitIdx,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to fund batch: %w", err)
@@ -1072,30 +1129,78 @@ func (r *RPCServer) SealBatch(ctx context.Context,
 	}, nil
 }
 
+// PrepareBatch commits the current caller-authored batch into its selected
+// anchor output and returns the packet for external signing.
+func (r *RPCServer) PrepareBatch(_ context.Context,
+	req *mintrpc.PrepareBatchRequest) (*mintrpc.PrepareBatchResponse, error) {
+
+	batch, err := r.cfg.AssetMinter.PrepareBatch()
+	if err != nil {
+		return nil, fmt.Errorf("unable to prepare batch: %w", err)
+	}
+	rpcBatch, err := marshalMintingBatch(batch, req.ShortResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return &mintrpc.PrepareBatchResponse{
+		Batch: rpcBatch,
+	}, nil
+}
+
 // FinalizeBatch attempts to finalize the current pending batch.
 func (r *RPCServer) FinalizeBatch(ctx context.Context,
 	req *mintrpc.FinalizeBatchRequest) (*mintrpc.FinalizeBatchResponse,
 	error) {
 
-	feeRate, err := checkFeeRateSanity(
-		ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	feeRateOpt := fn.MaybeSome(feeRate)
+	var signedPsbt *psbt.Packet
+	if len(req.SignedPsbt) != 0 {
+		if len(req.SignedPsbt) > maxCustomAnchorPsbtSize {
+			return nil, fmt.Errorf(
+				"signed PSBT exceeds maximum size of %d bytes",
+				maxCustomAnchorPsbtSize,
+			)
+		}
+		if req.FeeRate != 0 || req.GetFullTree() != nil ||
+			req.GetBranch() != nil {
 
-	tapTreeOpt, err := rpcutils.UnmarshalTapscriptSibling(
-		req.GetFullTree(), req.GetBranch(),
-	)
-	if err != nil {
-		return nil, err
+			return nil, fmt.Errorf("signed PSBT cannot be combined " +
+				"with fee rate or tapscript sibling")
+		}
+		var err error
+		signedPsbt, err = psbt.NewFromRawBytes(
+			bytes.NewReader(req.SignedPsbt), false,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse signed PSBT: %w",
+				err)
+		}
+	}
+
+	var feeRateOpt fn.Option[chainfee.SatPerKWeight]
+	var tapTreeOpt fn.Option[asset.TapscriptTreeNodes]
+	if signedPsbt == nil {
+		feeRate, err := checkFeeRateSanity(
+			ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		feeRateOpt = fn.MaybeSome(feeRate)
+
+		tapTreeOpt, err = rpcutils.UnmarshalTapscriptSibling(
+			req.GetFullTree(), req.GetBranch(),
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	batch, err := r.cfg.AssetMinter.FinalizeBatch(
 		tapgarden.FinalizeParams{
 			FeeRate:        feeRateOpt,
 			SiblingTapTree: tapTreeOpt,
+			SignedPsbt:     signedPsbt,
 		},
 	)
 	if err != nil {

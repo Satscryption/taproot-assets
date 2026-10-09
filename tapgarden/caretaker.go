@@ -649,6 +649,11 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 
 		genesisTxPkt.UnsignedTx.
 			TxOut[b.anchorOutputIndex].PkScript = genesisScript
+		if isCustomAnchorPsbt(genesisTxPkt) {
+			pOut := &genesisTxPkt.Outputs[b.anchorOutputIndex]
+			pOut.TaprootInternalKey = nil
+			pOut.TaprootBip32Derivation = nil
+		}
 
 		log.Infof("BatchCaretaker(%x): committing sprouts to disk",
 			b.batchKey[:])
@@ -710,11 +715,16 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		// TODO(roasbeef): only execute if finalized? or missing sig
 		ctx, cancel := b.WithCtxQuit()
 		defer cancel()
-		signedPkt, err := b.cfg.Wallet.SignAndFinalizePsbt(
-			ctx, b.cfg.Batch.GenesisPacket.Pkt,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("unable to sign psbt: %w", err)
+		signedPkt := b.cfg.Batch.GenesisPacket.Pkt
+		_, extractErr := psbt.Extract(signedPkt)
+		if extractErr != nil {
+			signedPkt, extractErr = b.cfg.Wallet.SignAndFinalizePsbt(
+				ctx, signedPkt,
+			)
+			if extractErr != nil {
+				return 0, fmt.Errorf("unable to sign psbt: %w",
+					extractErr)
+			}
 		}
 
 		// Final TX sanity check.

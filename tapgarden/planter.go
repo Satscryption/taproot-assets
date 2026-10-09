@@ -313,6 +313,7 @@ type UnsealedSeedling struct {
 type FinalizeParams struct {
 	FeeRate        fn.Option[chainfee.SatPerKWeight]
 	SiblingTapTree fn.Option[asset.TapscriptTreeNodes]
+	SignedPsbt     *psbt.Packet
 }
 
 // FundParams are the options available to change how a batch is funded, and how
@@ -320,6 +321,18 @@ type FinalizeParams struct {
 type FundParams struct {
 	FeeRate        fn.Option[chainfee.SatPerKWeight]
 	SiblingTapTree fn.Option[asset.TapscriptTreeNodes]
+
+	// AnchorPsbt is an optional caller-authored anchor transaction.
+	AnchorPsbt *psbt.Packet
+
+	// AssetAnchorOutIdx selects the output that receives the asset commitment.
+	AssetAnchorOutIdx uint32
+
+	// ChangeOutputIndex identifies a pre-existing change output. -1 means none.
+	ChangeOutputIndex int32
+
+	// PreCommitOutputIndex selects the supply commitment output when enabled.
+	PreCommitOutputIndex fn.Option[uint32]
 }
 
 // PendingGroupWitness specifies the asset group witness for an asset seedling
@@ -390,6 +403,7 @@ const (
 	reqTypeCancelBatch
 	reqTypeFundBatch
 	reqTypeSealBatch
+	reqTypePrepareBatch
 )
 
 // ChainPlanter is responsible for accepting new incoming requests to create
@@ -1860,6 +1874,8 @@ func (c *ChainPlanter) cancelMintingBatch(ctx context.Context,
 		return fmt.Errorf("unable to cancel minting batch: %w", err)
 	}
 
+	releaseBatchFundingInputs(ctx, c.cfg.Wallet, c.pendingBatch)
+
 	return nil
 }
 
@@ -2023,6 +2039,26 @@ func (c *ChainPlanter) gardener() {
 					Batch: verboseBatch,
 				})
 
+			case reqTypePrepareBatch:
+				if c.pendingBatch == nil {
+					req.Error(fmt.Errorf("no pending batch"))
+					break
+				}
+
+				ctx, cancel := c.WithCtxQuit()
+				preparedBatch, err := c.prepareBatch(
+					ctx, c.pendingBatch,
+				)
+				cancel()
+				if err != nil {
+					req.Error(fmt.Errorf("unable to prepare minting "+
+						"batch: %w", err))
+					break
+				}
+
+				c.pendingBatch = preparedBatch
+				req.Resolve(preparedBatch.Copy())
+
 			case reqTypeSealBatch:
 				if c.pendingBatch == nil {
 					req.Error(fmt.Errorf("no pending " +
@@ -2182,6 +2218,45 @@ func (c *ChainPlanter) fundBatch(ctx context.Context, params FundParams,
 	computeFunding := func(batch *MintingBatch) (
 		*FundedMintAnchorPsbt, error) {
 
+		if params.AnchorPsbt != nil {
+			anchorKeyDesc, err := customAnchorKeyDesc(
+				c.cfg.ChainParams, params.AnchorPsbt,
+				params.AssetAnchorOutIdx,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !c.cfg.KeyRing.IsLocalKey(ctx, anchorKeyDesc) {
+				return nil, fmt.Errorf("custom asset anchor internal " +
+					"key is not controlled by the backing wallet")
+			}
+
+			funded, err := customGenesisPsbt(
+				c.cfg.ChainParams, batch, params.AnchorPsbt,
+				params.AssetAnchorOutIdx,
+				params.ChangeOutputIndex,
+				params.PreCommitOutputIndex,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			locked, err := acquireCustomAnchorLeases(
+				ctx, c.cfg.Wallet,
+				customAnchorLeaseID(batch.BatchKey.PubKey),
+				funded.Pkt,
+			)
+			if err != nil {
+				return nil, batchFundingError(
+					ctx, c.cfg.Wallet, batch.BatchKey.PubKey,
+					&funded, err,
+				)
+			}
+			funded.LockedUTXOs = locked
+
+			return &funded, nil
+		}
+
 		feeRate, err := c.anchorTxFeeRate(ctx, params.FeeRate)
 		if err != nil {
 			return nil, fmt.Errorf("unable to determine anchor "+
@@ -2243,7 +2318,10 @@ func (c *ChainPlanter) fundBatch(ctx context.Context, params FundParams,
 
 		err = c.cfg.Log.CommitMintingBatch(ctx, newBatch)
 		if err != nil {
-			return err
+			return batchFundingError(
+				ctx, c.cfg.Wallet, newBatch.BatchKey.PubKey,
+				mintAnchorTx, err,
+			)
 		}
 
 		c.pendingBatch = newBatch
@@ -2265,7 +2343,10 @@ func (c *ChainPlanter) fundBatch(ctx context.Context, params FundParams,
 		ctx, workingBatch.BatchKey.PubKey, rootHash, *mintAnchorTx,
 	)
 	if err != nil {
-		return fmt.Errorf("unable to commit batch funding: %w", err)
+		return batchFundingError(
+			ctx, c.cfg.Wallet, workingBatch.BatchKey.PubKey,
+			mintAnchorTx, fmt.Errorf("unable to commit batch funding: %w", err),
+		)
 	}
 
 	// All persistence succeeded; commit the funding to memory.
@@ -2657,6 +2738,43 @@ func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 	// funded. If so, reject any provided parameters, as they would conflict
 	// with those previously used for batch funding.
 	haveParams := params.FeeRate.IsSome() || params.SiblingTapTree.IsSome()
+	if params.SignedPsbt != nil {
+		if haveParams {
+			return nil, fmt.Errorf("signed PSBT cannot be combined with " +
+				"fee rate or tapscript sibling")
+		}
+		if c.pendingBatch.State() != BatchStateCommitted ||
+			!isCustomAnchorPsbt(c.pendingBatch.GenesisPacket.Pkt) {
+
+			return nil, fmt.Errorf("no prepared custom batch awaiting " +
+				"an external signature")
+		}
+		merged, err := mergeSignedCustomPsbt(
+			c.pendingBatch.GenesisPacket.Pkt, params.SignedPsbt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateFinalizedAnchorPsbt(merged); err != nil {
+			return nil, fmt.Errorf("externally signed PSBT is not fully "+
+				"valid: %w", err)
+		}
+		c.pendingBatch.GenesisPacket.Pkt = merged
+
+		caretaker := c.newCaretakerForBatch(c.pendingBatch, nil)
+		if err := caretaker.Start(); err != nil {
+			return nil, fmt.Errorf("unable to start new caretaker: %w",
+				err)
+		}
+
+		return caretaker, nil
+	}
+	if c.pendingBatch.IsFunded() && c.pendingBatch.GenesisPacket != nil &&
+		isCustomAnchorPsbt(c.pendingBatch.GenesisPacket.Pkt) {
+
+		return nil, fmt.Errorf("custom anchor batch must be prepared and " +
+			"finalized with an externally signed PSBT")
+	}
 	if haveParams && c.pendingBatch.IsFunded() {
 		return nil, fmt.Errorf("cannot provide finalize parameters " +
 			"if batch already funded")
@@ -2680,7 +2798,10 @@ func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 	// fails, the batch stays pending so the user can retry.
 	if !c.pendingBatch.IsFunded() {
 		err = c.fundBatch(
-			ctx, FundParams(params), c.pendingBatch,
+			ctx, FundParams{
+				FeeRate:        params.FeeRate,
+				SiblingTapTree: params.SiblingTapTree,
+			}, c.pendingBatch,
 		)
 		if err != nil {
 			return nil, err
@@ -2764,6 +2885,18 @@ func (c *ChainPlanter) ListBatches(params ListBatchesParams) ([]*VerboseBatch,
 // a funded batch.
 func (c *ChainPlanter) FundBatch(params FundParams) (*FundBatchResp, error) {
 	req := newStateParamReq[*FundBatchResp](reqTypeFundBatch, params)
+
+	if !fn.SendOrQuit[stateRequest](c.stateReqs, req, c.Quit) {
+		return nil, fmt.Errorf("chain planter shutting down")
+	}
+
+	return <-req.resp, <-req.err
+}
+
+// PrepareBatch commits a caller-authored batch into its selected anchor PSBT
+// and returns the unsigned commitment packet for external signing.
+func (c *ChainPlanter) PrepareBatch() (*MintingBatch, error) {
+	req := newStateReq[*MintingBatch](reqTypePrepareBatch)
 
 	if !fn.SendOrQuit[stateRequest](c.stateReqs, req, c.Quit) {
 		return nil, fmt.Errorf("chain planter shutting down")
