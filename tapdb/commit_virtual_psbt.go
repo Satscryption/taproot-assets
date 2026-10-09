@@ -71,7 +71,6 @@ type CommitVirtualPsbtQueries interface {
 // BatchedCommitVirtualPsbtStore is the transactional surface for commit
 // idempotency records.
 type BatchedCommitVirtualPsbtStore interface {
-	CommitVirtualPsbtQueries
 	BatchedTx[CommitVirtualPsbtQueries]
 }
 

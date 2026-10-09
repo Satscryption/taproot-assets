@@ -16,125 +16,30 @@ type Querier interface {
 	AllMintingBatches(ctx context.Context) ([]AllMintingBatchesRow, error)
 	AnchorGenesisPoint(ctx context.Context, arg AnchorGenesisPointParams) error
 	AnchorPendingAssets(ctx context.Context, arg AnchorPendingAssetsParams) error
-	// The assets a receive (or mint) materialized in outputs of the given
-	// transaction, each with the parts of its proof locator: managed UTXO
-	// outpoints are stored as txid || index, so a prefix match on the
-	// txid finds every output of the transaction.
-	//
-	// A holding anchored in the transaction's outputs is the
-	// transaction's materialization — and so this site's to re-stamp and
-	// to compensate — unless the transaction's own transfer re-anchored
-	// it there: a passive_assets row of a transfer anchored by this very
-	// transaction marks a pre-existing holding the transfer carried
-	// along, which the porter's confirmation re-stamps and the porter's
-	// abandonment restores to its prior anchor. Only those are excluded.
-	// A passive row of some other transfer (a successor that staked the
-	// holding before broadcasting, and whose re-anchor has not yet
-	// confirmed) does not change what this transaction materialized: the
-	// holding still goes with it, and the compensation body sheds the
-	// successor's reference first.
-	AnchoredAssetsByAnchorTxPrefix(ctx context.Context, txid []byte) ([]AnchoredAssetsByAnchorTxPrefixRow, error)
 	ApplyPendingOutput(ctx context.Context, arg ApplyPendingOutputParams) (int64, error)
-	// The proof blob keyed by the asset's primary key (not the BIPS
-	// asset ID), as needed when compensating passive re-anchors.
-	AssetProofBlobByAssetID(ctx context.Context, assetID int64) ([]byte, error)
 	AssetsByGenesisPoint(ctx context.Context, prevOut []byte) ([]AssetsByGenesisPointRow, error)
 	AssetsDBSizePostgres(ctx context.Context) (int64, error)
 	AssetsDBSizeSqlite(ctx context.Context) (int32, error)
 	AssetsInBatch(ctx context.Context, rawKey []byte) ([]AssetsInBatchRow, error)
 	BindMintingBatchWithTapSibling(ctx context.Context, arg BindMintingBatchWithTapSiblingParams) error
-	// universe_commitments is intentionally not in the SET clause: the
-	// flag is set once at batch creation (NewMintingBatch) from the
-	// seedling's SupplyCommitments intent and must not change at
-	// funding time. Overwriting it here from a caller-derived value
-	// would silently disable supply commitments if no augmenter bind
-	// payload was produced for a batch that legitimately requested
-	// them.
 	BindMintingBatchWithTx(ctx context.Context, arg BindMintingBatchWithTxParams) (int64, error)
-	// Reserves a contiguous range of journal seq values ending at the
-	// returned tail. The row lock taken here is held until the enclosing
-	// transaction commits, serializing journal appends so that seq order
-	// equals commit order.
-	BumpUniverseLeafJournalTail(ctx context.Context, delta int64) (int64, error)
-	// A certified foreclosure is absorbing and never cleared.
-	ClearReorgDependencyForeclosure(ctx context.Context, arg ClearReorgDependencyForeclosureParams) error
 	ConfirmChainAnchorTx(ctx context.Context, arg ConfirmChainAnchorTxParams) error
 	ConfirmChainTx(ctx context.Context, arg ConfirmChainTxParams) error
 	CountAuthMailboxMessages(ctx context.Context) (int64, error)
 	CountForwards(ctx context.Context, arg CountForwardsParams) (int64, error)
-	// Over ALL anchorings, terminal included; see
-	// CountStuckReorgAnchorings.
-	CountLaggingReorgAnchorings(ctx context.Context) (int64, error)
-	// The live gauge's rollup: counts grouped in the database, so a
-	// metrics scrape never materializes anchoring rows.
-	CountLiveReorgAnchoringsByPhase(ctx context.Context) ([]CountLiveReorgAnchoringsByPhaseRow, error)
-	// The live claimants of an anchor point other than the given
-	// (abandoned) transfer: unconfirmed transfers, not superseded, that
-	// spend the point. A revived rival is one — its replacement is still
-	// in flight to spend the input — so the abandonment retains the
-	// input's lease rather than releasing it.
-	CountLiveTransfersSpendingPoint(ctx context.Context, arg CountLiveTransfersSpendingPointParams) (int64, error)
-	// Over ALL anchorings, terminal included: the delivery predicate has
-	// no terminal restriction (a buried or abandoned anchoring's site
-	// handler can still be failing), so the alarm gauges must not
-	// either.
-	CountStuckReorgAnchorings(ctx context.Context) (int64, error)
 	CountUnconfirmedAssets(ctx context.Context, arg CountUnconfirmedAssetsParams) (int64, error)
-	// The events' materialized custody references. On abandonment the
-	// proof and asset rows they point at are deleted, so the references
-	// must go first; the events themselves and their expected-output
-	// rows stand.
-	DeleteAddrEventProofsByAnchorTx(ctx context.Context, txid []byte) (int64, error)
-	// One asset's materialized custody reference. A self-send stakes the
-	// same asset row from two sites: the porter materialized it as a
-	// transfer output and the receive took custody of it. Whichever
-	// compensates first deletes the row, so it must shed the reference
-	// pointing at it — addr_event_proofs.asset_id_fk is unconstrained by
-	// ON DELETE, and would otherwise fail the delivery transaction. The
-	// event itself is left for the receive's compensation to reset.
-	DeleteAddrEventProofsByAssetID(ctx context.Context, assetID sql.NullInt64) (int64, error)
 	DeleteAllNodes(ctx context.Context, namespace string) (int64, error)
-	DeleteAssetByID(ctx context.Context, assetID int64) error
-	DeleteAssetProofAnchors(ctx context.Context, proofID int64) error
-	DeleteAssetProofByAssetID(ctx context.Context, assetID int64) error
 	DeleteAssetWitnesses(ctx context.Context, assetID int64) error
 	DeleteAuthMailboxMessageByIDAndReceiver(ctx context.Context, arg DeleteAuthMailboxMessageByIDAndReceiverParams) (int64, error)
 	DeleteAuxCloseInfo(ctx context.Context, chanPoint []byte) error
-	DeleteBurnsByTransferID(ctx context.Context, transferID int64) error
-	DeleteCommitVirtualPsbt(ctx context.Context, requestID []byte) error
-	DeleteCommitVirtualPsbtIf(ctx context.Context, arg DeleteCommitVirtualPsbtIfParams) (int64, error)
 	DeleteExpiredUTXOLeases(ctx context.Context, now sql.NullTime) error
 	DeleteFederationProofSyncLog(ctx context.Context, arg DeleteFederationProofSyncLogParams) error
 	DeleteManagedUTXO(ctx context.Context, outpoint []byte) error
 	DeleteMultiverseLeaf(ctx context.Context, arg DeleteMultiverseLeafParams) error
 	DeleteMultiverseRoot(ctx context.Context, namespaceRoot string) error
 	DeleteNode(ctx context.Context, arg DeleteNodeParams) (int64, error)
-	// The passive re-anchor records pointing at one asset row.
-	//
-	// A transfer records its intent to re-anchor a pre-existing holding
-	// before it broadcasts, so an asset that an earlier, confirmed
-	// transfer materialized as one of its outputs can already be a
-	// successor's passive holding by the time that earlier transfer is
-	// abandoned. passive_assets.asset_id is NOT NULL with no ON DELETE, so
-	// the reference has to be shed before the row it points at; otherwise
-	// the delete fails the watcher's entire delivery transaction and the
-	// abandonment can never apply at all.
-	//
-	// Discarding the successor's record is the correct reversal rather
-	// than merely the expedient one. The asset is being erased because the
-	// transaction that created it is gone from the surviving chain, so the
-	// successor's re-anchor of it never had a subject — and the successor,
-	// which spends an anchor output that no longer exists, cannot confirm
-	// either. The successor's own compensation reads passive_assets by
-	// transfer and simply finds nothing left to restore.
-	DeletePassiveAssetsByAssetID(ctx context.Context, assetID int64) (int64, error)
 	DeleteRoot(ctx context.Context, namespace string) (int64, error)
 	DeleteSupplyCommitTransition(ctx context.Context, transitionID int64) error
-	DeleteSupplyCommitment(ctx context.Context, commitID int64) error
-	// Deletes a single supply update event row identified by its
-	// event_id. Used by the migration 65 backfill to drop duplicate
-	// rows that hash to the same event_key as an earlier row.
-	DeleteSupplyUpdateEvent(ctx context.Context, eventID int64) error
 	DeleteSupplyUpdateEvents(ctx context.Context, transitionID sql.NullInt64) error
 	DeleteTapscriptTreeEdges(ctx context.Context, rootHash []byte) error
 	DeleteTapscriptTreeNodes(ctx context.Context) error
@@ -162,10 +67,7 @@ type Querier interface {
 	FetchAssetMetaByHash(ctx context.Context, metaDataHash []byte) (FetchAssetMetaByHashRow, error)
 	FetchAssetMetaForAsset(ctx context.Context, assetID []byte) (FetchAssetMetaForAssetRow, error)
 	FetchAssetProof(ctx context.Context, arg FetchAssetProofParams) ([]FetchAssetProofRow, error)
-	FetchAssetProofFileByProofID(ctx context.Context, proofID int64) ([]byte, error)
-	FetchAssetProofID(ctx context.Context, assetID int64) (int64, error)
 	FetchAssetProofs(ctx context.Context) ([]FetchAssetProofsRow, error)
-	FetchAssetProofsByAnchorTx(ctx context.Context, anchorTxid []byte) ([]FetchAssetProofsByAnchorTxRow, error)
 	FetchAssetProofsByAssetID(ctx context.Context, assetID []byte) ([]FetchAssetProofsByAssetIDRow, error)
 	// The proofs of all assets identified by the passed set of asset primary keys
 	// are fetched in a single query.
@@ -173,7 +75,6 @@ type Querier interface {
 	// The asset_ids argument must NEVER be an empty slice, otherwise this query
 	// will return no results.
 	FetchAssetProofsByIDs(ctx context.Context, assetIds []int64) ([]FetchAssetProofsByIDsRow, error)
-	FetchAssetProofsForAdoption(ctx context.Context, minBlockHeight sql.NullInt32) ([][]byte, error)
 	FetchAssetProofsSizes(ctx context.Context) ([]FetchAssetProofsSizesRow, error)
 	// The witnesses of all assets identified by the passed set of asset primary
 	// keys are fetched in a single query.
@@ -198,7 +99,6 @@ type Querier interface {
 	// independent of the size of the subtree beneath the node.
 	FetchChildren(ctx context.Context, arg FetchChildrenParams) ([]MssmtNode, error)
 	FetchChildrenSelfJoin(ctx context.Context, arg FetchChildrenSelfJoinParams) ([]FetchChildrenSelfJoinRow, error)
-	FetchCommitVirtualPsbt(ctx context.Context, requestID []byte) ([]byte, error)
 	FetchGenesisByAssetID(ctx context.Context, assetID []byte) (GenesisInfoView, error)
 	FetchGenesisByGroupKey(ctx context.Context, tweakedGroupKey []byte) (GenesisInfoView, error)
 	FetchGenesisByID(ctx context.Context, genAssetID int64) (FetchGenesisByIDRow, error)
@@ -208,41 +108,19 @@ type Querier interface {
 	FetchGroupByGenesis(ctx context.Context, genesisID int64) (FetchGroupByGenesisRow, error)
 	// Sort and limit to return the genesis ID for initial genesis of the group.
 	FetchGroupByGroupKey(ctx context.Context, groupKey []byte) (FetchGroupByGroupKeyRow, error)
-	FetchGroupWitnessesByGroupKey(ctx context.Context, groupKey []byte) ([]FetchGroupWitnessesByGroupKeyRow, error)
 	FetchGroupedAssets(ctx context.Context) ([]FetchGroupedAssetsRow, error)
 	FetchInternalKeyByID(ctx context.Context, keyID int64) (FetchInternalKeyByIDRow, error)
 	FetchInternalKeyLocator(ctx context.Context, rawKey []byte) (FetchInternalKeyLocatorRow, error)
-	// The live anchorings whose trigger set references the given
-	// transaction: used when a satisfying candidate in that form is first
-	// recorded, to derive edges for children registered before their
-	// parent's transaction had ever been observed.
-	FetchLiveReorgDependentsByTrigger(ctx context.Context, outpointTxid []byte) ([]int64, error)
-	// The live anchorings for which the given transaction is a recorded
-	// satisfying candidate. Candidate rows are the durable record of
-	// every form in which an anchoring has ever been observed satisfied,
-	// so matching them (rather than the current witness) lets a child's
-	// registration find its parent whichever form the parent currently
-	// holds — witnessed, conflicted, or reorged back out entirely.
-	FetchLiveReorgParentsByCandidate(ctx context.Context, spenderTxid []byte) ([]int64, error)
 	FetchManagedUTXO(ctx context.Context, arg FetchManagedUTXOParams) (FetchManagedUTXORow, error)
 	FetchManagedUTXOs(ctx context.Context) ([]FetchManagedUTXOsRow, error)
 	// Fetch records from the supply_pre_commits table with optional
 	// filtering.
 	FetchMintSupplyPreCommits(ctx context.Context, arg FetchMintSupplyPreCommitsParams) ([]FetchMintSupplyPreCommitsRow, error)
 	FetchMintingBatch(ctx context.Context, rawKey []byte) (FetchMintingBatchRow, error)
-	// ORDER BY matches the tie-break used by migration 61's self-heal
-	// (creation_time_unix DESC, batch_id DESC), so any code that has to
-	// pick "the most recent" pre-broadcast batch when several share a
-	// timestamp reaches the same row as the migration.
 	FetchMintingBatchesByInverseState(ctx context.Context, batchState int16) ([]FetchMintingBatchesByInverseStateRow, error)
 	FetchMultiverseRoot(ctx context.Context, namespaceRoot string) (FetchMultiverseRootRow, error)
 	FetchOrphanManagedUTXOs(ctx context.Context, arg FetchOrphanManagedUTXOsParams) ([]FetchOrphanManagedUTXOsRow, error)
 	FetchPeerAcceptedBuyPeerByScid(ctx context.Context, scid int64) ([]byte, error)
-	FetchReorgAnchoring(ctx context.Context, id int64) (ReorgAnchoring, error)
-	FetchReorgCandidateSpends(ctx context.Context, anchoringID int64) ([]ReorgCandidateSpend, error)
-	FetchReorgDependencyEdgesByChild(ctx context.Context, childID int64) ([]ReorgDependency, error)
-	FetchReorgDependencyEdgesByParent(ctx context.Context, parentID int64) ([]ReorgDependency, error)
-	FetchReorgTriggerOutpoints(ctx context.Context, anchoringID int64) ([]ReorgTriggerOutpoint, error)
 	FetchRootNode(ctx context.Context, namespace string) (MssmtNode, error)
 	FetchScriptKeyByTweakedKey(ctx context.Context, tweakedScriptKey []byte) (FetchScriptKeyByTweakedKeyRow, error)
 	FetchScriptKeyIDByTweakedKey(ctx context.Context, tweakedScriptKey []byte) (int64, error)
@@ -253,59 +131,17 @@ type Querier interface {
 	// Fetches all push log entries for a given asset group, ordered by
 	// creation time with the most recent entries first.
 	FetchSupplySyncerPushLogs(ctx context.Context, groupKey []byte) ([]SupplySyncerPushLog, error)
-	// Fetches the addresses of the servers a given supply commitment has
-	// already been pushed to, identified by its commitment outpoint. The
-	// push log records every successful remote insert, so this is the
-	// sender's durable view of which servers already hold the commitment.
-	FetchSupplySyncerPushedServers(ctx context.Context, arg FetchSupplySyncerPushedServersParams) ([]string, error)
-	// Returns rows that pre-date the event_key column and still need
-	// a hash computed. Used by the programmatic migration that runs
-	// at schema version 65.
-	//
-	// Rows attached to a transition come first, and among those the
-	// rows of finalized transitions come first, so the backfill's
-	// "keep the first duplicate" dedup logic can never drop the row
-	// a finalized transition depends on. Within each partition,
-	// event_id ASC is the deterministic tie-break.
-	//
-	// The LIMIT bounds the rows (and thus the event_data payloads)
-	// held in memory at once; the backfill either hashes or deletes
-	// every row it fetches, so re-running the query naturally pages
-	// through the remainder.
-	FetchSupplyUpdateEventsForBackfill(ctx context.Context, numLimit int32) ([]FetchSupplyUpdateEventsForBackfillRow, error)
 	// Sort the nodes by node_index here instead of returning the indices.
 	FetchTapscriptTree(ctx context.Context, rootHash []byte) ([]FetchTapscriptTreeRow, error)
 	FetchTransferInputs(ctx context.Context, transferID int64) ([]FetchTransferInputsRow, error)
 	FetchTransferOutputs(ctx context.Context, transferID int64) ([]FetchTransferOutputsRow, error)
-	FetchUnindexedAssetProofs(ctx context.Context, rowLimit int32) ([]FetchUnindexedAssetProofsRow, error)
-	// Note on hash construction: mssmt_nodes.hash_key on a compacted leaf
-	// commits to the subtree root at that leaf's tree height, which
-	// varies with the tree's shape and is therefore NOT canonical across
-	// universes with the same leaves. What we want for a cross-universe
-	// diff is the leaf's own canonical content hash H(value || sum),
-	// computed from mssmt_nodes.value (the leaf's RawProof bytes) and
-	// mssmt_nodes.sum. Callers compute the hash from these two columns.
 	FetchUniverseKeys(ctx context.Context, arg FetchUniverseKeysParams) ([]FetchUniverseKeysRow, error)
-	// The commit-ordered delta serves federation sync, whose domain is
-	// issuance and transfer universes; other proof types flow through
-	// dedicated syncers. Sequencing comes from the journal, whose seq
-	// assignment guarantees seq order equals commit order, so a reader
-	// can never observe a seq while a lower unserved seq is still
-	// uncommitted.
-	FetchUniverseLeavesSince(ctx context.Context, arg FetchUniverseLeavesSinceParams) ([]FetchUniverseLeavesSinceRow, error)
 	FetchUniverseRoot(ctx context.Context, namespace string) (FetchUniverseRootRow, error)
 	FetchUniverseSupplyRoot(ctx context.Context, namespaceRoot string) (FetchUniverseSupplyRootRow, error)
 	FetchUnknownTypeScriptKeys(ctx context.Context) ([]FetchUnknownTypeScriptKeysRow, error)
 	// Fetch unspent supply pre-commitment outputs. Each pre-commitment output
 	// comes from a mint anchor transaction and relates to an asset issuance
 	// where the local node acted as the issuer.
-	//
-	// Cancelled batches are excluded. A batch whose genesis transaction lost
-	// to a buried conflicting spender is cancelled by the mint site's
-	// abandonment, but its pre-commitment row survives to keep the
-	// issuance record. That outpoint does not exist on the surviving
-	// chain, so offering it here would build a commitment transaction that
-	// can never be broadcast, and whose own anchoring would never witness.
 	FetchUnspentMintSupplyPreCommits(ctx context.Context, groupKey []byte) ([]FetchUnspentMintSupplyPreCommitsRow, error)
 	// Fetch unspent supply pre-commitment outputs. Each pre-commitment output
 	// comes from a mint anchor transaction and relates to an asset issuance
@@ -318,7 +154,6 @@ type Querier interface {
 	GenesisPoints(ctx context.Context) ([]GenesisPoint, error)
 	GetRootKey(ctx context.Context, id []byte) (Macaroon, error)
 	HasAssetProof(ctx context.Context, tweakedScriptKey []byte) (bool, error)
-	InsertAssetProofAnchor(ctx context.Context, arg InsertAssetProofAnchorParams) error
 	InsertAssetSeedling(ctx context.Context, arg InsertAssetSeedlingParams) error
 	InsertAssetSeedlingIntoBatch(ctx context.Context, arg InsertAssetSeedlingIntoBatchParams) error
 	InsertAssetTransfer(ctx context.Context, arg InsertAssetTransferParams) (int64, error)
@@ -327,19 +162,11 @@ type Querier interface {
 	InsertAuthMailboxMessage(ctx context.Context, arg InsertAuthMailboxMessageParams) (int64, error)
 	InsertBranch(ctx context.Context, arg InsertBranchParams) error
 	InsertBurn(ctx context.Context, arg InsertBurnParams) (int64, error)
-	InsertCommitVirtualPsbt(ctx context.Context, arg InsertCommitVirtualPsbtParams) error
 	InsertCompactedLeaf(ctx context.Context, arg InsertCompactedLeafParams) error
 	InsertLeaf(ctx context.Context, arg InsertLeafParams) error
 	InsertNewProofEvent(ctx context.Context, arg InsertNewProofEventParams) error
 	InsertNewSyncEvent(ctx context.Context, arg InsertNewSyncEventParams) error
 	InsertPassiveAsset(ctx context.Context, arg InsertPassiveAssetParams) error
-	// Phase codes mirror tapreorg.PhaseCode: 0 unwitnessed, 1 witnessed,
-	// 2 conflicted, 3 buried, 4 abandoned. Codes >= 3 are
-	// terminal. Verdict codes mirror tapreorg.Verdict: 0 satisfies, 1
-	// foreign. The literals below must stay in sync with those enums.
-	InsertReorgAnchoring(ctx context.Context, arg InsertReorgAnchoringParams) (int64, error)
-	InsertReorgEffect(ctx context.Context, arg InsertReorgEffectParams) (int64, error)
-	InsertReorgTriggerOutpoint(ctx context.Context, arg InsertReorgTriggerOutpointParams) error
 	InsertRootKey(ctx context.Context, arg InsertRootKeyParams) error
 	InsertSupplyCommitTransition(ctx context.Context, arg InsertSupplyCommitTransitionParams) (int64, error)
 	InsertSupplyCommitment(ctx context.Context, arg InsertSupplyCommitmentParams) (int64, error)
@@ -347,50 +174,13 @@ type Querier interface {
 	// push to a remote universe server. The commit_txid and output_index are
 	// taken directly from the RootCommitment outpoint.
 	InsertSupplySyncerPushLog(ctx context.Context, arg InsertSupplySyncerPushLogParams) error
-	// The event_key column is a deterministic content hash that
-	// identifies a logical update event. A duplicate insert (e.g. on
-	// restart re-run of the Confirmed branch in the minting state
-	// machine) hits the unique index on event_key and is silently
-	// dropped, leaving the existing row -- and any transition_id it
-	// already carries -- untouched.
-	//
-	// Returning rows-affected (1 on insert, 0 on conflict) lets the
-	// caller distinguish "new event recorded" from "dedup absorbed an
-	// old one" -- the latter is the signal InsertPendingUpdate needs
-	// to avoid creating an empty pending transition when a re-fired
-	// event matches a row already attached to a prior (finalized)
-	// transition.
-	InsertSupplyUpdateEvent(ctx context.Context, arg InsertSupplyUpdateEventParams) (int64, error)
+	InsertSupplyUpdateEvent(ctx context.Context, arg InsertSupplyUpdateEventParams) error
 	InsertTxProof(ctx context.Context, arg InsertTxProofParams) error
-	// A leaf already journaled keeps its original seq: re-upserts and
-	// in-place rewrites are not re-delivered by delta sync, and heal via
-	// the root comparison on the enumeration path instead.
-	InsertUniverseLeafJournal(ctx context.Context, arg InsertUniverseLeafJournalParams) error
 	InsertUniverseServer(ctx context.Context, arg InsertUniverseServerParams) error
 	LinkDanglingSupplyUpdateEvents(ctx context.Context, arg LinkDanglingSupplyUpdateEventsParams) error
 	ListClaimedOutpoints(ctx context.Context, arg ListClaimedOutpointsParams) ([]ListClaimedOutpointsRow, error)
-	ListCommitVirtualPsbts(ctx context.Context) ([]ListCommitVirtualPsbtsRow, error)
-	ListFinishedCommitVirtualPsbtsBefore(ctx context.Context, finishedBefore sql.NullTime) ([]ListFinishedCommitVirtualPsbtsBeforeRow, error)
-	ListLiveReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
-	// The observability surface's list query: a pure row projection with
-	// an aggregated candidate count — no per-row follow-up queries and
-	// no raw transaction or proof deserialization behind it. Filters are
-	// applied here, not over materialized rows, and every page is
-	// bounded — the table is never pruned, so an unbounded scan would
-	// grow without limit.
-	ListReorgAnchoringSummariesPage(ctx context.Context, arg ListReorgAnchoringSummariesPageParams) ([]ListReorgAnchoringSummariesPageRow, error)
-	ListReorgAnchorings(ctx context.Context) ([]ReorgAnchoring, error)
-	ListReorgPendingDeliveries(ctx context.Context, now int64) ([]ReorgAnchoring, error)
-	ListReorgPendingEffects(ctx context.Context, arg ListReorgPendingEffectsParams) ([]ReorgOutbox, error)
-	ListUnstampedCommitVirtualPsbts(ctx context.Context) ([]ListUnstampedCommitVirtualPsbtsRow, error)
 	LogProofTransferAttempt(ctx context.Context, arg LogProofTransferAttemptParams) error
 	LogServerSync(ctx context.Context, arg LogServerSyncParams) error
-	// Returns the anchoring row for (site_id, match_key), or no rows if
-	// none exists. The unique partial index makes this O(1); it is the
-	// production shape of "does this site already have an anchoring for
-	// this identity?"
-	LookupReorgAnchoringByMatchKey(ctx context.Context, arg LookupReorgAnchoringByMatchKeyParams) (ReorgAnchoring, error)
-	MarkAssetProofProvenanceIndexed(ctx context.Context, proofID int64) error
 	MarkManagedUTXOAsSwept(ctx context.Context, arg MarkManagedUTXOAsSweptParams) error
 	// Mark a supply pre-commitment output as spent by its outpoint. The
 	// pre-commitment corresponds to an asset issuance where the local node acted as
@@ -400,23 +190,7 @@ type Querier interface {
 	// pre-commitment corresponds to an asset issuance where a remote node acted as
 	// the issuer.
 	MarkPreCommitSpentByOutpoint(ctx context.Context, arg MarkPreCommitSpentByOutpointParams) error
-	MarkReorgAnchoringDelivered(ctx context.Context, arg MarkReorgAnchoringDeliveredParams) error
-	MarkReorgEffectDispatched(ctx context.Context, arg MarkReorgEffectDispatchedParams) error
-	// An abandoned transfer is permanently dead: its anchor inputs were
-	// claimed by a buried foreign transaction, so its own anchor can
-	// never confirm. Superseded transfers are not resumed at startup.
-	//
-	// The abandoned flag records *why* it is superseded, so that a later
-	// abandonment of a sibling sharing an input cannot revive it.
-	MarkTransferSuperseded(ctx context.Context, transferID int64) error
-	MaxUniverseLeafJournalSeq(ctx context.Context) (int64, error)
 	NewMintingBatch(ctx context.Context, arg NewMintingBatchParams) error
-	// Classify local subsystem state staked on one proof transition. Mint and
-	// porter rows require their own compensation. An address-event reference is
-	// independently receive-owned, including for a self-send that is also owned
-	// by the porter.
-	ProofAnchorSiteOwnership(ctx context.Context, anchorTxid []byte) (ProofAnchorSiteOwnershipRow, error)
-	PurgeFinishedCommitVirtualPsbts(ctx context.Context, finishedBefore sql.NullTime) (int64, error)
 	QueryAddr(ctx context.Context, arg QueryAddrParams) (QueryAddrRow, error)
 	// We use a LEFT JOIN here as not every asset has a group key, so this'll
 	// generate rows that have NULL values for the group key fields if an asset
@@ -444,13 +218,6 @@ type Querier interface {
 	QueryAuthMailboxMessages(ctx context.Context, arg QueryAuthMailboxMessagesParams) ([]QueryAuthMailboxMessagesRow, error)
 	QueryBurns(ctx context.Context, arg QueryBurnsParams) ([]QueryBurnsRow, error)
 	QueryDanglingSupplyUpdateEvents(ctx context.Context, groupKey []byte) ([]QueryDanglingSupplyUpdateEventsRow, error)
-	// Returns non-finalized, non-frozen transitions that have no supply
-	// update events attached. Used by the migration 65 backfill: dropping
-	// a duplicate event row can leave the pending transition it belonged
-	// to empty, and an empty pending transition would otherwise freeze on
-	// the next tick and broadcast a supply commitment that commits
-	// nothing.
-	QueryEmptySupplyCommitTransitions(ctx context.Context) ([]QueryEmptySupplyCommitTransitionsRow, error)
 	QueryEventIDs(ctx context.Context, arg QueryEventIDsParams) ([]QueryEventIDsRow, error)
 	// Find the ID of an existing non-finalized transition for the group key
 	QueryExistingPendingTransition(ctx context.Context, groupKey []byte) (int64, error)
@@ -458,7 +225,6 @@ type Querier interface {
 	// Join on mssmt_nodes to get leaf related fields.
 	// Join on genesis_info_view to get leaf related fields.
 	QueryFederationProofSyncLog(ctx context.Context, arg QueryFederationProofSyncLogParams) ([]QueryFederationProofSyncLogRow, error)
-	QueryFederationSyncCursor(ctx context.Context, targetServer string) (int64, error)
 	QueryFederationUniSyncConfigs(ctx context.Context) ([]QueryFederationUniSyncConfigsRow, error)
 	QueryForwards(ctx context.Context, arg QueryForwardsParams) ([]QueryForwardsRow, error)
 	QueryLastEventHeight(ctx context.Context, version int16) (int64, error)
@@ -472,137 +238,32 @@ type Querier interface {
 	QueryStartingSupplyCommitment(ctx context.Context, groupKey []byte) (QueryStartingSupplyCommitmentRow, error)
 	QuerySupersededTransferIDs(ctx context.Context) ([]int64, error)
 	QuerySupplyCommitStateMachine(ctx context.Context, groupKey []byte) (QuerySupplyCommitStateMachineRow, error)
-	QuerySupplyCommitTransitionByNewCommitment(ctx context.Context, newCommitmentID sql.NullInt64) (QuerySupplyCommitTransitionByNewCommitmentRow, error)
 	QuerySupplyCommitment(ctx context.Context, commitID int64) (QuerySupplyCommitmentRow, error)
 	QuerySupplyCommitmentByOutpoint(ctx context.Context, arg QuerySupplyCommitmentByOutpointParams) (QuerySupplyCommitmentByOutpointRow, error)
 	QuerySupplyCommitmentBySpentOutpoint(ctx context.Context, arg QuerySupplyCommitmentBySpentOutpointParams) (QuerySupplyCommitmentBySpentOutpointRow, error)
-	QuerySupplyCommitmentByTxid(ctx context.Context, arg QuerySupplyCommitmentByTxidParams) (SupplyCommitment, error)
 	QuerySupplyCommitmentOutpoint(ctx context.Context, commitID int64) (QuerySupplyCommitmentOutpointRow, error)
 	QuerySupplyLeavesByHeight(ctx context.Context, arg QuerySupplyLeavesByHeightParams) ([]QuerySupplyLeavesByHeightRow, error)
 	QuerySupplyUpdateEvents(ctx context.Context, transitionID sql.NullInt64) ([]QuerySupplyUpdateEventsRow, error)
 	// TODO(roasbeef): use the universe id instead for the grouping? so namespace
 	// root, simplifies queries
 	QueryUniverseAssetStats(ctx context.Context, arg QueryUniverseAssetStatsParams) ([]QueryUniverseAssetStatsRow, error)
-	QueryUniverseLeafID(ctx context.Context, arg QueryUniverseLeafIDParams) (int64, error)
 	QueryUniverseLeaves(ctx context.Context, arg QueryUniverseLeavesParams) ([]QueryUniverseLeavesRow, error)
 	QueryUniverseServers(ctx context.Context, arg QueryUniverseServersParams) ([]UniverseServer, error)
 	QueryUniverseStats(ctx context.Context) (QueryUniverseStatsRow, error)
 	QueryUniverseSupplyLeaves(ctx context.Context, arg QueryUniverseSupplyLeavesParams) ([]QueryUniverseSupplyLeavesRow, error)
 	ReAnchorPassiveAssets(ctx context.Context, arg ReAnchorPassiveAssetsParams) error
-	RecordReorgDeliveryFailure(ctx context.Context, arg RecordReorgDeliveryFailureParams) error
-	RecordReorgEffectFailure(ctx context.Context, arg RecordReorgEffectFailureParams) error
-	// The receive-side inverse of event completion: the anchor
-	// transaction the events were keyed to was decided against by the
-	// chain, so the events return to the given (pre-completion) status.
-	// Their expected-output rows (addr_event_outputs) stand: they
-	// describe the address's expectation, not materialized state.
-	ResetAddrEventsByAnchorTx(ctx context.Context, arg ResetAddrEventsByAnchorTxParams) (int64, error)
-	// The inverse of ReAnchorPassiveAssets: restore the anchor UTXO and
-	// the spend-template fields that the re-anchor reset.
-	RestoreAssetSpendTemplate(ctx context.Context, arg RestoreAssetSpendTemplateParams) error
 	SetAddrManaged(ctx context.Context, arg SetAddrManagedParams) error
 	SetAssetSpent(ctx context.Context, arg SetAssetSpentParams) (int64, error)
-	// Marks one asset row spent by its primary key. Used by abandonment
-	// compensation for a passive holding whose restored anchor outpoint
-	// the foreclosing transaction consumed: the holding's provenance is
-	// intact but the outpoint belongs to someone else, so it must not
-	// count toward balances or coin selection.
-	SetAssetSpentByID(ctx context.Context, assetID int64) error
-	// The inverse of SetAssetSpent, applied when the transfer that spent
-	// the asset is abandoned and nothing else consumed its anchor input
-	// on the surviving chain.
-	//
-	// Two claimants can contradict that premise. A rival local transfer
-	// may have confirmed against the same outpoint — the sweeper's fee
-	// bump composes a replacement form — and only the losing form is
-	// abandoned; the surviving-claimant test below guards that case, the
-	// same test UnsupersedeSafeTransfers applies. Or the foreclosing
-	// transaction itself consumed the outpoint (a third party, routine
-	// for tapchannel triggers): that transaction is not a local transfer
-	// and is invisible here, so the caller must not invoke this query
-	// for inputs the foreclosure consumed. The abandoned transfer's own
-	// confirmation is withdrawn before this runs, so it cannot answer
-	// for itself.
-	SetAssetUnspent(ctx context.Context, arg SetAssetUnspentParams) (int64, error)
-	// A newly sensed phase is a new delivery objective, so the failure
-	// bookkeeping of the previous objective (backoff, attempts, stuck)
-	// resets with it; a systematically failing handler re-sticks after
-	// the usual number of attempts. Terminal phases are absorbing at the
-	// row level: a write racing another writer's terminal transition
-	// matches no rows, and the caller observes the refusal via the row
-	// count.
-	SetReorgAnchoringPhase(ctx context.Context, arg SetReorgAnchoringPhaseParams) (int64, error)
-	// Sets the content-hash key for a single supply update event row.
-	// Used by the programmatic migration that backfills pre-existing
-	// rows after column 000062 is added.
-	SetSupplyUpdateEventKey(ctx context.Context, arg SetSupplyUpdateEventKeyParams) error
 	SetTransferOutputProofDeliveryStatus(ctx context.Context, arg SetTransferOutputProofDeliveryStatusParams) error
 	// Mark all unconfirmed transfers that spend the given anchor point as
 	// superseded, except for the given (just confirmed) transfer. Once a
 	// conflicting transfer has confirmed on-chain, these transfers' anchor
 	// transactions can never confirm.
 	SupersedeConflictingTransfers(ctx context.Context, arg SupersedeConflictingTransfersParams) (int64, error)
-	// Re-enter supersession for the transfer of the given anchor
-	// transaction when another confirmed transfer claims one of its
-	// inputs, applied when its confirmation is withdrawn. The rival's
-	// confirmation did not supersede this transfer — only unconfirmed
-	// rivals are superseded, and this one was confirmed at the time — so
-	// without this it would sit unconfirmed and unsuperseded, be resumed
-	// at startup, and rebroadcast an anchor that can never confirm.
-	SupersedeIfConflictingConfirmed(ctx context.Context, txid []byte) error
-	// The superseded rivals of an abandoned transfer at one of its anchor
-	// points: the candidates for revival when it is abandoned.
-	//
-	// Only rivalry losers are candidates. A transfer marked abandoned was
-	// superseded by its own abandonment — its inputs were claimed by a
-	// buried foreign transaction — so reviving it would resume a transfer
-	// whose anchor can never confirm.
-	SupersededTransfersSpendingPoint(ctx context.Context, arg SupersededTransfersSpendingPointParams) ([]int64, error)
-	SwapCommitVirtualPsbt(ctx context.Context, arg SwapCommitVirtualPsbtParams) (int64, error)
-	// The asset row a transfer output materialized into, if any: the
-	// convergence guard for re-applying a confirmation, and the target
-	// of compensation when the transfer is abandoned. The genesis filter
-	// is necessary: distinct assets can share both script key and anchor
-	// UTXO (a multi-asset HTLC swept in one transaction), so the pair
-	// alone is ambiguous.
-	TransferOutputAssetID(ctx context.Context, arg TransferOutputAssetIDParams) (int64, error)
-	UnbindSupplyUpdateEvents(ctx context.Context, transitionID sql.NullInt64) error
-	// The inverse of ConfirmChainAnchorTx: the anchor transaction's
-	// recorded confirmation is withdrawn (its block was re-organized
-	// away and nothing has replaced it yet).
-	UnconfirmChainAnchorTx(ctx context.Context, txid []byte) error
 	UniverseLeaves(ctx context.Context) ([]UniverseLeafe, error)
 	UniverseRoots(ctx context.Context, arg UniverseRootsParams) ([]UniverseRootsRow, error)
-	UniverseRootsAfterID(ctx context.Context, arg UniverseRootsAfterIDParams) ([]UniverseRootsAfterIDRow, error)
-	// The inverse of SupersedeConflictingTransfers for one rivalry loser,
-	// applied when the transfer that superseded it is abandoned: the loser
-	// becomes live again, provided no confirmed transfer conflicts with it
-	// on any of its inputs — not merely on the input it shared with the
-	// abandoned transfer. A rival that also spends an input some other
-	// confirmed transfer claims can never confirm, and reviving it would
-	// resume a parcel that rebroadcasts a doomed anchor.
-	//
-	// The abandoned transfer's own confirmation is withdrawn before this
-	// runs, so it cannot answer as the conflicting claimant.
-	UnsupersedeSafeTransfer(ctx context.Context, transferID int64) (int64, error)
-	// Lift the confirming transfer's own superseded flag. A rivalry loser
-	// can still confirm — the rival that superseded it may since have been
-	// re-organized out — and once it does, its confirmation supersedes the
-	// rival in turn; the flag on the transfer itself must be lifted too,
-	// or it is skipped at startup and never completes. An abandoned
-	// transfer is left alone: it was compensated by its own abandonment.
-	UnsupersedeTransfer(ctx context.Context, transferID int64) error
-	// The inverse of MarkManagedUTXOAsSwept for every UTXO swept by the
-	// given (now abandoned) transaction.
-	UnsweepManagedUTXOsByTxid(ctx context.Context, txid []byte) error
 	UpdateBatchGenesisTx(ctx context.Context, arg UpdateBatchGenesisTxParams) error
-	UpdateCommitVirtualPsbt(ctx context.Context, arg UpdateCommitVirtualPsbtParams) (int64, error)
 	UpdateMintingBatchState(ctx context.Context, arg UpdateMintingBatchStateParams) error
-	// The first certified foreclosure freezes the edge: certification is
-	// act-final, so later stagings — fresher parent forms, off-chain
-	// flips — must not displace evidence the notifier certified, lest
-	// the child absorb an abandonment on a transaction it never did.
-	UpdateReorgDependencyForeclosure(ctx context.Context, arg UpdateReorgDependencyForeclosureParams) error
 	UpdateSupplyCommitTransitionCommitment(ctx context.Context, arg UpdateSupplyCommitTransitionCommitmentParams) error
 	UpdateSupplyCommitmentChainDetails(ctx context.Context, arg UpdateSupplyCommitmentChainDetailsParams) error
 	UpdateSupplyCommitmentRoot(ctx context.Context, arg UpdateSupplyCommitmentRootParams) error
@@ -613,7 +274,6 @@ type Querier interface {
 	UpsertAddrEventProof(ctx context.Context, arg UpsertAddrEventProofParams) (int64, error)
 	UpsertAsset(ctx context.Context, arg UpsertAssetParams) (int64, error)
 	UpsertAssetGroupKey(ctx context.Context, arg UpsertAssetGroupKeyParams) (int64, error)
-	UpsertAssetGroupKeyFull(ctx context.Context, arg UpsertAssetGroupKeyFullParams) (int64, error)
 	UpsertAssetGroupWitness(ctx context.Context, arg UpsertAssetGroupWitnessParams) (int64, error)
 	UpsertAssetMeta(ctx context.Context, arg UpsertAssetMetaParams) (int64, error)
 	UpsertAssetProofByID(ctx context.Context, arg UpsertAssetProofByIDParams) error
@@ -622,7 +282,6 @@ type Querier interface {
 	UpsertChainTx(ctx context.Context, arg UpsertChainTxParams) (int64, error)
 	UpsertFederationGlobalSyncConfig(ctx context.Context, arg UpsertFederationGlobalSyncConfigParams) error
 	UpsertFederationProofSyncLog(ctx context.Context, arg UpsertFederationProofSyncLogParams) (int64, error)
-	UpsertFederationSyncCursor(ctx context.Context, arg UpsertFederationSyncCursorParams) error
 	UpsertFederationUniSyncConfig(ctx context.Context, arg UpsertFederationUniSyncConfigParams) error
 	UpsertForward(ctx context.Context, arg UpsertForwardParams) (int64, error)
 	UpsertGenesisAsset(ctx context.Context, arg UpsertGenesisAssetParams) (int64, error)
@@ -639,22 +298,8 @@ type Querier interface {
 	UpsertMintSupplyPreCommit(ctx context.Context, arg UpsertMintSupplyPreCommitParams) (int64, error)
 	UpsertMultiverseLeaf(ctx context.Context, arg UpsertMultiverseLeafParams) (int64, error)
 	UpsertMultiverseRoot(ctx context.Context, arg UpsertMultiverseRootParams) (int64, error)
-	// Certification is sticky: once set it survives every later update,
-	// since a certified act crossing is never retracted by re-orgs. The
-	// watcher verifies a certifying location against the chain before it
-	// upserts, so a certified row's location was dominant when recorded.
-	//
-	// Witness enrichment (block_header, merkle_proof) only ever
-	// refreshes: a later observation that lacks block data must not
-	// erase enrichment already captured, since burial handlers rebuild
-	// proofs from it without network access.
-	UpsertReorgCandidateSpend(ctx context.Context, arg UpsertReorgCandidateSpendParams) error
-	// Edge creation is idempotent: registration-time and candidate-time
-	// derivation can discover the same edge, and the first write wins.
-	UpsertReorgDependency(ctx context.Context, arg UpsertReorgDependencyParams) error
 	UpsertRfqPolicy(ctx context.Context, arg UpsertRfqPolicyParams) error
 	UpsertRootNode(ctx context.Context, arg UpsertRootNodeParams) error
-	UpsertWalletVerifiedInternalKey(ctx context.Context, arg UpsertWalletVerifiedInternalKeyParams) (int64, error)
 	UpsertScriptKey(ctx context.Context, arg UpsertScriptKeyParams) (int64, error)
 	// Return the ID of the state that was actually set (either inserted or updated),
 	// and the latest commitment ID that was set.
@@ -664,7 +309,7 @@ type Querier interface {
 	UpsertTapscriptTreeEdge(ctx context.Context, arg UpsertTapscriptTreeEdgeParams) (int64, error)
 	UpsertTapscriptTreeNode(ctx context.Context, rawNode []byte) (int64, error)
 	UpsertTapscriptTreeRootHash(ctx context.Context, arg UpsertTapscriptTreeRootHashParams) (int64, error)
-	UpsertUniverseLeaf(ctx context.Context, arg UpsertUniverseLeafParams) (int64, error)
+	UpsertUniverseLeaf(ctx context.Context, arg UpsertUniverseLeafParams) error
 	UpsertUniverseRoot(ctx context.Context, arg UpsertUniverseRootParams) (int64, error)
 	UpsertUniverseSupplyLeaf(ctx context.Context, arg UpsertUniverseSupplyLeafParams) (int64, error)
 	UpsertUniverseSupplyRoot(ctx context.Context, arg UpsertUniverseSupplyRootParams) (int64, error)

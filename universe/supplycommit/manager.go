@@ -8,13 +8,13 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/protofsm"
@@ -52,15 +52,6 @@ type DaemonAdapters interface {
 // Manager. It contains all the dependencies needed to
 // manage multiple supply commitment state machines, one for each asset group.
 type ManagerCfg struct {
-	// AnchoringWatcher is the re-org watcher broadcast commitments
-	// register with as speculative anchorings; finalization is then
-	// act-gated on burial.
-	AnchoringWatcher AnchoringRegistrar
-
-	// AnchoringThreshold is the depth at which a commitment is
-	// act-confirmed (buried).
-	AnchoringThreshold uint32
-
 	// TreeView is the interface that allows the state machine to obtain an
 	// up-to-date snapshot of the root supply tree, and the relevant set of
 	// subtrees.
@@ -87,7 +78,7 @@ type ManagerCfg struct {
 	// Chain is our access to the current main chain.
 	//
 	// TODO(roasbeef): can make a slimmer version of
-	Chain tapnode.ChainBridge
+	Chain tapgarden.ChainBridge
 
 	// SupplySyncer is used to insert supply commitments into the remote
 	// universe server.
@@ -447,8 +438,6 @@ func (m *Manager) startAssetSM(ctx context.Context,
 		CommitConfTarget:   DefaultCommitConfTarget,
 		ChainParams:        m.cfg.ChainParams,
 		IgnoreCheckerCache: m.cfg.IgnoreCheckerCache,
-		AnchoringWatcher:   m.cfg.AnchoringWatcher,
-		AnchoringThreshold: m.cfg.AnchoringThreshold,
 		IdleCommitInterval: m.cfg.IdleCommitInterval,
 		AutoPublishPending: m.cfg.AutoPublishPending,
 	}
@@ -472,26 +461,6 @@ func (m *Manager) startAssetSM(ctx context.Context,
 			state.SupplyTransition = transition
 		}
 	})
-
-	// A restored broadcast state must hold its anchoring before the
-	// machine resumes and rests on it. A record persisted before the
-	// watcher existed has none; adopt it now. The state it watches
-	// over is already durable, so the registration stakes nothing.
-	if broadcast, ok := initialState.(*CommitBroadcastState); ok &&
-		broadcast.SupplyTransition.NewCommitment.Txn != nil {
-
-		registered, err := registerCommitAnchoring(
-			ctx, env, &broadcast.SupplyTransition,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to adopt commit "+
-				"anchoring: %w", err)
-		}
-		if registered {
-			log.Infof("Registered missing commit anchoring for "+
-				"group %v on restart", assetSpec)
-		}
-	}
 
 	// Create a new error reporter for the state machine.
 	errorReporter := NewErrorReporter(assetSpec)
