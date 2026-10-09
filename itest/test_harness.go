@@ -203,6 +203,7 @@ func (h *harnessTest) shutdown(_ *testing.T) error {
 	if err != nil {
 		return fmt.Errorf("unable to stop tapd: %w", err)
 	}
+	h.tapd.purgeDataDir()
 
 	return nil
 }
@@ -613,6 +614,7 @@ func shutdownAndAssert(t *harnessTest, node *node.HarnessNode,
 
 	if tapd != nil {
 		require.NoError(t.t, tapd.stop(!*noDelete))
+		tapd.purgeDataDir()
 	}
 
 	t.lndHarness.Shutdown(node)
