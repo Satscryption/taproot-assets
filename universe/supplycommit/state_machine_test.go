@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -495,7 +494,7 @@ func (h *supplyCommitTestHarness) expectBroadcastAndConfRegistration() {
 
 	h.mockChain.On(
 		"GetBlockByHeight", mock.Anything, mock.Anything,
-	).Return(nil, fmt.Errorf("block not found"))
+	).Return(wire.NewMsgBlock(&wire.BlockHeader{}), nil).Maybe()
 
 	h.mockDaemon.On(
 		"RegisterConfirmationsNtfn", mock.Anything, mock.Anything,
@@ -1256,6 +1255,37 @@ func TestSupplyCommitBroadcastStateTransitions(t *testing.T) {
 
 // TestSupplyCommitFinalizeStateTransitions tests the transitions from the
 // CommitFinalizeState.
+func TestCommitFinalizeStateResumeFinalizeEvent(t *testing.T) {
+	t.Parallel()
+
+	randGroupKey := test.RandPubKey(t)
+	defaultAssetSpec := asset.NewSpecifierFromGroupKey(*randGroupKey)
+	initialTransition := SupplyStateTransition{
+		NewCommitment: RootCommitment{
+			Txn: wire.NewMsgTx(2),
+		},
+		ChainProof: lfn.Some(ChainProof{}),
+	}
+
+	h := newSupplyCommitTestHarness(t, &harnessCfg{
+		initialState: &CommitFinalizeState{
+			SupplyTransition: initialTransition,
+		},
+		assetSpec: defaultAssetSpec,
+	})
+	h.start()
+	defer h.stopAndAssert()
+
+	h.expectAssetLookup()
+	h.expectSupplySyncer()
+	h.expectApplyStateTransition()
+	h.expectBindDanglingUpdatesWithEvents([]SupplyUpdateEvent{})
+	h.expectIgnoreCheckerCacheInvalidation()
+
+	h.sendEvent(&FinalizeEvent{})
+	h.assertStateTransitions(&DefaultState{})
+}
+
 func TestSupplyCommitFinalizeStateTransitions(t *testing.T) {
 	t.Parallel()
 

@@ -2838,7 +2838,18 @@ func UpdateAndMineSupplyCommit(t *testing.T, ctx context.Context,
 	minedBlocks := MineBlocks(t, miner, 1, expectedTxsInBlock)
 	require.Len(t, minedBlocks, 1)
 
+	MineSupplyCommitBurial(t, miner)
+
 	return minedBlocks
+}
+
+// MineSupplyCommitBurial mines the empty blocks required after a supply
+// commitment transaction is included so tapd can finalize at burial depth.
+func MineSupplyCommitBurial(t *testing.T, miner *miner.HarnessMiner) {
+	const supplyCommitBurialDepth = 6
+	if supplyCommitBurialDepth > 1 {
+		MineBlocks(t, miner, supplyCommitBurialDepth-1, 0)
+	}
 }
 
 // WaitForSupplyCommit waits for a supply commitment to be available and returns

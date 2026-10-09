@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 
+	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/txscript"
@@ -20,6 +23,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"slices"
 )
 
@@ -158,6 +162,18 @@ func customGenesisPsbt(chainParams address.ChainParams,
 		return zero, fmt.Errorf("custom anchor PSBT output maps don't " +
 			"match unsigned transaction outputs")
 	}
+
+	var buf bytes.Buffer
+	if err := packet.Serialize(&buf); err != nil {
+		return zero, fmt.Errorf("unable to copy custom anchor "+
+			"PSBT: %w", err)
+	}
+	copied, err := psbt.NewFromRawBytes(&buf, false)
+	if err != nil {
+		return zero, fmt.Errorf("unable to copy custom anchor "+
+			"PSBT: %w", err)
+	}
+	packet = copied
 	if int(assetAnchorOutIdx) >= len(packet.UnsignedTx.TxOut) {
 		return zero, fmt.Errorf("asset anchor output index %d out of "+
 			"range", assetAnchorOutIdx)
@@ -283,9 +299,14 @@ func customGenesisPsbt(chainParams address.ChainParams,
 		return zero, fmt.Errorf("pre-commitment output index specified " +
 			"for batch without supply commitments")
 	}
+	changeIdx := uint32(0)
+	if changeOutputIndex >= 0 {
+		changeIdx = uint32(changeOutputIndex)
+	}
+
 	indexes := AnchorTxOutputIndexes{
 		AssetAnchorOutIdx: assetAnchorOutIdx,
-		ChangeOutIdx:      0,
+		ChangeOutIdx:      changeIdx,
 		PreCommitOutIdx:   preCommitIdx,
 	}
 
@@ -354,6 +375,19 @@ func leaseCustomAnchorOutpoints(ctx context.Context, wallet WalletAnchor,
 	}
 
 	return locked, nil
+}
+
+// renewCustomAnchorLeases extends wallet leases while a prepared batch waits
+// for an external signature.
+func renewCustomAnchorLeases(ctx context.Context, wallet WalletAnchor,
+	leaseID CustomAnchorLeaseID, funded *FundedMintAnchorPsbt) error {
+
+	if funded == nil || funded.Pkt == nil {
+		return nil
+	}
+
+	_, err := acquireCustomAnchorLeases(ctx, wallet, leaseID, funded.Pkt)
+	return err
 }
 
 func releaseCustomAnchorOutpoints(ctx context.Context, wallet WalletAnchor,
@@ -502,7 +536,25 @@ func (c *ChainPlanter) prepareBatch(ctx context.Context,
 			nextState)
 	}
 
+	err = c.cfg.Log.UpdateBatchState(
+		ctx, batch.BatchKey.PubKey, BatchStateCommitted,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to persist prepared batch: %w",
+			err)
+	}
+
 	batch.UpdateState(BatchStateCommitted)
+
+	err = renewCustomAnchorLeases(
+		ctx, c.cfg.Wallet, customAnchorLeaseID(batch.BatchKey.PubKey),
+		batch.GenesisPacket,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to renew custom anchor leases: %w",
+			err)
+	}
+
 	return batch, nil
 }
 
@@ -626,9 +678,93 @@ func mergeSignedCustomPsbt(stored,
 	return merged, nil
 }
 
+func validateAnchorInputSigHashTypes(packet *psbt.Packet) error {
+	for idx, pIn := range packet.Inputs {
+		if pIn.FinalScriptWitness == nil {
+			continue
+		}
+
+		if len(pIn.FinalScriptWitness) == 0 {
+			continue
+		}
+
+		reader := bytes.NewReader(pIn.FinalScriptWitness)
+		itemCount, err := wire.ReadVarInt(reader, 0)
+		if err != nil || itemCount == 0 {
+			continue
+		}
+
+		itemSize, err := wire.ReadVarInt(reader, 0)
+		if err != nil {
+			return fmt.Errorf("unable to parse witness for input %d: %w",
+				idx, err)
+		}
+		if itemSize > uint64(reader.Len()) {
+			return fmt.Errorf("witness item exceeds serialized data")
+		}
+
+		sig := make([]byte, itemSize)
+		if _, err := io.ReadFull(reader, sig); err != nil {
+			return fmt.Errorf("unable to read witness signature: %w",
+				err)
+		}
+		if len(sig) == 0 {
+			continue
+		}
+
+		hashType := txscript.SigHashType(sig[len(sig)-1])
+		switch hashType {
+		case txscript.SigHashAll, txscript.SigHashDefault:
+			continue
+
+		default:
+			return fmt.Errorf("input %d uses disallowed sighash %v",
+				idx, hashType)
+		}
+	}
+
+	return nil
+}
+
+func validateCustomAnchorFeeRate(ctx context.Context, wallet WalletAnchor,
+	packet *psbt.Packet) error {
+
+	fee, err := packet.GetTxFee()
+	if err != nil {
+		return fmt.Errorf("unable to determine custom anchor fee: %w", err)
+	}
+
+	signedTx, err := psbt.Extract(packet)
+	if err != nil {
+		return fmt.Errorf("unable to extract custom anchor transaction: %w",
+			err)
+	}
+
+	weight := lntypes.WeightUnit(
+		blockchain.GetTransactionWeight(btcutil.NewTx(signedTx)),
+	)
+
+	minRelayFee, err := wallet.MinRelayFee(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to obtain minimum relay fee: %w", err)
+	}
+
+	minFee := minRelayFee.FeeForWeight(weight)
+	if btcutil.Amount(fee) < minFee {
+		return fmt.Errorf("fee %d below minimum relay fee %d", fee,
+			minFee)
+	}
+
+	return nil
+}
+
 func validateFinalizedAnchorPsbt(packet *psbt.Packet) error {
 	tx, err := psbt.Extract(packet)
 	if err != nil {
+		return err
+	}
+
+	if err := validateAnchorInputSigHashTypes(packet); err != nil {
 		return err
 	}
 

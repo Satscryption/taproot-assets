@@ -287,6 +287,27 @@ func (l *LndRpcWalletAnchor) LeaseInputs(ctx context.Context,
 		locked = append(locked, op)
 	}
 
+	lockedSet := make(map[wire.OutPoint]struct{}, len(locked))
+	for _, op := range locked {
+		lockedSet[op] = struct{}{}
+	}
+	for _, op := range ops {
+		lease, leased := leaseByOutpoint[op]
+		_, walletOwned := walletInputs[op]
+		if leased && lease.LockID != lockID {
+			continue
+		}
+		if !walletOwned && !leased {
+			continue
+		}
+		if _, ok := lockedSet[op]; !ok {
+			return locked, fmt.Errorf(
+				"wallet input %v was not locked for custom "+
+					"anchor batch", op,
+			)
+		}
+	}
+
 	return locked, nil
 }
 

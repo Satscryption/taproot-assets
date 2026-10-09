@@ -619,6 +619,10 @@ func checkBurnLeafInputs(burnProof *proof.Proof) error {
 	seen := make(map[asset.PrevID]struct{}, len(burnProof.AdditionalInputs))
 	for idx := range burnProof.AdditionalInputs {
 		inputFile := &burnProof.AdditionalInputs[idx]
+		if inputFile.IsEmpty() {
+			return fmt.Errorf("empty proof file")
+		}
+
 		last, err := inputFile.LastProof()
 		if err != nil {
 			return fmt.Errorf("burn input %d: %w", idx, err)

@@ -1865,7 +1865,9 @@ func testSupplyVerifyPeerNode(t *harnessTest) {
 	assertFetchCommitResponse(t, thirdSupplyCommitResp, peerFetchResp3)
 }
 
-const supplyIdleCommitInterval = uint32(3)
+// Keep the idle interval well above supply-commit burial depth so the extra
+// blocks mined for finalization do not publish the idle successor early.
+const supplyIdleCommitInterval = uint32(12)
 
 // testSupplyCommitIdleTick verifies that a locally controlled asset group
 // publishes an empty ancestry-linked successor supply commitment once the
@@ -1880,7 +1882,7 @@ func testSupplyCommitIdleTick(t *harnessTest) {
 		"universe.supply-idle-commit-interval",
 		fmt.Sprintf("%d", supplyIdleCommitInterval),
 	)
-	require.NoError(t.t, t.tapd.stop(!*noDelete))
+	require.NoError(t.t, t.tapd.stop(false))
 	require.NoError(t.t, t.tapd.start(false))
 
 	t.Log("Minting asset with supply commitments enabled")
@@ -1925,6 +1927,7 @@ func testSupplyCommitIdleTick(t *harnessTest) {
 		// without expecting the tx yet, then mine the inclusion block.
 		MineBlocks(t.t, miner, 1, 0)
 		MineBlocks(t.t, miner, 1, 1)
+		MineSupplyCommitBurial(t.t, miner)
 
 		return WaitForSupplyCommit(
 			t.t, ctxb, t.tapd, groupKeyBytes,
@@ -1970,8 +1973,9 @@ func testSupplyCommitIdleTick(t *harnessTest) {
 	_, err := WaitForNTxsInMempool(miner, 1, minerMempoolTimeout)
 	require.NoError(t.t, err)
 
-	require.NoError(t.t, t.tapd.stop(!*noDelete))
+	require.NoError(t.t, t.tapd.stop(false))
 	MineBlocks(t.t, miner, 1, 1)
+	MineSupplyCommitBurial(t.t, miner)
 	require.NoError(t.t, t.tapd.start(false))
 
 	secondIdleCommit, _ := WaitForSupplyCommit(

@@ -54,6 +54,10 @@ var allTestCases = []*testCase{
 		test: testMintCustomAnchorPsbt,
 	},
 	{
+		name: "mint custom anchor psbt restart",
+		test: testMintCustomAnchorPsbtRestart,
+	},
+	{
 		name: "mint external group key chantools",
 		test: testMintExternalGroupKeyChantools,
 	},

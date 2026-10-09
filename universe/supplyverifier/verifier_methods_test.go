@@ -13,6 +13,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	internaltest "github.com/lightninglabs/taproot-assets/internal/test"
+	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/universe"
@@ -1074,5 +1075,44 @@ func TestVerifyBurnLeaf(t *testing.T) {
 
 		err = v.verifyBurnLeaf(ctx, assetSpec, burnEntry)
 		require.NoError(t, err)
+
+		// A bare suffix has no provenance. Universe servers
+		// verify with a nil prior snapshot, so this is what a
+		// burn leaf looked like before the sender embedded the
+		// input proofs (lightninglabs/taproot-assets#2285).
+		bare := burnProof
+		bare.AdditionalInputs = nil
+		burnEntry.BurnProof = &bare
+
+		err = v.verifyBurnLeaf(ctx, assetSpec, burnEntry)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "missing asset input")
+
+		// Two embedded files for one input must not collapse
+		// to whichever copy was verified last.
+		duplicated := burnProof
+		duplicated.AdditionalInputs = append(
+			append(
+				[]proof.File{}, burnProof.AdditionalInputs...,
+			),
+			burnProof.AdditionalInputs...,
+		)
+		burnEntry.BurnProof = &duplicated
+
+		err = v.verifyBurnLeaf(ctx, assetSpec, burnEntry)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "duplicate burn input")
+
+		// An embedded file that does not decode as a proof
+		// chain fails closed.
+		malformed := burnProof
+		malformed.AdditionalInputs = []proof.File{
+			*proof.NewEmptyFile(proof.V0),
+		}
+		burnEntry.BurnProof = &malformed
+
+		err = v.verifyBurnLeaf(ctx, assetSpec, burnEntry)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "empty proof file")
 	})
 }

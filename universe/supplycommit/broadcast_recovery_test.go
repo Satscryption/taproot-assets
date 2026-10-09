@@ -48,4 +48,76 @@ func TestFindCommitConfirmation(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.False(t, missing.IsSome())
+
+	delete(chain.BlocksByHeight, 5)
+	_, err = findCommitConfirmation(
+		context.Background(), chain, commitTx,
+	)
+	require.Error(t, err)
+}
+
+func TestIsCommitBuried(t *testing.T) {
+	depth := uint32(DefaultCommitConfTarget)
+
+	require.False(t, isCommitBuried(12, 10, depth))
+	require.True(t, isCommitBuried(15, 10, depth))
+}
+
+func TestTryRecoverBuriedBroadcastNotBuried(t *testing.T) {
+	commitTx := wire.NewMsgTx(2)
+	commitTx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
+
+	header := wire.BlockHeader{}
+	block := wire.NewMsgBlock(&header)
+	block.AddTransaction(commitTx)
+
+	chain := tapgarden.NewMockChainBridge()
+	chain.BlocksByHeight = map[int64]*wire.MsgBlock{}
+	for height := int64(1); height <= 12; height++ {
+		if height == 10 {
+			chain.BlocksByHeight[height] = block
+			continue
+		}
+		chain.BlocksByHeight[height] = wire.NewMsgBlock(&header)
+	}
+	chain.TipHeight = 12
+
+	env := &Environment{
+		Chain:            chain,
+		CommitConfTarget: DefaultCommitConfTarget,
+	}
+
+	state := &CommitBroadcastState{
+		SupplyTransition: SupplyStateTransition{
+			NewCommitment: RootCommitment{Txn: commitTx},
+		},
+	}
+
+	transition, recovered, err := tryRecoverBuriedBroadcast(
+		context.Background(), state, env,
+	)
+	require.NoError(t, err)
+	require.False(t, recovered)
+	require.Nil(t, transition)
+}
+
+func TestTryRecoverBuriedBroadcastScanError(t *testing.T) {
+	commitTx := wire.NewMsgTx(2)
+	commitTx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
+
+	chain := tapgarden.NewMockChainBridge()
+	chain.TipHeight = 5
+	chain.BlocksByHeight = map[int64]*wire.MsgBlock{}
+
+	env := &Environment{Chain: chain}
+	state := &CommitBroadcastState{
+		SupplyTransition: SupplyStateTransition{
+			NewCommitment: RootCommitment{Txn: commitTx},
+		},
+	}
+
+	_, _, err := tryRecoverBuriedBroadcast(
+		context.Background(), state, env,
+	)
+	require.Error(t, err)
 }

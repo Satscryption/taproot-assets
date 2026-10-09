@@ -127,11 +127,6 @@ type tapdHarness struct {
 	// logFile is the log file for this tapd instance's output.
 	logFile *os.File
 
-	// pendingDataDeletion is set when stop requests a data directory wipe.
-	// The wipe is deferred until purgeDataDir runs so a subsequent start on
-	// the same harness keeps state across restarts.
-	pendingDataDeletion bool
-
 	ht *harnessTest
 
 	taprpc.TaprootAssetsClient
@@ -623,8 +618,6 @@ func (hs *tapdHarness) updateLndNode(lndNode *node.HarnessNode) {
 // start spins up the tapd process and waits for it to be ready for gRPC
 // connections.
 func (hs *tapdHarness) start(expectErrExit bool) error {
-	hs.pendingDataDeletion = false
-
 	//nolint:gosec
 	hs.cmd = exec.Command("./tapd-itest", hs.cliArgs...)
 
@@ -782,22 +775,12 @@ func (hs *tapdHarness) stop(deleteData bool) error {
 	// Reset RPC clients so they get re-created on next start().
 	hs.TaprootAssetsClient = nil
 
-	if deleteData && !*noDelete {
-		hs.pendingDataDeletion = true
+	// Clean up data directory.
+	if deleteData {
+		_ = os.RemoveAll(hs.cfg.BaseDir)
 	}
 
 	return stopErr
-}
-
-// purgeDataDir removes the tapd data directory when a prior stop requested
-// deletion and the harness is not being restarted.
-func (hs *tapdHarness) purgeDataDir() {
-	if !hs.pendingDataDeletion || *noDelete {
-		return
-	}
-
-	_ = os.RemoveAll(hs.cfg.BaseDir)
-	hs.pendingDataDeletion = false
 }
 
 // assetIDWithBalance returns the asset ID of an asset that has at least the

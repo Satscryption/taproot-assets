@@ -173,3 +173,49 @@ func clonePsbt(t *testing.T, pkt *psbt.Packet) *psbt.Packet {
 	require.NoError(t, err)
 	return clone
 }
+
+func TestCustomGenesisPsbtDoesNotMutateCallerPacket(t *testing.T) {
+	original := testCustomAnchorPacket(t)
+	before := clonePsbt(t, original)
+
+	_, err := customGenesisPsbt(
+		address.TestNet3Tap, nil, original, 0, -1, noneUint32(),
+	)
+	require.NoError(t, err)
+
+	after := clonePsbt(t, original)
+	require.Equal(t, before.UnsignedTx.TxOut[0].Value,
+		after.UnsignedTx.TxOut[0].Value)
+	require.False(t, isCustomAnchorPsbt(original))
+}
+
+func serializeFinalWitness(t *testing.T, hashType txscript.SigHashType) []byte {
+	t.Helper()
+
+	sig := bytes.Repeat([]byte{1}, 64)
+	sig = append(sig, byte(hashType))
+
+	var buf bytes.Buffer
+	require.NoError(t, psbt.WriteTxWitness(&buf, [][]byte{sig}))
+
+	return buf.Bytes()
+}
+
+func TestValidateAnchorInputSigHashTypesRejectsNonAll(t *testing.T) {
+	pkt := testCustomAnchorPacket(t)
+	pkt.Inputs[0].FinalScriptWitness = serializeFinalWitness(
+		t, txscript.SigHashSingle,
+	)
+
+	err := validateAnchorInputSigHashTypes(pkt)
+	require.ErrorContains(t, err, "disallowed sighash")
+}
+
+func TestValidateAnchorInputSigHashTypesAllowsDefault(t *testing.T) {
+	pkt := testCustomAnchorPacket(t)
+	pkt.Inputs[0].FinalScriptWitness = serializeFinalWitness(
+		t, txscript.SigHashDefault,
+	)
+
+	require.NoError(t, validateAnchorInputSigHashTypes(pkt))
+}

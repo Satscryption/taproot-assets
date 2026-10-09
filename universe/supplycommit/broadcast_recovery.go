@@ -6,9 +6,7 @@ import (
 
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/fn"
-	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
-	lfn "github.com/lightningnetwork/lnd/fn/v2"
 )
 
 const (
@@ -18,9 +16,8 @@ const (
 )
 
 // findCommitConfirmation scans recent chain history for a commitment
-// transaction that already reached at least one confirmation. This covers
-// restarts that miss the RegisterConf notification because the transaction
-// confirmed while the daemon was stopped.
+// transaction. This covers restarts that miss the RegisterConf notification
+// because the transaction confirmed while the daemon was stopped.
 func findCommitConfirmation(ctx context.Context,
 	chain tapgarden.ChainBridge, commitTx *wire.MsgTx) (fn.Option[*ConfEvent],
 	error) {
@@ -44,7 +41,9 @@ func findCommitConfirmation(ctx context.Context,
 	for height := tip; height >= start; height-- {
 		block, err := chain.GetBlockByHeight(ctx, int64(height))
 		if err != nil {
-			continue
+			return fn.None[*ConfEvent](), fmt.Errorf(
+				"unable to fetch block %d: %w", height, err,
+			)
 		}
 
 		for idx, blockTx := range block.Transactions {
@@ -64,49 +63,9 @@ func findCommitConfirmation(ctx context.Context,
 	return fn.None[*ConfEvent](), nil
 }
 
-// transitionForConfEvent builds the finalize transition for a recovered
-// confirmation event.
-func transitionForConfEvent(c *CommitBroadcastState, env *Environment,
-	conf *ConfEvent) (*StateTransition, error) {
-
-	stateTransition := c.SupplyTransition
-
-	merkleProof, err := proof.NewTxMerkleProof(
-		conf.Block.Transactions, int(conf.TxIndex),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create merkle proof: %w", err)
-	}
-
-	stateTransition.ChainProof = lfn.Some(ChainProof{
-		Header:      conf.Block.Header,
-		BlockHeight: conf.BlockHeight,
-		MerkleProof: *merkleProof,
-		TxIndex:     conf.TxIndex,
-	})
-
-	ctx := context.Background()
-	err = env.StateLog.CommitState(
-		ctx, env.AssetSpec, &CommitFinalizeState{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to commit state transition: %w",
-			err)
-	}
-
-	return &StateTransition{
-		NextState: &CommitFinalizeState{
-			SupplyTransition: stateTransition,
-		},
-		NewEvents: lfn.Some(FsmEvent{
-			InternalEvent: []Event{&FinalizeEvent{}},
-		}),
-	}, nil
-}
-
-// tryRecoverBroadcastConfirmation finalizes an in-flight broadcast when its
-// commitment transaction is already confirmed on chain.
-func tryRecoverBroadcastConfirmation(ctx context.Context,
+// tryRecoverBuriedBroadcast finalizes an in-flight broadcast when its
+// commitment transaction is already buried on chain.
+func tryRecoverBuriedBroadcast(ctx context.Context,
 	c *CommitBroadcastState, env *Environment) (*StateTransition, bool,
 	error) {
 
@@ -127,7 +86,19 @@ func tryRecoverBroadcastConfirmation(ctx context.Context,
 		return nil, false, nil
 	}
 
-	transition, err := transitionForConfEvent(c, env, conf)
+	tip, err := env.Chain.CurrentHeight(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to get chain tip: %w", err)
+	}
+
+	burialDepth := commitBurialDepth(env)
+	if !isCommitBuried(tip, conf.BlockHeight, burialDepth) {
+		return nil, false, nil
+	}
+
+	transition, err := transitionForBuriedConf(
+		ctx, env, c.SupplyTransition, conf,
+	)
 	if err != nil {
 		return nil, false, err
 	}

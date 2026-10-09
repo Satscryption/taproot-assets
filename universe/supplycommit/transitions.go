@@ -13,7 +13,6 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -1118,7 +1117,7 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 	// confirms.
 	case *CommitTickEvent:
 		ctx := context.Background()
-		transition, recovered, err := tryRecoverBroadcastConfirmation(
+		transition, recovered, err := tryRecoverBuriedBroadcast(
 			ctx, c, env,
 		)
 		if err != nil {
@@ -1136,7 +1135,7 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 		}
 
 		recCtx := context.Background()
-		transition, recovered, err := tryRecoverBroadcastConfirmation(
+		transition, recovered, err := tryRecoverBuriedBroadcast(
 			recCtx, c, env,
 		)
 		if err != nil {
@@ -1193,7 +1192,7 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 			Txid:       commitTx.TxHash(),
 			PkScript:   pkScript,
 			HeightHint: currentHeight,
-			NumConfs:   lfn.Some(uint32(1)),
+			NumConfs:   lfn.Some(commitBurialDepth(env)),
 			FullBlock:  true,
 			PostConfMapper: lfn.Some[protofsm.ConfMapper[Event]](
 				confMapper,
@@ -1218,51 +1217,15 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 	// the CommitFinalizeState, which will finalize our supply transition
 	// with the new root and sub-tree information.
 	case *ConfEvent:
-		stateTransition := c.SupplyTransition
-
-		merkleProof, err := proof.NewTxMerkleProof(
-			newEvent.Block.Transactions, int(newEvent.TxIndex),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create merkle "+
-				"proof: %w", err)
-		}
-
-		// Now that the transaction has been confirmed, we'll construct
-		// a merkle proof for the commitment transaction. This'll be
-		// used to prove that the supply commit is canonical.
-		stateTransition.ChainProof = lfn.Some(ChainProof{
-			Header:      newEvent.Block.Header,
-			BlockHeight: newEvent.BlockHeight,
-			MerkleProof: *merkleProof,
-			TxIndex:     newEvent.TxIndex,
-		})
-
-		prefixedLog.Tracef("Supply commitment txn confirmed "+
+		prefixedLog.Tracef("Supply commitment txn buried "+
 			"in block %d (hash=%v): %v",
 			newEvent.BlockHeight, newEvent.Block.Header.BlockHash(),
 			limitSpewer.Sdump(c.SupplyTransition.NewCommitment.Txn))
 
-		// The commitment has been confirmed, so we'll transition to the
-		// finalize state, but also log on disk that we no longer need
-		// to request confirmations on restart.
 		ctx := context.Background()
-		err = env.StateLog.CommitState(
-			ctx, env.AssetSpec, &CommitFinalizeState{},
+		return transitionForBuriedConf(
+			ctx, env, c.SupplyTransition, newEvent,
 		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to commit "+
-				"state transition: %w", err)
-		}
-
-		return &StateTransition{
-			NextState: &CommitFinalizeState{
-				SupplyTransition: stateTransition,
-			},
-			NewEvents: lfn.Some(FsmEvent{
-				InternalEvent: []Event{&FinalizeEvent{}}},
-			),
-		}, nil
 
 	// An idle tick is a no-op while a commitment cycle is in flight.
 	case *IdleTickEvent:

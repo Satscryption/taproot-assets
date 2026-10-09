@@ -638,6 +638,31 @@ func (c *ChainPlanter) Start() error {
 				}
 			}
 
+			if batchState == BatchStateCommitted &&
+				batch.GenesisPacket != nil &&
+				isCustomAnchorPsbt(batch.GenesisPacket.Pkt) {
+
+				if _, err := psbt.Extract(
+					batch.GenesisPacket.Pkt,
+				); err != nil {
+
+					log.Infof("Skipping ChainCaretaker(%x) "+
+						"awaiting external custom anchor "+
+						"signature", batchKey)
+					if c.pendingBatch == nil {
+						c.pendingBatch = batch
+					}
+					_ = renewCustomAnchorLeases(
+						ctx, c.cfg.Wallet,
+						customAnchorLeaseID(
+							batch.BatchKey.PubKey,
+						),
+						batch.GenesisPacket,
+					)
+					continue
+				}
+			}
+
 			log.Infof("Launching ChainCaretaker(%x)", batchKey)
 			caretaker := c.newCaretakerForBatch(batch, nil)
 			if err := caretaker.Start(); err != nil {
@@ -1865,10 +1890,23 @@ func (c *ChainPlanter) cancelMintingBatch(ctx context.Context,
 	log.Infof("Cancelling MintingBatch(key=%x, num_assets=%v)",
 		batchKeySerialized, len(c.pendingBatch.Seedlings))
 
+	if c.pendingBatch.State() == BatchStateCommitted &&
+		c.pendingBatch.GenesisPacket != nil &&
+		isCustomAnchorPsbt(c.pendingBatch.GenesisPacket.Pkt) {
+
+		return fmt.Errorf("prepared custom anchor batch is not " +
+			"cancellable")
+	}
+
 	// If the target batch was not assigned a caretaker, we only need to
 	// update the batch state on disk to cancel it.
+	cancelState := BatchStateSeedlingCancelled
+	if c.pendingBatch.State() == BatchStateCommitted {
+		cancelState = BatchStateSproutCancelled
+	}
+
 	err := c.cfg.Log.UpdateBatchState(
-		ctx, batchKey, BatchStateSeedlingCancelled,
+		ctx, batchKey, cancelState,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to cancel minting batch: %w", err)
@@ -2101,6 +2139,30 @@ func (c *ChainPlanter) gardener() {
 				}
 
 			case reqTypeFinalizeBatch:
+				finalizeReqParams, paramErr :=
+					typedParam[FinalizeParams](req)
+				if paramErr != nil {
+					req.Error(fmt.Errorf("bad finalize "+
+						"params: %w", paramErr))
+					break
+				}
+
+				ctx, cancel := c.WithCtxQuit()
+				c.attachPendingCustomAnchorBatch(ctx)
+				cancel()
+
+				if c.pendingBatch == nil &&
+					finalizeReqParams.SignedPsbt != nil {
+
+					if batch, ok := c.customAnchorBatchAwaitingRetry(
+						finalizeReqParams.SignedPsbt,
+					); ok {
+
+						req.Resolve(batch.Copy())
+						break
+					}
+				}
+
 				if c.pendingBatch == nil {
 					req.Error(fmt.Errorf("no pending " +
 						"batch"))
@@ -2110,14 +2172,6 @@ func (c *ChainPlanter) gardener() {
 				batchKey := c.pendingBatch.BatchKey.PubKey
 				batchKeySerial := asset.ToSerialized(batchKey)
 				log.Infof("Finalizing batch %x", batchKeySerial)
-
-				finalizeReqParams, err :=
-					typedParam[FinalizeParams](req)
-				if err != nil {
-					req.Error(fmt.Errorf("bad finalize "+
-						"params: %w", err))
-					break
-				}
 
 				caretaker, err := c.finalizeBatch(
 					*finalizeReqParams,
@@ -2725,6 +2779,70 @@ func (c *ChainPlanter) sealBatch(ctx context.Context, params SealParams,
 	return batchWithGroupInfo, nil
 }
 
+// attachPendingCustomAnchorBatch restores the in-memory pending batch when a
+// prepared custom-anchor mint is waiting for an external signature.
+func (c *ChainPlanter) attachPendingCustomAnchorBatch(ctx context.Context) {
+	if c.pendingBatch != nil {
+		return
+	}
+
+	batches, err := c.cfg.Log.FetchNonFinalBatches(ctx)
+	if err != nil {
+		log.Warnf("Unable to restore pending custom anchor batch: %v",
+			err)
+		return
+	}
+
+	for _, batch := range batches {
+		if batch.State() != BatchStateCommitted {
+			continue
+		}
+		if batch.GenesisPacket == nil ||
+			!isCustomAnchorPsbt(batch.GenesisPacket.Pkt) {
+
+			continue
+		}
+		if _, err := psbt.Extract(batch.GenesisPacket.Pkt); err == nil {
+			continue
+		}
+
+		c.pendingBatch = batch
+		return
+	}
+}
+
+// customAnchorBatchAwaitingRetry returns a batch that already accepted an
+// identical signed PSBT and reached broadcast.
+func (c *ChainPlanter) customAnchorBatchAwaitingRetry(
+	signed *psbt.Packet) (*MintingBatch, bool) {
+
+	for _, caretaker := range c.caretakers {
+		batch := caretaker.cfg.Batch
+		if batch.GenesisPacket == nil ||
+			!isCustomAnchorPsbt(batch.GenesisPacket.Pkt) {
+
+			continue
+		}
+		if batch.State() < BatchStateBroadcast {
+			continue
+		}
+
+		merged, err := mergeSignedCustomPsbt(
+			batch.GenesisPacket.Pkt, signed,
+		)
+		if err != nil {
+			continue
+		}
+		if _, err := psbt.Extract(merged); err != nil {
+			continue
+		}
+
+		return batch, true
+	}
+
+	return nil, false
+}
+
 // finalizeBatch creates a new caretaker for the batch and starts it.
 func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 	error) {
@@ -2755,11 +2873,35 @@ func (c *ChainPlanter) finalizeBatch(params FinalizeParams) (*BatchCaretaker,
 		if err != nil {
 			return nil, err
 		}
+		ctx, cancel := c.WithCtxQuit()
+		defer cancel()
+
 		if err := validateFinalizedAnchorPsbt(merged); err != nil {
 			return nil, fmt.Errorf("externally signed PSBT is not fully "+
 				"valid: %w", err)
 		}
+		if err := validateCustomAnchorFeeRate(ctx, c.cfg.Wallet, merged); err != nil {
+			return nil, fmt.Errorf("custom anchor fee rate below relay "+
+				"minimum: %w", err)
+		}
+
+		if err := renewCustomAnchorLeases(
+			ctx, c.cfg.Wallet,
+			customAnchorLeaseID(c.pendingBatch.BatchKey.PubKey),
+			c.pendingBatch.GenesisPacket,
+		); err != nil {
+			return nil, fmt.Errorf("unable to renew custom anchor "+
+				"leases: %w", err)
+		}
+
 		c.pendingBatch.GenesisPacket.Pkt = merged
+
+		batchKey := asset.ToSerialized(c.pendingBatch.BatchKey.PubKey)
+		if existing, ok := c.caretakers[batchKey]; ok &&
+			c.pendingBatch.State() >= BatchStateBroadcast {
+
+			return existing, nil
+		}
 
 		caretaker := c.newCaretakerForBatch(c.pendingBatch, nil)
 		if err := caretaker.Start(); err != nil {

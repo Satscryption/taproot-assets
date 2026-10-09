@@ -528,21 +528,22 @@ func (m *Manager) startAssetSM(ctx context.Context,
 	// publish the wallet rejected, would otherwise leave a signed
 	// transaction nobody broadcasts and a group that can never
 	// advance. Publishing a transaction the network already has is
-	// harmless. The re-org watcher already holds the commitment and
-	// finalizes it out of band, so a tick follows: the resting
-	// handler re-derives the machine's position from the durable
-	// record. Rows persisted by the legacy finalize state load as
-	// this state too — a pending transition awaiting act-level
-	// finality is exactly what the broadcast state means.
+	// harmless. A tick may also recover burial-finalization when the
+	// commitment confirmed while tapd was down.
 	case *CommitBroadcastState:
 		if state.SupplyTransition.NewCommitment.Txn != nil {
 			newSm.SendEvent(ctx, &BroadcastEvent{})
 		}
 		newSm.SendEvent(ctx, &CommitTickEvent{})
 
-	// The watcher's finalizer and compensator park bound updates here
-	// for the machine to pick up, so a tick resumes the interrupted
-	// cycle.
+	// Once we get a burial confirmation, then we'll transition to the
+	// CommitFinalizeState. If we crashed right after that, then
+	// we'll also send the finalize event so we can apply
+	// everything, and transition back to the normal default state.
+	case *CommitFinalizeState:
+		newSm.SendEvent(ctx, &FinalizeEvent{})
+
+	// Parked updates resume on tick after an interrupted cycle.
 	case *UpdatesPendingState:
 		newSm.SendEvent(ctx, &CommitTickEvent{})
 	}
