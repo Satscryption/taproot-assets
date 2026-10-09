@@ -111,6 +111,11 @@ type ManagerCfg struct {
 	// updates when the next block arrives, instead of waiting for a manual
 	// UpdateSupplyCommit call.
 	AutoPublishPending bool
+
+	// ResumeInterruptedOnStart, if true, loads local supply-commit state
+	// machines during Start so in-flight commitments can finalize without
+	// waiting for the next block epoch.
+	ResumeInterruptedOnStart bool
 }
 
 // autoCommitEnabled returns true if the manager should emit an idle tick for
@@ -212,8 +217,36 @@ func (m *Manager) Start() error {
 		m.idleTickLoop(ctx, blockChan, errChan, subCancel)
 	}()
 
+	if m.cfg.ResumeInterruptedOnStart {
+		m.resumeLocalStateMachines(ctx)
+	}
+
 	m.started = true
 	return nil
+}
+
+// resumeLocalStateMachines starts or resumes state machines for every
+// locally controlled supply-commit asset group.
+func (m *Manager) resumeLocalStateMachines(ctx context.Context) {
+	groupKeys, err := m.cfg.AssetLookup.FetchSupplyCommitAssets(ctx, true)
+	if err != nil {
+		log.Errorf("Unable to fetch supply commit assets to "+
+			"resume state machines: %v", err)
+
+		return
+	}
+
+	for idx := range groupKeys {
+		groupKey := groupKeys[idx]
+		assetSpec := asset.NewSpecifierFromGroupKey(groupKey)
+
+		_, err := m.fetchStateMachine(assetSpec)
+		if err != nil {
+			log.Errorf("Unable to resume supply commit state "+
+				"machine for asset %s: %v",
+				assetSpec.String(), err)
+		}
+	}
 }
 
 // registerBlockEpoch subscribes to block epochs with a child context so

@@ -668,6 +668,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			IgnoreCheckerCache: ignoreChecker,
 			IdleCommitInterval: cfg.Universe.SupplyIdleCommitInterval,
 			AutoPublishPending: cfg.Universe.SupplyAutoPublishPending,
+			ResumeInterruptedOnStart: true,
 		},
 	)
 
