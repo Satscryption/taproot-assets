@@ -8,7 +8,6 @@ import (
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
@@ -28,6 +27,11 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 
 	if len(req.VirtualPsbts) == 0 {
 		return nil, fmt.Errorf("no virtual PSBTs specified")
+	}
+
+	proofOpts, err := transitionProofOptions(req.TransitionProofVersion)
+	if err != nil {
+		return nil, err
 	}
 
 	pkt, err := psbt.NewFromRawBytes(bytes.NewReader(req.AnchorPsbt), false)
@@ -52,11 +56,6 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 	err = r.validateInputAssets(ctx, pkt, allPackets)
 	if err != nil {
 		return nil, fmt.Errorf("error validating input assets: %w", err)
-	}
-
-	proofOpts, err := transitionProofOptions(req.TransitionProofVersion)
-	if err != nil {
-		return nil, err
 	}
 
 	// We're ready to attempt to fund the transaction now. For that we first
@@ -159,22 +158,9 @@ func (r *RPCServer) fundAndCommitVirtualPsbts(ctx context.Context,
 				return
 			}
 
-			var releaseErr error
-			for idx, utxo := range lockedUTXO {
-				var lockID wtxmgr.LockID
-				copy(lockID[:], utxo.Id)
-
-				op := lockedOutpoints[idx]
-				err := lndWallet.ReleaseOutput(ctx, lockID, op)
-				if err != nil {
-					rpcsLog.Errorf("Error unlocking lnd "+
-						"UTXO %v: %v", op, err)
-					releaseErr = err
-				}
-			}
-			if releaseErr != nil && hooks != nil {
-				hooks.retainPending = true
-			}
+			releaseLeasedOutputs(
+				ctx, lndWallet, lockedUTXO, lockedOutpoints,
+			)
 		}()
 
 		if hooks != nil && hooks.onFunded != nil {

@@ -2921,6 +2921,25 @@ func (a *AssetStore) LogPendingParcel(ctx context.Context,
 
 	var writeTxOpts AssetStoreTxOptions
 	return a.db.ExecTx(ctx, &writeTxOpts, func(q ActiveAssetsStore) error {
+		// A retry of the same anchor (a lost PublishAndLogTransfer
+		// response, or a second porter entry for that anchor) must not
+		// insert another asset_transfers row. chain_txns.txid is unique,
+		// but asset_transfers.anchor_txn_id is not.
+		existing, err := q.QueryAssetTransfers(ctx, TransferQuery{
+			AnchorTxHash: newAnchorTXID[:],
+		})
+		if err != nil {
+			return fmt.Errorf("unable to query existing transfer: %w",
+				err)
+		}
+		if len(existing) > 0 {
+			log.Infof("Anchor transaction %v already logged as "+
+				"transfer id=%d; not inserting another row",
+				newAnchorTXID, existing[0].ID)
+
+			return nil
+		}
+
 		// First, we'll insert the new transaction that anchors the new
 		// anchor point (commits to the set of new outputs).
 		txnID, err := q.UpsertChainTx(ctx, ChainTxParams{

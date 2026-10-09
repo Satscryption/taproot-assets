@@ -194,6 +194,18 @@ type SupplyCommitStore interface {
 		arg sqlc.QuerySupplyCommitmentByOutpointParams) (
 		sqlc.QuerySupplyCommitmentByOutpointRow, error)
 
+	// QuerySupplyCommitmentByTxid fetches a supply commitment by its
+	// chain transaction ID.
+	QuerySupplyCommitmentByTxid(ctx context.Context,
+		arg sqlc.QuerySupplyCommitmentByTxidParams) (
+		sqlc.QuerySupplyCommitmentByTxidRow, error)
+
+	// QuerySupplyCommitTransitionByNewCommitment fetches the transition
+	// that created the given commitment.
+	QuerySupplyCommitTransitionByNewCommitment(ctx context.Context,
+		newCommitmentID sql.NullInt64) (
+		sqlc.QuerySupplyCommitTransitionByNewCommitmentRow, error)
+
 	// QuerySupplyCommitmentBySpentOutpoint fetches a supply commitment by
 	// its spent outpoint.
 	QuerySupplyCommitmentBySpentOutpoint(ctx context.Context,

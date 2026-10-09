@@ -2,6 +2,7 @@ package supplyverifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -549,6 +550,21 @@ func (m *Manager) InsertSupplyCommit(ctx context.Context,
 	log.Infof("Inserting supply commitment for asset: %s, "+
 		"commitment_outpoint=%s", assetSpec.String(),
 		commitment.CommitPoint().String())
+
+	// A legitimate re-push of a commitment we already stored must be
+	// absorbed before verification. Re-applying the leaves would mutate
+	// the supply tree a second time and fail spuriously.
+	existing, err := m.cfg.SupplyCommitView.FetchCommitmentByOutpoint(
+		ctx, assetSpec, commitment.CommitPoint(),
+	)
+	switch {
+	case err == nil && existing != nil:
+		return nil
+
+	case err != nil && !errors.Is(err, ErrCommitmentNotFound):
+		return fmt.Errorf("unable to look up existing commitment: %w",
+			err)
+	}
 
 	// Fetch all known unspent pre-commitment outputs for the asset group.
 	preCommits, err := FetchPreCommits(ctx,

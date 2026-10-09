@@ -939,7 +939,6 @@ func (p *ChainPorter) storePackageAnchorTxConf(pkg *sendPackage) error {
 	}
 
 	anchorTxBlockHeight := int32(pkg.TransferTxConfEvent.BlockHeight)
-	anchorTxBlockHeader := pkg.TransferTxConfEvent.Block.Header
 
 	// Now we scan through the VPacket for any burns.
 	//
@@ -957,6 +956,61 @@ func (p *ChainPorter) storePackageAnchorTxConf(pkg *sendPackage) error {
 
 			assetID := o.Asset.ID()
 
+			if o.ProofSuffix == nil {
+				return fmt.Errorf("burn output missing proof "+
+					"suffix")
+			}
+
+			parsedSuffix, err := cloneProof(o.ProofSuffix)
+			if err != nil {
+				return fmt.Errorf("error copying burn proof "+
+					"suffix: %w", err)
+			}
+
+			err = parsedSuffix.UpdateTransitionProof(
+				&proof.BaseProofParams{
+					Block:       pkg.TransferTxConfEvent.Block,
+					BlockHeight: pkg.TransferTxConfEvent.BlockHeight,
+					Tx:          pkg.TransferTxConfEvent.Tx,
+					TxIndex: int(
+						pkg.TransferTxConfEvent.TxIndex,
+					),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("error updating burn "+
+					"transition proof: %w", err)
+			}
+
+			burnInputs := make(map[asset.PrevID]*proof.File)
+			for _, witness := range parsedSuffix.Asset.Witnesses() {
+				if witness.PrevID == nil {
+					continue
+				}
+
+				prevID := *witness.PrevID
+				inputFile, err := p.fetchInputProof(
+					ctx, prevID,
+				)
+				if err != nil {
+					return fmt.Errorf("error fetching burn "+
+						"input proof: %w", err)
+				}
+
+				cloned, err := cloneProofFile(inputFile)
+				if err != nil {
+					return fmt.Errorf("unable to copy burn "+
+						"input proof: %w", err)
+				}
+				burnInputs[prevID] = cloned
+			}
+
+			burnProof, err := BurnLeafProof(parsedSuffix, burnInputs)
+			if err != nil {
+				return fmt.Errorf("unable to build burn "+
+					"proof: %w", err)
+			}
+
 			// We prepare the burn and add it to the list.
 			op := wire.OutPoint{
 				Hash:  pkg.OutboundPkg.AnchorTx.TxHash(),
@@ -969,13 +1023,9 @@ func (p *ChainPorter) storePackageAnchorTxConf(pkg *sendPackage) error {
 				AnchorTxid: pkg.OutboundPkg.AnchorTx.TxHash(),
 				Note:       pkg.Note,
 				ScriptKey:  &o.Asset.ScriptKey,
-				Proof:      o.ProofSuffix,
+				Proof:      burnProof,
 				OutPoint:   op,
 			}
-
-			// Set the block height and header in the burn proof.
-			b.Proof.BlockHeight = uint32(anchorTxBlockHeight)
-			b.Proof.BlockHeader = anchorTxBlockHeader
 
 			if o.Asset.GroupKey != nil {
 				groupKey := o.Asset.GroupKey.GroupPubKey

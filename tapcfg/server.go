@@ -646,6 +646,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			ClientFactory:          rpcserver.NewRpcSupplySync,
 			Store:                  supplySyncerStore,
 			UniverseFederationView: federationDB,
+			History:                supplyCommitStore,
 		},
 	)
 
