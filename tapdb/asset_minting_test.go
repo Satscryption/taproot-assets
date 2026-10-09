@@ -1,4 +1,3 @@
-//nolint:lll
 package tapdb
 
 import (
@@ -14,8 +13,8 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog/v2"
@@ -27,8 +26,6 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
-	"github.com/lightninglabs/taproot-assets/tapnode"
-	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapscript"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/clock"
@@ -514,9 +511,7 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 		t, assetStore, ctx, mintingBatch.Seedlings,
 	)
 	_, randSiblingHash := addRandSiblingToBatch(t, mintingBatch)
-	err := assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	)
+	err := assetStore.CommitMintingBatch(ctx, mintingBatch)
 	require.NoError(t, err)
 
 	batchKey := mintingBatch.BatchKey.PubKey
@@ -555,9 +550,8 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	// Finally update the state of the batch, and asset that when we read
 	// it from disk again, it has transitioned to being frozen.
 	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, mintingBatch, tapgarden.BatchStateFrozen,
+		ctx, batchKey, tapgarden.BatchStateFrozen,
 	))
-	require.Equal(t, tapgarden.BatchStateFrozen, mintingBatch.State())
 
 	mintingBatches = noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 1, numSeedlings*2)
@@ -566,7 +560,7 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	// If we finalize the batch, then the next query to
 	// FetchNonFinalBatches should return zero batches.
 	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, mintingBatch, tapgarden.BatchStateFinalized,
+		ctx, batchKey, tapgarden.BatchStateFinalized,
 	))
 	mintingBatches = noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 0, 0)
@@ -590,14 +584,10 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	// Adding sprouts updates the batch state to committed, so we'll set it
 	// back to finalized.
 	require.NoError(t, assetStore.AddSproutsToBatch(
-		ctx, mintingBatch, genesisPacket, assetRoot,
-		tapgarden.MockBindDataForBatch(mintingBatch),
+		ctx, batchKey, genesisPacket, assetRoot,
 	))
-	require.Equal(
-		t, tapgarden.BatchStateCommitted, mintingBatch.State(),
-	)
 	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, mintingBatch, tapgarden.BatchStateFinalized,
+		ctx, batchKey, tapgarden.BatchStateFinalized,
 	))
 
 	// We should still be able to fetch the finalized batch from disk.
@@ -620,9 +610,7 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	mintingBatch = tapgarden.RandMintingBatch(
 		t, tapgarden.WithTotalSeedlings(numSeedlings),
 	)
-	err = assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	)
+	err = assetStore.CommitMintingBatch(ctx, mintingBatch)
 	require.NoError(t, err)
 	mintingBatches = noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 1, numSeedlings)
@@ -663,9 +651,7 @@ func TestInsertFetchUniCommitBatch(t *testing.T) {
 	require.True(t, seedling.DelegationKey.IsSome())
 
 	// Commit the minting batch to the database.
-	err := assetStore.CommitMintingBatch(
-		ctx, batch, tapgarden.MockBindDataForBatch(batch),
-	)
+	err := assetStore.CommitMintingBatch(ctx, batch)
 	require.NoError(t, err)
 
 	// Fetch the same batch from the database.
@@ -886,9 +872,9 @@ func TestAddSproutsToBatch(t *testing.T) {
 	}
 
 	// First, we'll create a new batch, then add some sample seedlings.
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	))
+	require.NoError(t, assetStore.CommitMintingBatch(ctx, mintingBatch))
+
+	batchKey := mintingBatch.BatchKey.PubKey
 
 	// Now that the batch is on disk, we'll map those seedlings to an
 	// actual asset commitment, then insert them into the DB as sprouts.
@@ -913,12 +899,8 @@ func TestAddSproutsToBatch(t *testing.T) {
 	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
 
 	require.NoError(t, assetStore.AddSproutsToBatch(
-		ctx, mintingBatch, genesisPacket, assetRoot,
-		tapgarden.MockBindDataForBatch(mintingBatch),
+		ctx, batchKey, genesisPacket, assetRoot,
 	))
-	require.Equal(
-		t, tapgarden.BatchStateCommitted, mintingBatch.State(),
-	)
 
 	// Now we'll query for that same batch, and assert that the set of
 	// assets we just inserted into the database matches up.
@@ -958,6 +940,7 @@ func TestAddSproutsToBatch(t *testing.T) {
 }
 
 type randAssetCtx struct {
+	batchKey        *btcec.PublicKey
 	groupKey        *btcec.PublicKey
 	groupGenAmt     uint64
 	genesisPkt      *tapsend.FundedPsbt
@@ -980,9 +963,8 @@ func addRandAssets(t *testing.T, ctx context.Context,
 		t, assetStore, ctx, mintingBatch.Seedlings,
 	)
 	randSibling, randSiblingHash := addRandSiblingToBatch(t, mintingBatch)
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	))
+	batchKey := mintingBatch.BatchKey.PubKey
+	require.NoError(t, assetStore.CommitMintingBatch(ctx, mintingBatch))
 
 	genesisPacket := mintingBatch.GenesisPacket
 	assetRoot := seedlingsToAssetRoot(
@@ -1008,12 +990,8 @@ func addRandAssets(t *testing.T, ctx context.Context,
 	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
 
 	require.NoError(t, assetStore.AddSproutsToBatch(
-		ctx, mintingBatch, genesisPacket, assetRoot,
-		tapgarden.MockBindDataForBatch(mintingBatch),
+		ctx, batchKey, genesisPacket, assetRoot,
 	))
-	require.Equal(
-		t, tapgarden.BatchStateCommitted, mintingBatch.State(),
-	)
 
 	merkleRoot := assetRoot.TapscriptRoot(&randSiblingHash)
 	scriptRoot := assetRoot.TapscriptRoot(nil)
@@ -1023,6 +1001,7 @@ func addRandAssets(t *testing.T, ctx context.Context,
 	require.NoError(t, err)
 
 	return randAssetCtx{
+		batchKey:        batchKey,
 		groupKey:        &group.GroupKey.GroupPubKey,
 		groupGenAmt:     genAmt,
 		genesisPkt:      &genesisPacket.FundedPsbt,
@@ -1058,55 +1037,15 @@ func TestCommitBatchChainActions(t *testing.T) {
 	//
 	// TODO(roasbeef): move the tx extraction up one layer?
 	randAssetCtx.genesisPkt.Pkt.Inputs[0].FinalScriptSig = []byte{}
-	customInternalKey, customPriv := test.RandKeyDesc(t)
-	customInternalKey.KeyLocator = keychain.KeyLocator{
-		Family: asset.TaprootAssetsKeyFamily,
-		Index:  721,
-	}
-	customInternalKey.PubKey = customPriv.PubKey()
-	_, err := db.UpsertInternalKey(ctx, InternalKey{
-		RawKey: customInternalKey.PubKey.SerializeCompressed(),
-	})
-	require.NoError(t, err)
-	bip32Derivation, taprootDerivation :=
-		tappsbt.Bip32DerivationFromKeyDesc(
-			customInternalKey, address.TestNet3Tap.HDCoinType,
-		)
-	randAssetCtx.genesisPkt.Pkt.Outputs[0].Bip32Derivation =
-		[]*psbt.Bip32Derivation{bip32Derivation}
-	randAssetCtx.genesisPkt.Pkt.Outputs[0].TaprootBip32Derivation =
-		[]*psbt.TaprootBip32Derivation{taprootDerivation}
-	randAssetCtx.genesisPkt.Pkt.Unknowns = append(
-		randAssetCtx.genesisPkt.Pkt.Unknowns, &psbt.Unknown{
-			Key:   []byte{0xfc, 0x04, 't', 'a', 'p', 'd', 0x01},
-			Value: []byte{1},
-		},
-	)
-	customOutputKey := txscript.ComputeTaprootOutputKey(
-		customInternalKey.PubKey, randAssetCtx.merkleRoot,
-	)
-	customOutputScript, err := txscript.PayToTaprootScript(customOutputKey)
-	require.NoError(t, err)
-	randAssetCtx.genesisPkt.Pkt.UnsignedTx.TxOut[0].PkScript =
-		customOutputScript
 
 	// With our assets inserted, we'll now commit the signed genesis packet
 	// to disk, along with the Taproot Asset script root that's stored
 	// alongside any managed UTXOs.
-	require.NoError(t, assetStore.CommitSignedGenesisTxWithKey(
-		ctx, randAssetCtx.mintingBatch, customInternalKey,
-		randAssetCtx.genesisPkt, 0,
+	require.NoError(t, assetStore.CommitSignedGenesisTx(
+		ctx, randAssetCtx.batchKey, randAssetCtx.genesisPkt, 0,
 		randAssetCtx.merkleRoot, randAssetCtx.scriptRoot,
 		randAssetCtx.tapSiblingBytes,
 	))
-	require.ErrorContains(t, assetStore.StoreSignedGenesisPsbt(
-		ctx, randAssetCtx.mintingBatch.BatchKey.PubKey,
-		randAssetCtx.genesisPkt,
-	), "batch in state BatchStateBroadcast")
-	require.Equal(
-		t, tapgarden.BatchStateBroadcast,
-		randAssetCtx.mintingBatch.State(),
-	)
 
 	// The batch updated above should be found, with the batch state
 	// updated, and also the genesis transaction updated to match what we
@@ -1145,12 +1084,6 @@ func TestCommitBatchChainActions(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, randAssetCtx.merkleRoot, managedUTXO.MerkleRoot)
-	require.Equal(
-		t, customInternalKey.PubKey.SerializeCompressed(),
-		managedUTXO.RawKey,
-	)
-	require.Equal(t, int32(customInternalKey.Family), managedUTXO.KeyFamily)
-	require.Equal(t, int32(customInternalKey.Index), managedUTXO.KeyIndex)
 	require.Equal(t, randAssetCtx.scriptRoot, managedUTXO.TaprootAssetRoot)
 	require.Equal(
 		t, randAssetCtx.tapSiblingBytes, managedUTXO.TapscriptSibling,
@@ -1169,18 +1102,11 @@ func TestCommitBatchChainActions(t *testing.T) {
 	_, err = db.FetchGenesisPointByAnchorTx(ctx, sqlInt64(dbGenTx.TxnID))
 	require.NoError(t, err)
 
-	// For each asset created above, make a structurally valid synthetic
-	// proof file. Confirming a batch now stores proof provenance together
-	// with each blob, so arbitrary bytes are not a representable input.
+	// For each asset created above, we'll make a fake proof file for it.
 	assetProofs := make(proof.AssetBlobs)
-	mintBlock := wire.MsgBlock{
-		Transactions: []*wire.MsgTx{rawGenTx},
-	}
 	for _, a := range randAssetCtx.assetRoot.CommittedAssets() {
-		assetProof := proof.RandProof(
-			t, a.Genesis, a.ScriptKey.PubKey, mintBlock, 0, 0,
-		)
-		blob, err := proof.EncodeAsProofFile(&assetProof)
+		blob := make([]byte, 100)
+		_, err := rand.Read(blob[:])
 		require.NoError(t, err)
 
 		assetProofs[asset.ToSerialized(a.ScriptKey.PubKey)] = blob
@@ -1192,13 +1118,9 @@ func TestCommitBatchChainActions(t *testing.T) {
 	blockHeight := uint32(20)
 	txIndex := uint32(5)
 	require.NoError(t, assetStore.MarkBatchConfirmed(
-		ctx, randAssetCtx.mintingBatch, &fakeBlockHash, blockHeight,
+		ctx, randAssetCtx.batchKey, &fakeBlockHash, blockHeight,
 		txIndex, assetProofs,
 	))
-	require.Equal(
-		t, tapgarden.BatchStateConfirmed,
-		randAssetCtx.mintingBatch.State(),
-	)
 
 	// We'll now fetch the chain transaction again, to confirm that all the
 	// field have been properly updated.
@@ -1339,43 +1261,6 @@ func TestCommitBatchChainActions(t *testing.T) {
 	}
 }
 
-func TestCommitSignedGenesisTxConflictingLocatorRollback(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	assetStore, _, db := newAssetStore(t)
-	randAssetCtx := addRandAssets(t, ctx, assetStore, 1)
-	randAssetCtx.genesisPkt.Pkt.Inputs[0].FinalScriptSig = []byte{}
-
-	customInternalKey, _ := test.RandKeyDesc(t)
-	rawKey := customInternalKey.PubKey.SerializeCompressed()
-	conflicting := InternalKey{
-		RawKey: rawKey, KeyFamily: int32(customInternalKey.Family),
-		KeyIndex: int32(customInternalKey.Index) + 1,
-	}
-	_, err := db.UpsertInternalKey(ctx, conflicting)
-	require.NoError(t, err)
-
-	err = assetStore.CommitSignedGenesisTxWithKey(
-		ctx, randAssetCtx.mintingBatch, customInternalKey,
-		randAssetCtx.genesisPkt, 0, randAssetCtx.merkleRoot,
-		randAssetCtx.scriptRoot, randAssetCtx.tapSiblingBytes,
-	)
-	require.ErrorIs(t, err, sql.ErrNoRows)
-
-	// The locator and minting batch stay unchanged because the descriptor
-	// upsert and all Broadcast bookkeeping share one transaction.
-	locator, err := db.FetchInternalKeyLocator(ctx, rawKey)
-	require.NoError(t, err)
-	require.Equal(t, conflicting.KeyFamily, locator.KeyFamily)
-	require.Equal(t, conflicting.KeyIndex, locator.KeyIndex)
-	persisted, err := assetStore.FetchMintingBatch(
-		ctx, randAssetCtx.mintingBatch.BatchKey.PubKey,
-	)
-	require.NoError(t, err)
-	require.Equal(t, tapgarden.BatchStateCommitted, persisted.State())
-}
-
 // TestDuplicateGroupKey tests that if we attempt to insert a group key with
 // the exact same tweaked key blob, then the noop UPSERT logic triggers, and we
 // get the ID of that same key.
@@ -1422,162 +1307,6 @@ func TestDuplicateGroupKey(t *testing.T) {
 	groupID2, err := db.UpsertAssetGroupKey(ctx, assetKey)
 	require.NoError(t, err)
 	require.Equal(t, groupID, groupID2)
-}
-
-func TestInternalKeyLocatorUpsertMatrix(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	_, _, db := newAssetStore(t)
-	rawKey := test.RandPubKey(t).SerializeCompressed()
-
-	placeholder := sqlc.UpsertInternalKeyParams{RawKey: rawKey}
-	keyID, err := db.UpsertInternalKey(ctx, placeholder)
-	require.NoError(t, err)
-
-	verified := sqlc.UpsertWalletVerifiedInternalKeyParams{
-		RawKey: rawKey, KeyFamily: 212, KeyIndex: 721,
-	}
-
-	// A generic, unverified caller cannot promote the placeholder, but must
-	// still receive its existing ID. Default import-then-use paths insert a
-	// raw placeholder before later encountering the full descriptor and need
-	// this ID to create dependent rows.
-	defaultCallerID, err := db.UpsertInternalKey(ctx,
-		sqlc.UpsertInternalKeyParams{
-			RawKey: rawKey, KeyFamily: verified.KeyFamily,
-			KeyIndex: verified.KeyIndex,
-		})
-	require.NoError(t, err)
-	require.Equal(t, keyID, defaultCallerID)
-	locator, err := db.FetchInternalKeyLocator(ctx, rawKey)
-	require.NoError(t, err)
-	require.Zero(t, locator.KeyFamily)
-	require.Zero(t, locator.KeyIndex)
-
-	// The wallet-verified capability promotes exactly the placeholder and is
-	// idempotent for the same locator.
-	verifiedID, err := db.UpsertWalletVerifiedInternalKey(ctx, verified)
-	require.NoError(t, err)
-	require.Equal(t, keyID, verifiedID)
-	verifiedID2, err := db.UpsertWalletVerifiedInternalKey(ctx, verified)
-	require.NoError(t, err)
-	require.Equal(t, keyID, verifiedID2)
-	locator, err = db.FetchInternalKeyLocator(ctx, rawKey)
-	require.NoError(t, err)
-	require.Equal(t, verified.KeyFamily, locator.KeyFamily)
-	require.Equal(t, verified.KeyIndex, locator.KeyIndex)
-
-	// A later generic placeholder import preserves and returns the known
-	// locator instead of erasing it.
-	preservedID, err := db.UpsertInternalKey(ctx, placeholder)
-	require.NoError(t, err)
-	require.Equal(t, keyID, preservedID)
-	locator, err = db.FetchInternalKeyLocator(ctx, rawKey)
-	require.NoError(t, err)
-	require.Equal(t, verified.KeyFamily, locator.KeyFamily)
-	require.Equal(t, verified.KeyIndex, locator.KeyIndex)
-
-	// Neither generic nor verified paths overwrite a conflicting known
-	// locator. The generic path remains a successful ID lookup for backwards
-	// compatibility, while the verified path reports the conflict.
-	conflictingGenericID, err := db.UpsertInternalKey(
-		ctx, sqlc.UpsertInternalKeyParams{
-			RawKey: rawKey, KeyFamily: verified.KeyFamily,
-			KeyIndex: verified.KeyIndex + 1,
-		},
-	)
-	require.NoError(t, err)
-	require.Equal(t, keyID, conflictingGenericID)
-	_, err = db.UpsertWalletVerifiedInternalKey(
-		ctx, sqlc.UpsertWalletVerifiedInternalKeyParams{
-			RawKey: rawKey, KeyFamily: verified.KeyFamily,
-			KeyIndex: verified.KeyIndex + 1,
-		},
-	)
-	require.ErrorIs(t, err, sql.ErrNoRows)
-	locator, err = db.FetchInternalKeyLocator(ctx, rawKey)
-	require.NoError(t, err)
-	require.Equal(t, verified.KeyFamily, locator.KeyFamily)
-	require.Equal(t, verified.KeyIndex, locator.KeyIndex)
-
-	for _, known := range []sqlc.UpsertInternalKeyParams{
-		{RawKey: test.RandPubKey(t).SerializeCompressed(), KeyIndex: 7},
-		{RawKey: test.RandPubKey(t).SerializeCompressed(), KeyFamily: 7},
-	} {
-		known := known
-		knownID, err := db.UpsertInternalKey(ctx, known)
-		require.NoError(t, err)
-		genericConflictID, err := db.UpsertInternalKey(
-			ctx, sqlc.UpsertInternalKeyParams{
-				RawKey: known.RawKey, KeyFamily: 9, KeyIndex: 9,
-			},
-		)
-		require.NoError(t, err)
-		require.Equal(t, knownID, genericConflictID)
-
-		_, err = db.UpsertWalletVerifiedInternalKey(
-			ctx, sqlc.UpsertWalletVerifiedInternalKeyParams{
-				RawKey: known.RawKey, KeyFamily: 9, KeyIndex: 9,
-			},
-		)
-		require.ErrorIs(t, err, sql.ErrNoRows)
-		partial, err := db.FetchInternalKeyLocator(ctx, known.RawKey)
-		require.NoError(t, err)
-		require.Equal(t, known.KeyFamily, partial.KeyFamily)
-		require.Equal(t, known.KeyIndex, partial.KeyIndex)
-	}
-}
-
-// TestGenericInternalKeyImportThenUse verifies the default script-key storage
-// path can reuse an earlier proof-import placeholder without either failing or
-// treating the later, unverified descriptor as authority to promote it.
-func TestGenericInternalKeyImportThenUse(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	_, _, db := newAssetStore(t)
-	rawKey, _ := test.RandKeyDesc(t)
-	rawKey.Family = 212
-	rawKey.Index = 721
-	rawKeyBytes := rawKey.PubKey.SerializeCompressed()
-
-	placeholderID, err := db.UpsertInternalKey(
-		ctx, sqlc.UpsertInternalKeyParams{RawKey: rawKeyBytes},
-	)
-	require.NoError(t, err)
-
-	tweak := test.RandBytes(32)
-	tweakedKey := txscript.ComputeTaprootOutputKey(rawKey.PubKey, tweak)
-	scriptKey := asset.ScriptKey{
-		PubKey: tweakedKey,
-		TweakedScriptKey: &asset.TweakedScriptKey{
-			RawKey: rawKey,
-			Tweak:  tweak,
-		},
-	}
-
-	scriptKeyID, err := upsertScriptKey(ctx, scriptKey, db)
-	require.NoError(t, err)
-	require.NotZero(t, scriptKeyID)
-	storedScriptKeyID, err := db.FetchScriptKeyIDByTweakedKey(
-		ctx, tweakedKey.SerializeCompressed(),
-	)
-	require.NoError(t, err)
-	require.Equal(t, scriptKeyID, storedScriptKeyID)
-
-	reusedID, err := db.UpsertInternalKey(
-		ctx, sqlc.UpsertInternalKeyParams{
-			RawKey: rawKeyBytes, KeyFamily: int32(rawKey.Family),
-			KeyIndex: int32(rawKey.Index),
-		},
-	)
-	require.NoError(t, err)
-	require.Equal(t, placeholderID, reusedID)
-	locator, err := db.FetchInternalKeyLocator(ctx, rawKeyBytes)
-	require.NoError(t, err)
-	require.Zero(t, locator.KeyFamily)
-	require.Zero(t, locator.KeyIndex)
 }
 
 // TestGroupStore tests all the queries exposed via the GroupStore interface,
@@ -1735,9 +1464,9 @@ func TestGroupAnchors(t *testing.T) {
 	ctx := context.Background()
 	const numSeedlings = 10
 	assetStore, _, _ := newAssetStore(t)
-	groupVerifier := tapnode.GenGroupVerifier(ctx, assetStore)
-	groupAnchorVerifier := tapnode.GenGroupAnchorVerifier(ctx, assetStore)
-	rawGroupAnchorVerifier := tapnode.GenRawGroupAnchorVerifier(ctx)
+	groupVerifier := tapgarden.GenGroupVerifier(ctx, assetStore)
+	groupAnchorVerifier := tapgarden.GenGroupAnchorVerifier(ctx, assetStore)
+	rawGroupAnchorVerifier := tapgarden.GenRawGroupAnchorVerifier(ctx)
 
 	// First, we'll write a new minting batch to disk, including an
 	// internal key and a set of seedlings. One random seedling will
@@ -1750,9 +1479,7 @@ func TestGroupAnchors(t *testing.T) {
 		t, assetStore, ctx, mintingBatch.Seedlings,
 	)
 	addMultiAssetGroupToBatch(mintingBatch.Seedlings)
-	err := assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	)
+	err := assetStore.CommitMintingBatch(ctx, mintingBatch)
 	require.NoError(t, err)
 
 	batchKey := mintingBatch.BatchKey.PubKey
@@ -1830,12 +1557,8 @@ func TestGroupAnchors(t *testing.T) {
 	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
 
 	require.NoError(t, assetStore.AddSproutsToBatch(
-		ctx, mintingBatch, genesisPacket, assetRoot,
-		tapgarden.MockBindDataForBatch(mintingBatch),
+		ctx, batchKey, genesisPacket, assetRoot,
 	))
-	require.Equal(
-		t, tapgarden.BatchStateCommitted, mintingBatch.State(),
-	)
 
 	// Now we'll query for that same batch, and assert that the set of
 	// assets we just inserted into the database matches up.
@@ -2274,9 +1997,7 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 	storeSeedlingGroupGenesis(t, ctx, assetStore, seedling)
 
 	// Commit batch.
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	))
+	require.NoError(t, assetStore.CommitMintingBatch(ctx, mintingBatch))
 
 	// Retrieve the batch key of the batch we just inserted.
 	var batchKey []byte
@@ -2293,15 +2014,12 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 	)
 
 	// Define pre-commit outpoint for the batch mint anchor tx.
-	// The funded PSBT no longer carries a PreCommitmentOutput
-	// field; the test mock augmenter knows how to derive the
-	// same persistence payload from the batch's seedlings and
-	// the funded PSBT.
 	genesisPkt := mintingBatch.GenesisPacket
 	require.NotNil(t, genesisPkt)
 
-	preCommitBind, err := tapgarden.MockBindDataForBatch(mintingBatch).
-		UnwrapOrErr(fmt.Errorf("no pre-commitment output"))
+	preCommitOut, err := genesisPkt.PreCommitmentOutput.UnwrapOrErr(
+		fmt.Errorf("no pre-commitment output"),
+	)
 	require.NoError(t, err)
 
 	txidStr := genesisPkt.FundedPsbt.Pkt.UnsignedTx.TxID()
@@ -2310,11 +2028,11 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 
 	preCommitOutpoint := wire.OutPoint{
 		Hash:  *txid,
-		Index: preCommitBind.OutputIndex,
+		Index: preCommitOut.OutIdx,
 	}
 
 	// Serialize keys into bytes for easier handling.
-	preCommitGroupKey, err := preCommitBind.GroupKey.UnwrapOrErr(
+	preCommitGroupKey, err := preCommitOut.GroupPubKey.UnwrapOrErr(
 		fmt.Errorf("no group key"),
 	)
 	require.NoError(t, err)
@@ -2322,8 +2040,8 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 
 	// Retrieve and inspect the mint anchor commitment we just inserted.
 	assertMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		preCommitBind.InternalKey, groupPubKeyBytes, preCommitOutpoint,
+		t, *assetStore, batchKey, preCommitOut.OutIdx,
+		preCommitOut.InternalKey, groupPubKeyBytes, preCommitOutpoint,
 	)
 
 	// Upsert-ing a new taproot internal key for the same pre-commit
@@ -2331,13 +2049,13 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 	internalKey2, _ := test.RandKeyDesc(t)
 
 	storeMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, groupPubKeyBytes, preCommitOutpoint,
+		t, *assetStore, batchKey, preCommitOut.OutIdx, internalKey2,
+		groupPubKeyBytes, preCommitOutpoint,
 	)
 
 	assertMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, groupPubKeyBytes, preCommitOutpoint,
+		t, *assetStore, batchKey, preCommitOut.OutIdx, internalKey2,
+		groupPubKeyBytes, preCommitOutpoint,
 	)
 
 	// Upsert-ing a new group key for the same pre-commit outpoint should
@@ -2346,251 +2064,14 @@ func TestUpsertMintSupplyPreCommit(t *testing.T) {
 	groupPubKey2Bytes := schnorr.SerializePubKey(groupPubKey2)
 
 	storeMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, groupPubKey2Bytes, preCommitOutpoint,
+		t, *assetStore, batchKey, preCommitOut.OutIdx, internalKey2,
+		groupPubKey2Bytes, preCommitOutpoint,
 	)
 
 	assertMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, groupPubKey2Bytes, preCommitOutpoint,
+		t, *assetStore, batchKey, preCommitOut.OutIdx, internalKey2,
+		groupPubKey2Bytes, preCommitOutpoint,
 	)
-
-	// A restored new-group batch cannot reconstruct GroupInfo from its
-	// seedling row. Its idempotent Frozen-state write therefore carries
-	// no group key. That absence must not erase the key persisted at
-	// seal time.
-	storeMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, nil, preCommitOutpoint,
-	)
-
-	assertMintSupplyPreCommit(
-		t, *assetStore, batchKey, preCommitBind.OutputIndex,
-		internalKey2, groupPubKey2Bytes, preCommitOutpoint,
-	)
-
-	// The output index is binding data, not the logical identity of the
-	// pre-commitment. A second row for the same batch must fail loudly.
-	secondOutpoint := preCommitOutpoint
-	secondOutpoint.Index++
-	secondOpBytes, err := encodeOutpoint(secondOutpoint)
-	require.NoError(t, err)
-
-	var writeTxOpts AssetStoreTxOptions
-	err = assetStore.db.ExecTx(
-		ctx, &writeTxOpts, func(q PendingAssetStore) error {
-			rawKey := internalKey2.PubKey.SerializeCompressed()
-			internalKeyID, err := q.UpsertInternalKey(
-				ctx, InternalKey{
-					RawKey:    rawKey,
-					KeyFamily: int32(internalKey2.Family),
-					KeyIndex:  int32(internalKey2.Index),
-				},
-			)
-			if err != nil {
-				return err
-			}
-
-			outIdx := int32(secondOutpoint.Index)
-			_, err = q.UpsertMintSupplyPreCommit(
-				ctx, UpsertBatchPreCommitParams{
-					BatchKey:             batchKey,
-					TxOutputIndex:        outIdx,
-					TaprootInternalKeyID: internalKeyID,
-					GroupKey:             groupPubKey2Bytes,
-					Outpoint:             secondOpBytes,
-				},
-			)
-			return err
-		},
-	)
-	require.Error(t, err)
-}
-
-// TestValidatePreCommitBind exhaustively verifies the correspondence between
-// a funded batch's supply-commit flag and its pre-commit bind payload.
-func TestValidatePreCommitBind(t *testing.T) {
-	t.Parallel()
-
-	noBind := fn.None[tapgarden.PreCommitBindData]()
-
-	testCases := []struct {
-		name              string
-		supplyCommitments bool
-		preCommit         fn.Option[tapgarden.PreCommitBindData]
-		errContains       string
-	}{
-		{
-			name:              "ordinary without bind data",
-			supplyCommitments: false,
-			preCommit:         noBind,
-		},
-		{
-			name:              "ordinary with bind data",
-			supplyCommitments: false,
-			preCommit: fn.Some(
-				tapgarden.PreCommitBindData{},
-			),
-			errContains: "non-supply-commit batch",
-		},
-		{
-			name:              "supply without bind data",
-			supplyCommitments: true,
-			preCommit:         noBind,
-			errContains:       "has no pre-commit bind data",
-		},
-		{
-			name:              "supply with bind data",
-			supplyCommitments: true,
-			preCommit: fn.Some(
-				tapgarden.PreCommitBindData{},
-			),
-		},
-	}
-
-	for _, testCase := range testCases {
-		testCase := testCase
-
-		t.Run(testCase.name, func(t *testing.T) {
-			batch := &tapgarden.MintingBatch{
-				SupplyCommitments: testCase.supplyCommitments,
-			}
-
-			err := validatePreCommitBind(batch, testCase.preCommit)
-			if testCase.errContains == "" {
-				require.NoError(t, err)
-				return
-			}
-
-			require.ErrorContains(t, err, testCase.errContains)
-		})
-	}
-}
-
-// TestSupplyPreCommitBindRequired verifies that CommitMintingBatch applies the
-// bind-payload validation before attempting to persist a funded batch.
-func TestSupplyPreCommitBindRequired(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	assetStore, _, _ := newAssetStore(t)
-	batch := tapgarden.RandMintingBatch(
-		t, tapgarden.WithTotalGroups([]int{1}),
-		tapgarden.WithUniverseCommitments(true),
-	)
-
-	err := assetStore.CommitMintingBatch(
-		ctx, batch, fn.None[tapgarden.PreCommitBindData](),
-	)
-	require.ErrorContains(t, err, "has no pre-commit bind data")
-}
-
-// TestUpdateBatchStateMemoryCoherence pins the invariant that the
-// in-memory batch state never advances unless the on-disk write
-// succeeds. When the DB call fails (here, via a pre-cancelled
-// context), batch.State() must remain at its prior value and a fresh
-// read from disk must agree.
-func TestUpdateBatchStateMemoryCoherence(t *testing.T) {
-	t.Parallel()
-
-	assetStore, _, _ := newAssetStore(t)
-	ctx := context.Background()
-
-	mintingBatch := tapgarden.RandMintingBatch(t)
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, mintingBatch, tapgarden.MockBindDataForBatch(mintingBatch),
-	))
-	require.Equal(
-		t, tapgarden.BatchStatePending, mintingBatch.State(),
-	)
-
-	// A pre-cancelled context forces ExecTx to fail before touching
-	// the row, exercising the failure path of UpdateBatchState.
-	cancelledCtx, cancel := context.WithCancel(ctx)
-	cancel()
-
-	err := assetStore.UpdateBatchState(
-		cancelledCtx, mintingBatch, tapgarden.BatchStateFrozen,
-	)
-	require.Error(t, err)
-
-	// In-memory state must not have moved.
-	require.Equal(
-		t, tapgarden.BatchStatePending, mintingBatch.State(),
-	)
-
-	// On-disk state must not have moved either.
-	fetched, err := assetStore.FetchMintingBatch(
-		ctx, mintingBatch.BatchKey.PubKey,
-	)
-	require.NoError(t, err)
-	require.Equal(
-		t, tapgarden.BatchStatePending, fetched.State(),
-	)
-}
-
-// TestSingletonPreBroadcastBatchConstraint exercises the partial
-// unique index added in migration 000061. At most one
-// asset_minting_batches row may be in BatchStatePending or
-// BatchStateFrozen at any time; the second insert into that set
-// must fail with a constraint error, and a row in
-// BatchStateCommitted (or later) must not count against the
-// constraint.
-func TestSingletonPreBroadcastBatchConstraint(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	assetStore, _, _ := newAssetStore(t)
-
-	// A first Pending batch is fine.
-	first := tapgarden.RandMintingBatch(t)
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, first, tapgarden.MockBindDataForBatch(first),
-	))
-
-	// A second Pending batch must be rejected: two rows in
-	// BatchStatePending violate the partial unique index. The
-	// violation must surface as the domain error, not as a raw
-	// SQL constraint error.
-	secondPending := tapgarden.RandMintingBatch(t)
-	err := assetStore.CommitMintingBatch(
-		ctx, secondPending,
-		tapgarden.MockBindDataForBatch(secondPending),
-	)
-	require.ErrorIs(t, err, tapgarden.ErrDuplicatePreBroadcastBatch)
-
-	// Move the first batch to Frozen; it is still in the
-	// pre-broadcast set, so a new Pending batch must still be
-	// rejected (Pending ∪ Frozen, not just Pending).
-	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, first, tapgarden.BatchStateFrozen,
-	))
-
-	pendingWhileFrozen := tapgarden.RandMintingBatch(t)
-	err = assetStore.CommitMintingBatch(
-		ctx, pendingWhileFrozen,
-		tapgarden.MockBindDataForBatch(pendingWhileFrozen),
-	)
-	require.ErrorIs(t, err, tapgarden.ErrDuplicatePreBroadcastBatch)
-
-	// Move the first batch out of the pre-broadcast set into
-	// Committed; the constraint no longer applies to it. A new
-	// Pending batch must now succeed.
-	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, first, tapgarden.BatchStateCommitted,
-	))
-
-	third := tapgarden.RandMintingBatch(t)
-	require.NoError(t, assetStore.CommitMintingBatch(
-		ctx, third, tapgarden.MockBindDataForBatch(third),
-	))
-
-	// And finally: two batches both in Committed must be
-	// permitted -- the constraint targets only the pre-broadcast
-	// set.
-	require.NoError(t, assetStore.UpdateBatchState(
-		ctx, third, tapgarden.BatchStateCommitted,
-	))
 }
 
 func init() {
