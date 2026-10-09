@@ -1,16 +1,15 @@
 package tapcfg
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
+	"time"
 
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightninglabs/lndclient"
@@ -18,6 +17,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/authmailbox"
+	"github.com/lightninglabs/taproot-assets/backup"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/healthcheck"
 	"github.com/lightninglabs/taproot-assets/lndservices"
@@ -26,13 +26,17 @@ import (
 	"github.com/lightninglabs/taproot-assets/rpcserver"
 	"github.com/lightninglabs/taproot-assets/tapchannel"
 	"github.com/lightninglabs/taproot-assets/tapconfig"
+	"github.com/lightninglabs/taproot-assets/tapcustody"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapfeatures"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapreorg"
 	"github.com/lightninglabs/taproot-assets/tapscript"
 	"github.com/lightninglabs/taproot-assets/universe"
+	"github.com/lightninglabs/taproot-assets/universe/mintpublish"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
 	"github.com/lightninglabs/taproot-assets/universe/supplyverifier"
 	"github.com/lightningnetwork/lnd/clock"
@@ -45,8 +49,9 @@ import (
 //
 // NOTE: The RPCConfig and SignalInterceptor fields must be set by the caller
 // after generating the server config.
-func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
-	lndServices *lndclient.LndServices, enableChannelFeatures bool,
+func genServerConfig(ctx context.Context, cfg *Config,
+	cfgLogger btclog.Logger, lndServices *lndclient.LndServices,
+	enableChannelFeatures bool,
 	mainErrChan chan<- error) (*tapconfig.Config, error) {
 
 	var (
@@ -54,14 +59,6 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		db     tapdb.DatabaseBackend
 		dbType sqlc.BackendType
 	)
-
-	// Every proof verifier of this daemon applies the activation height
-	// of its network.
-	activationHeight := proofActivationHeight(cfg)
-	proof.SetDefaultActivationHeight(activationHeight)
-	activationHeight.WhenSome(func(h uint32) {
-		cfgLogger.Infof("Transition proof activation height: %d", h)
-	})
 
 	// If we're using sqlite, we need to ensure that the temp directory is
 	// writable otherwise we might encounter an error at an unexpected
@@ -204,6 +201,16 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		return nil, fmt.Errorf("create multiverse store: %w", err)
 	}
 
+	// The multiverse trees are derived from the universe roots; repair any
+	// entries that diverged, for example because the daemon stopped
+	// between a proof insert committing and its multiverse update being
+	// written. The context is shutdown-derived, so an operator can
+	// interrupt a long-running reconcile.
+	err = multiverse.ReconcileMultiverse(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile multiverse: %w", err)
+	}
+
 	uniStatsDB := tapdb.NewTransactionExecutor(
 		db, func(tx *sql.Tx) tapdb.UniverseStatsStore {
 			return db.WithTx(tx)
@@ -228,10 +235,10 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		uniStatsDB, defaultClock, statsOpts...,
 	)
 
-	headerVerifier := tapgarden.GenHeaderVerifier(
+	headerVerifier := tapnode.GenHeaderVerifier(
 		context.Background(), chainBridge,
 	)
-	groupVerifier := tapgarden.GenGroupVerifier(
+	groupVerifier := tapnode.GenGroupVerifier(
 		context.Background(), assetMintingStore,
 	)
 
@@ -410,31 +417,72 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		}
 	}
 
-	reOrgWatcher := tapgarden.NewReOrgWatcher(&tapgarden.ReOrgWatcherConfig{
-		ChainBridge:   chainBridge,
-		GroupVerifier: groupVerifier,
-		ProofArchive:  proofArchive,
-		IgnoreChecker: ignoreCheckerOpt,
-		NonBuriedAssetFetcher: func(ctx context.Context,
-			minHeight int32) ([]*asset.ChainAsset, error) {
-
-			return assetStore.FetchAllAssets(
-				ctx, false, true, &tapdb.AssetQueryFilters{
-					MinAnchorHeight: minHeight,
-				},
-			)
+	// The watcher's registry advances run site handlers in the same
+	// transaction, so its executor is instantiated at the full
+	// generated query set.
+	reorgRegistryDB := tapdb.NewTransactionExecutor(
+		db, func(tx *sql.Tx) *sqlc.Queries {
+			return db.WithTx(tx)
 		},
-		SafeDepth: cfg.ReOrgSafeDepth,
-		ErrChan:   mainErrChan,
-	})
+	)
+	anchoringRegistry := tapdb.NewReorgRegistryStore(
+		reorgRegistryDB, defaultClock,
+	)
+	var defaultThreshold uint32
+	if cfg.ReOrgSafeDepth > 0 {
+		defaultThreshold = uint32(cfg.ReOrgSafeDepth)
+	}
+	watcherCfg := &tapreorg.WatcherConfig{
+		Notifier:         chainBridge,
+		Registry:         anchoringRegistry,
+		Clock:            defaultClock,
+		DefaultThreshold: defaultThreshold,
+		ErrChan:          mainErrChan,
+	}
+
+	// Regtest and simnet blocks arrive on demand and consumers wait
+	// on short windows, so retry and scan quickly there; the
+	// defaults are tuned to public-network block cadence.
+	switch cfg.ChainConf.Network {
+	case "regtest", "simnet":
+		watcherCfg.InitialDeliveryBackoff = time.Second
+		watcherCfg.MaxDeliveryBackoff = 10 * time.Second
+		watcherCfg.ScanInterval = time.Second
+	}
+	anchoringWatcher := tapreorg.NewWatcher(watcherCfg)
 
 	uniArchive := universe.NewArchive(uniArchiveCfg)
+
+	// Pool of outbound gRPC connections used by the federation push
+	// path. The previous per-call dial pattern in
+	// FederationEnvoy.pushProofToServer paid a TLS handshake for every
+	// leaf push; the pool reuses one ClientConn per server and lets
+	// HTTP/2 multiplex calls onto it.
+	//
+	// We deliberately do NOT route the syncer's NewRemoteDiffEngine
+	// through this pool. SyncUniverse is reachable from the public
+	// RPC with a client-supplied host, so pooling those connections
+	// would let a caller grow the pool's host map without bound. The
+	// syncer's existing per-call dial-and-close is fine — it already
+	// reuses one conn for the full sync round against a given host.
+	uniConnPool := rpcserver.NewUniverseConnPool()
+
+	pooledRegistrar := func(
+		addr universe.ServerAddr) (universe.Registrar, error) {
+
+		conn, err := uniConnPool.Get(addr)
+		if err != nil {
+			return nil, err
+		}
+		return rpcserver.NewPooledRpcUniverseRegistrar(conn), nil
+	}
 
 	universeSyncer := universe.NewSimpleSyncer(universe.SimpleSyncCfg{
 		LocalDiffEngine:     uniArchive,
 		NewRemoteDiffEngine: rpcserver.NewRpcUniverseDiff,
 		LocalRegistrar:      uniArchive,
 		SyncBatchSize:       defaultUniverseSyncBatchSize,
+		SyncRootConcurrency: defaultUniverseSyncRootConcurrency,
 	})
 
 	var runtimeIDBytes [8]byte
@@ -451,7 +499,9 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			UniverseSyncer:          universeSyncer,
 			LocalRegistrar:          uniArchive,
 			SyncInterval:            cfg.Universe.SyncInterval,
-			NewRemoteRegistrar:      rpcserver.NewRpcUniverseRegistrar,
+			DisableDeltaSync:        cfg.Universe.NoDeltaSync,
+			SyncAuditInterval:       cfg.Universe.SyncAuditInterval,
+			NewRemoteRegistrar:      pooledRegistrar,
 			StaticFederationMembers: federationMembers,
 			ServerChecker: func(addr universe.ServerAddr) error {
 				return rpcserver.CheckFederationServer(
@@ -653,6 +703,8 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	// manage the supply commitment state machines for each asset group.
 	supplyCommitManager := supplycommit.NewManager(
 		supplycommit.ManagerCfg{
+			AnchoringWatcher:   anchoringWatcher,
+			AnchoringThreshold: uint32(cfg.ReOrgSafeDepth),
 			TreeView:           supplyTreeStore,
 			Commitments:        supplyCommitStore,
 			Wallet:             walletAnchor,
@@ -665,6 +717,10 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			StateLog:           supplyCommitStore,
 			ChainParams:        *tapChainParams.Params,
 			IgnoreCheckerCache: ignoreChecker,
+			IdleCommitInterval: cfg.Universe.
+				SupplyIdleCommitInterval,
+			AutoPublishPending: cfg.Universe.
+				SupplyAutoPublishPending,
 		},
 	)
 
@@ -703,6 +759,9 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			Signer:                 virtualTxSigner,
 			TxValidator:            &tap.ValidatorV0{},
 			ExportLog:              assetStore,
+			AnchoringWatcher:       anchoringWatcher,
+			AnchoringLog:           assetStore,
+			AnchoringThreshold:     uint32(cfg.ReOrgSafeDepth),
 			ChainBridge:            chainBridge,
 			GroupVerifier:          groupVerifier,
 			Wallet:                 walletAnchor,
@@ -711,13 +770,212 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			ProofReader:            porterProofReader,
 			ProofWriter:            proofFileStore,
 			ProofCourierDispatcher: proofCourierDispatcher,
-			ProofWatcher:           reOrgWatcher,
 			IgnoreChecker:          ignoreCheckerOpt,
 			ErrChan:                mainErrChan,
 			BurnCommitter:          supplyCommitManager,
 			DelegationKeyChecker:   addrBook,
 		},
 	)
+
+	genesisAugmenter, err := supplycommit.NewGenesisAugmenter(
+		supplycommit.GenesisAugmenterCfg{
+			PreCommitStore: tapdb.NewSupplyPreCommitStore(
+				mintingStore,
+			),
+			KeyRing:              keyRing,
+			DelegationKeyChecker: addrBook,
+			MintEvents:           supplyCommitManager,
+			ChainParams:          tapChainParams,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create genesis augmenter: %w",
+			err)
+	}
+
+	assetMinter := tapgarden.NewChainPlanter(tapgarden.PlanterConfig{
+		// nolint: lll
+		GardenKit: tapgarden.GardenKit{
+			Wallet:       walletAnchor,
+			ChainBridge:  chainBridge,
+			BatchStore:   assetMintingStore,
+			MintingRefs:  assetMintingStore,
+			TreeStore:    assetMintingStore,
+			KeyRing:      keyRing,
+			GenSigner:    virtualTxSigner,
+			GenTxBuilder: &tapscript.GroupTxBuilder{},
+			TxValidator:  &tap.ValidatorV0{},
+			ProofFiles:   proofFileStore,
+			ProofArchive: proofArchive,
+			MintProofPublisher: mintpublish.NewPublisher(
+				universeFederation,
+				defaultUniverseSyncBatchSize,
+			),
+			IgnoreChecker:      ignoreCheckerOpt,
+			GenesisTxAugmenter: genesisAugmenter,
+			AnchoringWatcher:   anchoringWatcher,
+			MintAnchoringLog:   assetStore,
+			AnchoringThreshold: uint32(cfg.ReOrgSafeDepth),
+		},
+		ChainParams:  tapChainParams,
+		ProofUpdates: proofArchive,
+		ErrChan:      mainErrChan,
+	})
+
+	assetCustodian := tapcustody.NewCustodian(&tapcustody.Config{
+		ChainParams:            &tapChainParams,
+		WalletAnchor:           walletAnchor,
+		ChainBridge:            chainBridge,
+		GroupVerifier:          groupVerifier,
+		AddrBook:               addrBook,
+		Signer:                 lndServices.Signer,
+		ProofArchive:           proofArchive,
+		ProofNotifier:          multiNotifier,
+		ErrChan:                mainErrChan,
+		ProofCourierDispatcher: proofCourierDispatcher,
+		MboxBackoffCfg:         cfg.UniverseRpcCourier.BackoffCfg,
+		ProofRetrievalDelay:    cfg.CustodianProofRetrievalDelay,
+		IgnoreChecker:          ignoreCheckerOpt,
+		AnchoringWatcher:       anchoringWatcher,
+		AnchoringLog:           assetStore,
+		ProofAdoptionLog:       assetStore,
+		AnchoringThreshold:     uint32(cfg.ReOrgSafeDepth),
+		ProofFiles:             proofFileStore,
+	})
+
+	// The sites run on the anchoring watcher: their handlers,
+	// delivery nudges and act-gated effect dispatch are all
+	// registered before the watcher starts.
+	err = anchoringWatcher.RegisterSite(
+		chainPorter.AnchoringSite(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register porter "+
+			"site: %w", err)
+	}
+	err = anchoringWatcher.RegisterDeliveryListener(
+		chainPorter.OnAnchoringDelivered,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register porter "+
+			"delivery listener: %w", err)
+	}
+	// The burn handler is local — it rebuilds the burn records
+	// from stored state and hands them to the supply-commit
+	// event system — and scales with its payload, so it runs
+	// unbounded; the commit push reaches remote universe
+	// servers and keeps the default deadline.
+	err = anchoringWatcher.RegisterEffectHandler(
+		tapfreighter.BurnSupplyEventsEffectKind,
+		chainPorter.DispatchBurnSupplyEvents,
+		tapreorg.WithDispatchTimeout(0),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register burn "+
+			"effect handler: %w", err)
+	}
+	err = anchoringWatcher.RegisterSite(
+		assetCustodian.AnchoringSite(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register receive "+
+			"site: %w", err)
+	}
+	err = anchoringWatcher.RegisterSite(
+		assetMinter.AnchoringSite(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register mint "+
+			"site: %w", err)
+	}
+	err = anchoringWatcher.RegisterDeliveryListener(
+		assetMinter.OnAnchoringDelivered,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register mint "+
+			"delivery listener: %w", err)
+	}
+	// The mint-publish handler's own work is local — one
+	// universe leaf per minted asset — and scales with its
+	// payload: a large batch cannot finish inside the default
+	// deadline and would fail forever at the capped backoff, so
+	// it runs unbounded. Its wait is bounded by the federation
+	// envoy instead: the envoy answers each upsert from its
+	// serial loop, which puts a deadline on every push it makes
+	// to a remote member and drops a member that misses one for
+	// the rest of the batch, so a member that accepts a stream
+	// and never answers costs this effect one deadline per
+	// chunk rather than the outbox until restart.
+	err = anchoringWatcher.RegisterEffectHandler(
+		tapgarden.MintPublishEffectKind,
+		assetMinter.DispatchMintPublish,
+		tapreorg.WithDispatchTimeout(0),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register mint "+
+			"publish handler: %w", err)
+	}
+	err = anchoringWatcher.RegisterSite(&supplycommit.SupplySite{
+		Log: supplyCommitStore,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to register supply "+
+			"site: %w", err)
+	}
+	commitPushCfg := supplycommit.CommitPushCfg{
+		Log:         supplyCommitStore,
+		Syncer:      &supplySyncer,
+		AssetLookup: tapdbAddrBook,
+		IgnoreCache: ignoreChecker,
+	}
+	err = anchoringWatcher.RegisterEffectHandler(
+		supplycommit.CommitPushEffectKind,
+		func(ctx context.Context,
+			id fn.Option[tapreorg.AnchoringID],
+			payload tapreorg.VersionedBlob) error {
+
+			return supplycommit.DispatchCommitPush(
+				ctx, commitPushCfg, id, payload,
+			)
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register commit "+
+			"push handler: %w", err)
+	}
+	err = anchoringWatcher.RegisterEffectHandler(
+		supplycommit.CommitNudgeEffectKind,
+		supplyCommitManager.DispatchCommitNudge,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register commit "+
+			"nudge handler: %w", err)
+	}
+
+	// The sites rewrite and delete database proofs inside
+	// their delivery transactions; the flat-file mirror is
+	// brought back into lockstep afterwards, through the
+	// outbox.
+	mirrorSyncCfg := proof.MirrorSyncCfg{
+		Source: assetStore,
+		Mirror: proofFileStore,
+	}
+	err = anchoringWatcher.RegisterEffectHandler(
+		proof.MirrorSyncEffectKind,
+		func(ctx context.Context,
+			_ fn.Option[tapreorg.AnchoringID],
+			payload tapreorg.VersionedBlob) error {
+
+			return proof.DispatchMirrorSync(
+				ctx, mirrorSyncCfg, payload.Version,
+				payload.Data,
+			)
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to register mirror "+
+			"sync handler: %w", err)
+	}
 
 	auxFundingController := tapchannel.NewFundingController(
 		tapchannel.FundingControllerCfg{
@@ -737,7 +995,6 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			RfqManager:         rfqManager,
 			TxSender:           chainPorter,
 			DefaultCourierAddr: proofCourierAddr,
-			ProofFetcher:       proofCourierDispatcher,
 			AssetSyncer:        addrBook,
 			FeatureBits:        lndFeatureBitsVerifier,
 			IgnoreChecker:      ignoreCheckerOpt,
@@ -778,6 +1035,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			TxSender:           chainPorter,
 			DefaultCourierAddr: proofCourierAddr,
 			ProofArchive:       proofArchive,
+			AnchoringRegistrar: assetCustodian,
 			ProofFetcher:       proofCourierDispatcher,
 			HeaderVerifier:     headerVerifier,
 			GroupVerifier:      groupVerifier,
@@ -800,58 +1058,82 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			GroupVerifier:      groupVerifier,
 			ChainBridge:        chainBridge,
 			IgnoreChecker:      ignoreCheckerOpt,
-			ProofWatcher:       reOrgWatcher,
+			AnchoringRegistrar: assetCustodian,
 		},
 	)
+	// The backup updater keeps an encrypted copy of the wallet's asset
+	// state on disk, in the same spirit as lnd's channel.backup file.
+	var backupUpdater *backup.Updater
+	if !cfg.Backup.Disable {
+		backupUpdater, err = backup.NewUpdater(&backup.UpdaterConfig{
+			FetchAssets: func(ctx context.Context) (
+				[]*asset.ChainAsset, error) {
+
+				// Leased leaves are still ours until their
+				// spend confirms, so they stay in the backup.
+				assets, err := assetStore.FetchAllAssets(
+					ctx, false, true, nil,
+				)
+				if err != nil {
+					return nil, err
+				}
+
+				// Leaves that fund asset channels belong to
+				// lnd's channel state and channel.backup, a
+				// fresh tapd cannot use them on their own.
+				return fn.Filter(assets, backupEligible), nil
+			},
+			LookupSpent: func(ctx context.Context,
+				scriptKey *btcec.PublicKey,
+				anchorPoint wire.OutPoint) (bool, error) {
+
+				leaves, err := assetStore.FetchAllAssets(
+					ctx, true, true,
+					&tapdb.AssetQueryFilters{
+						ScriptKey: &asset.ScriptKey{
+							PubKey: scriptKey,
+						},
+						AnchorPoint: &anchorPoint,
+					},
+				)
+				if err != nil {
+					return false, err
+				}
+
+				return fn.Any(leaves, func(
+					a *asset.ChainAsset) bool {
+
+					return a.IsSpent
+				}), nil
+			},
+			ProofArchive:  proofArchive,
+			KeyLookup:     tapdbAddrBook,
+			GroupLookup:   tapdbAddrBook,
+			ProofNotifier: assetStore,
+			EventNotifiers: []backup.EventNotifier{
+				assetMinter, chainPorter,
+			},
+			KeyDeriver: lndServices.WalletKit,
+			Swapper:    backup.NewFile(cfg.Backup.FilePath),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("unable to create backup "+
+				"updater: %w", err)
+		}
+	}
 
 	// nolint: lll
 	return &tapconfig.Config{
-		DebugLevel:            cfg.DebugLevel,
-		Version:               tap.Version(),
-		RuntimeID:             runtimeID,
-		EnableChannelFeatures: enableChannelFeatures,
-		Lnd:                   lndServices,
-		ChainParams:           tapChainParams,
-		ReOrgWatcher:          reOrgWatcher,
-		AssetMinter: tapgarden.NewChainPlanter(tapgarden.PlanterConfig{
-			// nolint: lll
-			GardenKit: tapgarden.GardenKit{
-				Wallet:                walletAnchor,
-				ChainBridge:           chainBridge,
-				Log:                   assetMintingStore,
-				TreeStore:             assetMintingStore,
-				KeyRing:               keyRing,
-				GenSigner:             virtualTxSigner,
-				GenTxBuilder:          &tapscript.GroupTxBuilder{},
-				TxValidator:           &tap.ValidatorV0{},
-				ProofFiles:            proofFileStore,
-				Universe:              universeFederation,
-				ProofWatcher:          reOrgWatcher,
-				UniversePushBatchSize: defaultUniverseSyncBatchSize,
-				IgnoreChecker:         ignoreCheckerOpt,
-				MintSupplyCommitter:   supplyCommitManager,
-				DelegationKeyChecker:  addrBook,
-			},
-			ChainParams:  tapChainParams,
-			ProofUpdates: proofArchive,
-			ErrChan:      mainErrChan,
-		}),
-		AssetCustodian: tapgarden.NewCustodian(&tapgarden.CustodianConfig{
-			ChainParams:            &tapChainParams,
-			WalletAnchor:           walletAnchor,
-			ChainBridge:            chainBridge,
-			GroupVerifier:          groupVerifier,
-			AddrBook:               addrBook,
-			Signer:                 lndServices.Signer,
-			ProofArchive:           proofArchive,
-			ProofNotifier:          multiNotifier,
-			ErrChan:                mainErrChan,
-			ProofCourierDispatcher: proofCourierDispatcher,
-			MboxBackoffCfg:         cfg.UniverseRpcCourier.BackoffCfg,
-			ProofRetrievalDelay:    cfg.CustodianProofRetrievalDelay,
-			ProofWatcher:           reOrgWatcher,
-			IgnoreChecker:          ignoreCheckerOpt,
-		}),
+		DebugLevel:               cfg.DebugLevel,
+		Version:                  tap.Version(),
+		RuntimeID:                runtimeID,
+		EnableChannelFeatures:    enableChannelFeatures,
+		Lnd:                      lndServices,
+		ChainParams:              tapChainParams,
+		AnchoringWatcher:         anchoringWatcher,
+		AnchoringRegistry:        anchoringRegistry,
+		AssetMinter:              assetMinter,
+		AssetCustodian:           assetCustodian,
 		ChainBridge:              chainBridge,
 		AddrBook:                 addrBook,
 		AddrBookDisableSyncer:    cfg.AddrBook.DisableSyncer,
@@ -868,6 +1150,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		UniverseArchive:          uniArchive,
 		UniverseSyncer:           universeSyncer,
 		UniverseFederation:       universeFederation,
+		UniverseConnPool:         uniConnPool,
 		UniFedSyncAllAssets:      cfg.Universe.SyncAllAssets,
 		UniverseStats:            universeStats,
 		UniversePublicAccess:     universePublicAccess,
@@ -897,8 +1180,21 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			Multiverse:   multiverse,
 			FederationDB: federationDB,
 		},
-		Prometheus: cfg.Prometheus,
+		BackupUpdater: backupUpdater,
+		Prometheus:    cfg.Prometheus,
 	}, nil
+}
+
+// backupEligible reports whether a wallet leaf belongs in the asset wallet
+// backup file. Channel related leaves are excluded, they are covered by lnd's
+// channel state and cannot be used by a tapd restored on their own.
+func backupEligible(a *asset.ChainAsset) bool {
+	if a == nil || a.Asset == nil || a.ScriptKey.TweakedScriptKey == nil {
+		return true
+	}
+
+	return a.ScriptKey.TweakedScriptKey.Type !=
+		asset.ScriptKeyScriptPathChannel
 }
 
 // CreateServerFromConfig creates a new Taproot Asset server from the given CLI
@@ -929,9 +1225,23 @@ func CreateServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
 
 	cfgLogger.Infof("lnd connection initialized")
 
+	// Derive a context that ends when the interceptor signals
+	// shutdown, so long-running startup work — the multiverse
+	// reconcile in particular — can be interrupted.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-shutdownInterceptor.ShutdownChannel():
+			cancel()
+
+		case <-ctx.Done():
+		}
+	}()
+
 	serverCfg, err := genServerConfig(
-		cfg, cfgLogger, &lndConn.LndServices, enableChannelFeatures,
-		mainErrChan,
+		ctx, cfg, cfgLogger, &lndConn.LndServices,
+		enableChannelFeatures, mainErrChan,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to generate server config: %w",
@@ -1035,12 +1345,15 @@ func mboxOutpointChecker(
 }
 
 // ConfigureSubServer updates a Taproot Asset server with the given CLI config.
-func ConfigureSubServer(srv *tap.Server, cfg *Config, cfgLogger btclog.Logger,
-	lndServices *lndclient.LndServices, litdIntegrated bool,
-	mainErrChan chan<- error) error {
+// The context bounds the startup work done here, the multiverse
+// reconcile in particular, and should be derived from the daemon's
+// shutdown signal.
+func ConfigureSubServer(ctx context.Context, srv *tap.Server, cfg *Config,
+	cfgLogger btclog.Logger, lndServices *lndclient.LndServices,
+	litdIntegrated bool, mainErrChan chan<- error) error {
 
 	serverCfg, err := genServerConfig(
-		cfg, cfgLogger, lndServices, litdIntegrated, mainErrChan,
+		ctx, cfg, cfgLogger, lndServices, litdIntegrated, mainErrChan,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to generate server config: %w", err)
@@ -1054,29 +1367,4 @@ func ConfigureSubServer(srv *tap.Server, cfg *Config, cfgLogger btclog.Logger,
 	srv.UpdateConfig(serverCfg)
 
 	return nil
-}
-
-// proofActivationHeight returns the block height from which transition proofs
-// must satisfy the activation rules on the configured network: the configured
-// override, or else the height of the network, if it has one. A custom signet
-// is not the default signet, so the height of the default signet doesn't
-// apply to it.
-func proofActivationHeight(cfg *Config) lfn.Option[uint32] {
-	if cfg.ProofActivationHeight != 0 {
-		return lfn.Some(cfg.ProofActivationHeight)
-	}
-
-	if cfg.ChainConf.Network == "signet" &&
-		cfg.ChainConf.SigNetChallenge != "" {
-
-		challenge, err := hex.DecodeString(
-			cfg.ChainConf.SigNetChallenge,
-		)
-		defaultChallenge := chaincfg.DefaultSignetChallenge
-		if err != nil || !bytes.Equal(challenge, defaultChallenge) {
-			return lfn.None[uint32]()
-		}
-	}
-
-	return proof.NetworkActivationHeight(cfg.ActiveNetParams.Name)
 }

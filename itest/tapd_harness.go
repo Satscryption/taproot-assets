@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/lightninglabs/taproot-assets/cmd/commands"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/rfq"
@@ -168,6 +168,14 @@ type harnessOpts struct {
 	// universe syncer cache.
 	disableSyncCache bool
 
+	// reOrgSafeDepth is the burial depth the node considers a
+	// transaction safely buried at. Itests default to 1 so act-gated
+	// behavior (universe publish, supply commits) fires at the first
+	// confirmation, matching the block counts the tests mine; the
+	// re-org tests override it so burial certification stays deeper
+	// than the re-orgs they generate.
+	reOrgSafeDepth int32
+
 	// sendPriceHint indicates whether the tapd should send price hints from
 	// the local oracle to the counterparty when requesting a quote.
 	sendPriceHint bool
@@ -277,6 +285,14 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		"--logging.file.max-files=99",
 		"--logging.file.max-file-size=999",
 	}
+
+	reOrgSafeDepth := int32(1)
+	if opts.reOrgSafeDepth > 0 {
+		reOrgSafeDepth = opts.reOrgSafeDepth
+	}
+	args = append(args, fmt.Sprintf(
+		"--reorgsafedepth=%d", reOrgSafeDepth,
+	))
 
 	// Resolve the proof courier address.
 	proofCourierAddr := ""
@@ -477,6 +493,12 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		args = append(args, "--experimental.rfq.sendpricehint")
 	}
 
+	// Optional extra tapd flags for integration test matrix runs (for
+	// example supply idle tick regression).
+	if extra := os.Getenv("ITEST_TAPD_EXTRA_ARGS"); extra != "" {
+		args = append(args, strings.Fields(extra)...)
+	}
+
 	// Compute the expected TLS cert path and macaroon path based on
 	// the tapd directory structure that the tapd process will create.
 	tlsCertPath := filepath.Join(cfg.BaseDir, "tls.cert")
@@ -484,7 +506,7 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		cfg.BaseDir, "data", cfg.NetParams.Name, "admin.macaroon",
 	)
 
-	return &tapdHarness{
+	harness := &tapdHarness{
 		cfg:                   &cfg,
 		cliArgs:               args,
 		rpcListenAddr:         rpcListenAddr,
@@ -494,7 +516,12 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		hashmailBackoffCfg:    hashmailBackoffCfg,
 		universeRpcBackoffCfg: universeRpcBackoffCfg,
 		ht:                    ht,
-	}, nil
+	}
+	if ht != nil && ht.nodes != nil {
+		ht.nodes[rpcListenAddr] = harness
+	}
+
+	return harness, nil
 }
 
 // ExecTapCLI uses the CLI parser to invoke the specified tapd harness via RPC,

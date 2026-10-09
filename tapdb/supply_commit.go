@@ -3,7 +3,9 @@ package tapdb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,8 +13,8 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
@@ -134,6 +136,18 @@ type SupplyCommitStore interface {
 		ctx context.Context, arg SupplyCommitMachineParams,
 	) (sqlc.UpsertSupplyCommitStateMachineRow, error)
 
+	// QuerySupplyCommitmentByTxid fetches a supply commitment by its
+	// group key and commit transaction ID.
+	QuerySupplyCommitmentByTxid(ctx context.Context,
+		arg sqlc.QuerySupplyCommitmentByTxidParams) (SupplyCommitment,
+		error)
+
+	// QuerySupplyCommitTransitionByNewCommitment fetches the
+	// transition that created the given commitment.
+	QuerySupplyCommitTransitionByNewCommitment(ctx context.Context,
+		newCommitmentID sql.NullInt64) (
+		sqlc.QuerySupplyCommitTransitionByNewCommitmentRow, error)
+
 	// QueryPendingSupplyCommitTransition fetches the latest non-finalized
 	// transition for a group key.
 	QueryPendingSupplyCommitTransition(ctx context.Context,
@@ -148,9 +162,11 @@ type SupplyCommitStore interface {
 		arg InsertSupplyCommitTransition) (int64, error)
 
 	// InsertSupplyUpdateEvent inserts a new supply update event associated
-	// with a transition.
+	// with a transition. Returns the number of rows affected: 1 on a
+	// genuine insert and 0 when the row was deduped by the
+	// event_key UNIQUE index (ON CONFLICT DO NOTHING).
 	InsertSupplyUpdateEvent(ctx context.Context,
-		arg InsertSupplyUpdateEvent) error
+		arg InsertSupplyUpdateEvent) (int64, error)
 
 	// UpsertChainTx upserts a chain transaction.
 	UpsertChainTx(ctx context.Context,
@@ -496,8 +512,6 @@ func stateToDBString(state supplycommit.State) (string, error) {
 		return "CommitTxSignState", nil
 	case *supplycommit.CommitBroadcastState:
 		return "CommitBroadcastState", nil
-	case *supplycommit.CommitFinalizeState:
-		return "CommitFinalizeState", nil
 	default:
 		return "", fmt.Errorf("unknown state type: %T", state)
 	}
@@ -518,8 +532,6 @@ func stateToInt(state supplycommit.State) (int32, error) {
 		return 4, nil
 	case *supplycommit.CommitBroadcastState:
 		return 5, nil
-	case *supplycommit.CommitFinalizeState:
-		return 6, nil
 	default:
 		return -1, fmt.Errorf("unknown state type: %T", state)
 	}
@@ -541,7 +553,12 @@ func intToState(stateID int32) (supplycommit.State, error) {
 	case 5:
 		return &supplycommit.CommitBroadcastState{}, nil
 	case 6:
-		return &supplycommit.CommitFinalizeState{}, nil
+		// Rows persisted by the legacy finalize state load as the
+		// broadcast state: a pending transition awaiting act-level
+		// finality is exactly what the broadcast state now means,
+		// and its resume path re-derives everything it needs from
+		// the durable record.
+		return &supplycommit.CommitBroadcastState{}, nil
 	default:
 		return nil, fmt.Errorf("unknown state ID: %d", stateID)
 	}
@@ -559,6 +576,24 @@ func updateTypeToInt(treeType supplycommit.SupplySubTree) (int32, error) {
 	default:
 		return -1, fmt.Errorf("unknown tree type: %v", treeType)
 	}
+}
+
+// supplyUpdateEventKey returns the 32-byte content hash used as the
+// dedup key for a supply update event row. The same logical event --
+// same group, same type, same payload bytes -- always hashes to the
+// same value, which is what lets the unique index on event_key
+// silently absorb re-inserts after a cultivator restart.
+func supplyUpdateEventKey(groupKey []byte, updateTypeID int32,
+	eventData []byte) []byte {
+
+	var typeBuf [4]byte
+	binary.BigEndian.PutUint32(typeBuf[:], uint32(updateTypeID))
+
+	h := sha256.New()
+	h.Write(groupKey)
+	h.Write(typeBuf[:])
+	h.Write(eventData)
+	return h.Sum(nil)
 }
 
 // serializeSupplyUpdateEvent encodes a SupplyUpdateEvent into bytes.
@@ -616,7 +651,12 @@ func deserializeSupplyUpdateEvent(typeName string,
 }
 
 // InsertPendingUpdate attempts to insert a new pending update into the
-// update log of the target supply commit state machine.
+// update log of the target supply commit state machine. If the event is
+// absorbed by the content-hash dedup index (an identical event is
+// already recorded), the transaction is rolled back and
+// supplycommit.ErrDuplicateUpdate is returned so the caller can tell a
+// no-op apart from a fresh insert and avoid advancing its own state on
+// the strength of a row that was never written.
 func (s *SupplyCommitMachine) InsertPendingUpdate(ctx context.Context,
 	assetSpec asset.Specifier, event supplycommit.SupplyUpdateEvent) error {
 
@@ -629,29 +669,39 @@ func (s *SupplyCommitMachine) InsertPendingUpdate(ctx context.Context,
 	writeTx := WriteTxOption()
 	return s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
 		// We'll use this helper function to serialize, then insert a
-		// new supply update event into the database.
-		insertUpdate := func(transitionID sql.NullInt64) error {
+		// new supply update event into the database. It returns the
+		// number of rows affected (1 on insert, 0 on dedup) so the
+		// caller can decide whether further work is justified.
+		insertUpdate := func(
+			transitionID sql.NullInt64) (int64, error) {
+
 			var b bytes.Buffer
 			err := serializeSupplyUpdateEvent(&b, event)
 			if err != nil {
-				return fmt.Errorf("failed to serialize event "+
-					"data: %w", err)
+				return 0, fmt.Errorf("failed to serialize "+
+					"event data: %w", err)
 			}
 
 			updateTypeID, err := updateTypeToInt(
 				event.SupplySubTreeType(),
 			)
 			if err != nil {
-				return fmt.Errorf("failed to map update "+
+				return 0, fmt.Errorf("failed to map update "+
 					"type: %w", err)
 			}
+
+			eventData := b.Bytes()
+			eventKey := supplyUpdateEventKey(
+				groupKeyBytes, updateTypeID, eventData,
+			)
 
 			return db.InsertSupplyUpdateEvent(
 				ctx, InsertSupplyUpdateEvent{
 					GroupKey:     groupKeyBytes,
 					TransitionID: transitionID,
 					UpdateTypeID: updateTypeID,
-					EventData:    b.Bytes(),
+					EventData:    eventData,
+					EventKey:     eventKey,
 				},
 			)
 		}
@@ -663,7 +713,11 @@ func (s *SupplyCommitMachine) InsertPendingUpdate(ctx context.Context,
 		)
 
 		// If a pending transition exists, insert the update with the
-		// appropriate transition ID.
+		// appropriate transition ID. On dedup (rows == 0) the
+		// existing pending transition is untouched and the prior row
+		// already carries whatever transition link it should -- but
+		// the caller must still learn that nothing new was written,
+		// so it doesn't cache an event that has no row of its own.
 		if err == nil {
 			//nolint:lll
 			transition := pendingTransitionRow.SupplyCommitTransition
@@ -675,7 +729,15 @@ func (s *SupplyCommitMachine) InsertPendingUpdate(ctx context.Context,
 				transitionID = sqlInt64(transition.TransitionID)
 			}
 
-			return insertUpdate(transitionID)
+			rowsAffected, err := insertUpdate(transitionID)
+			if err != nil {
+				return err
+			}
+			if rowsAffected == 0 {
+				return supplycommit.ErrDuplicateUpdate
+			}
+
+			return nil
 		}
 
 		// If the error is anything other than "no rows", it's a real
@@ -736,10 +798,20 @@ func (s *SupplyCommitMachine) InsertPendingUpdate(ctx context.Context,
 		}
 
 		// With the transition created, we can now insert the update
-		// event, linking it to the new transition.
-		err = insertUpdate(sqlInt64(transitionID))
+		// event, linking it to the new transition. If the insert is
+		// absorbed by the dedup index (rows == 0), the event was
+		// already recorded against a prior, now-finalized transition;
+		// committing the freshly-created transition would leave an
+		// empty pending transition behind and move the state machine
+		// to UpdatesPendingState with nothing to commit. Returning the
+		// sentinel rolls the whole tx back (discarding the fresh
+		// transition row) and tells the caller no new row was written.
+		rowsAffected, err := insertUpdate(sqlInt64(transitionID))
 		if err != nil {
 			return err
+		}
+		if rowsAffected == 0 {
+			return supplycommit.ErrDuplicateUpdate
 		}
 
 		// Finally, we'll explicitly set the state machine to the
@@ -800,42 +872,171 @@ func (s *SupplyCommitMachine) BindDanglingUpdatesToTransition(
 	}
 	groupKeyBytes := schnorr.SerializePubKey(groupKey)
 
-	var (
-		boundEvents []supplycommit.SupplyUpdateEvent
-	)
+	var boundEvents []supplycommit.SupplyUpdateEvent
 	writeTx := WriteTxOption()
 	err := s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
-		eventRows, err := db.QueryDanglingSupplyUpdateEvents(
-			ctx, groupKeyBytes,
+		var err error
+		boundEvents, err = bindDanglingUpdatesBody(
+			ctx, db, groupKeyBytes,
+		)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return boundEvents, nil
+}
+
+// bindDanglingUpdatesBody is the transaction-scoped body of
+// BindDanglingUpdatesToTransition: it gathers all dangling supply
+// update events for the group and binds them to a freshly created
+// pending transition whose old commitment is the machine's latest. It
+// returns nil with no side effects when nothing is dangling.
+func bindDanglingUpdatesBody(ctx context.Context, db SupplyCommitStore,
+	groupKeyBytes []byte) ([]supplycommit.SupplyUpdateEvent, error) {
+
+	eventRows, err := db.QueryDanglingSupplyUpdateEvents(
+		ctx, groupKeyBytes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query dangling "+
+			"events: %w", err)
+	}
+
+	if len(eventRows) == 0 {
+		return nil, nil
+	}
+
+	// We have dangling updates. So we'll now move to create a new
+	// transition for them.
+	stateMachine, err := db.QuerySupplyCommitStateMachine(
+		ctx, groupKeyBytes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query state "+
+			"machine: %w", err)
+	}
+	latestCommitID := stateMachine.LatestCommitmentID
+
+	transitionID, err := db.InsertSupplyCommitTransition(
+		ctx, InsertSupplyCommitTransition{
+			StateMachineGroupKey: groupKeyBytes,
+			OldCommitmentID:      latestCommitID,
+			Finalized:            false,
+			CreationTime:         time.Now().Unix(),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert new "+
+			"transition: %w", err)
+	}
+
+	// With the new transition created, we'll now link all the
+	// dangling updates.
+	err = db.LinkDanglingSupplyUpdateEvents(
+		ctx, LinkDanglingSupplyUpdateEventsParams{
+			GroupKey:     groupKeyBytes,
+			TransitionID: sqlInt64(transitionID),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to link dangling "+
+			"events: %w", err)
+	}
+
+	boundEvents := make(
+		[]supplycommit.SupplyUpdateEvent, 0, len(eventRows),
+	)
+	for _, eventRow := range eventRows {
+		event, err := deserializeSupplyUpdateEvent(
+			eventRow.UpdateTypeName,
+			bytes.NewReader(eventRow.EventData),
 		)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil
-			}
-			return fmt.Errorf("failed to query dangling "+
-				"events: %w", err)
+			return nil, fmt.Errorf("failed to deserialize "+
+				"event: %w", err)
 		}
+		boundEvents = append(boundEvents, event)
+	}
 
-		if len(eventRows) == 0 {
-			return nil
-		}
+	return boundEvents, nil
+}
 
-		// We have dangling updates. So we'll now move to create a new
-		// transition for them.
+// BeginIdleTransition starts a new, frozen transition that spends the latest
+// confirmed supply commitment without requiring a new supply update. Any
+// dangling updates are bound to the new transition and returned. The state
+// machine must be in the default state, have a latest commitment, and have no
+// pending transition.
+func (s *SupplyCommitMachine) BeginIdleTransition(ctx context.Context,
+	assetSpec asset.Specifier) ([]supplycommit.SupplyUpdateEvent, error) {
+
+	groupKey := assetSpec.UnwrapGroupKeyToPtr()
+	if groupKey == nil {
+		return nil, ErrMissingGroupKey
+	}
+	groupKeyBytes := schnorr.SerializePubKey(groupKey)
+
+	var boundEvents []supplycommit.SupplyUpdateEvent
+
+	writeTx := WriteTxOption()
+	err := s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
+		// Start from a clean slate, so a failed attempt can be retried.
+		boundEvents = nil
+
 		stateMachine, err := db.QuerySupplyCommitStateMachine(
 			ctx, groupKeyBytes,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to query state "+
-				"machine: %w", err)
+			return fmt.Errorf("failed to query state machine: %w",
+				err)
 		}
-		latestCommitID := stateMachine.LatestCommitmentID
 
+		currentState, err := intToState(stateMachine.CurrentStateID)
+		if err != nil {
+			return fmt.Errorf("invalid state ID %d: %w",
+				stateMachine.CurrentStateID, err)
+		}
+		if _, ok := currentState.(*supplycommit.DefaultState); !ok {
+			return fmt.Errorf("cannot begin idle transition in "+
+				"state: %s", currentState.String())
+		}
+
+		// An idle transition spends the latest commitment, so there
+		// has to be one.
+		if !stateMachine.LatestCommitmentID.Valid {
+			return fmt.Errorf("cannot begin idle transition "+
+				"without a latest commitment for group key %x",
+				groupKeyBytes)
+		}
+
+		// We can't start a new transition while one is pending.
+		_, err = db.QueryPendingSupplyCommitTransition(
+			ctx, groupKeyBytes,
+		)
+		switch {
+		case err == nil:
+			return fmt.Errorf("cannot begin idle transition, "+
+				"a transition is already pending for group "+
+				"key %x", groupKeyBytes)
+
+		case !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("failed to query pending "+
+				"transition: %w", err)
+		}
+
+		// The transition is created frozen, so that updates arriving
+		// while it is in flight become dangling updates for the next
+		// one.
 		transitionID, err := db.InsertSupplyCommitTransition(
 			ctx, InsertSupplyCommitTransition{
 				StateMachineGroupKey: groupKeyBytes,
-				OldCommitmentID:      latestCommitID,
+				OldCommitmentID:      stateMachine.LatestCommitmentID, //nolint:lll
 				Finalized:            false,
+				Frozen:               true,
 				CreationTime:         time.Now().Unix(),
 			},
 		)
@@ -844,17 +1045,26 @@ func (s *SupplyCommitMachine) BindDanglingUpdatesToTransition(
 				"transition: %w", err)
 		}
 
-		// With the new transition created, we'll now link all the
-		// dangling updates.
-		err = db.LinkDanglingSupplyUpdateEvents(
-			ctx, LinkDanglingSupplyUpdateEventsParams{
-				GroupKey:     groupKeyBytes,
-				TransitionID: sqlInt64(transitionID),
-			},
+		// Bind any dangling updates, they are committed together with
+		// the idle successor.
+		eventRows, err := db.QueryDanglingSupplyUpdateEvents(
+			ctx, groupKeyBytes,
 		)
-		if err != nil {
-			return fmt.Errorf("failed to link dangling "+
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to query dangling "+
 				"events: %w", err)
+		}
+		if len(eventRows) > 0 {
+			err = db.LinkDanglingSupplyUpdateEvents(
+				ctx, LinkDanglingSupplyUpdateEventsParams{
+					GroupKey:     groupKeyBytes,
+					TransitionID: sqlInt64(transitionID),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to link dangling "+
+					"events: %w", err)
+			}
 		}
 
 		boundEvents = make(
@@ -872,9 +1082,28 @@ func (s *SupplyCommitMachine) BindDanglingUpdatesToTransition(
 			boundEvents = append(boundEvents, event)
 		}
 
+		// Finally persist the updates pending state, so the cycle is
+		// resumed after a restart.
+		pendingStateName, err := stateToDBString(
+			&supplycommit.UpdatesPendingState{},
+		)
+		if err != nil {
+			return fmt.Errorf("error getting pending state "+
+				"name: %w", err)
+		}
+		_, err = db.UpsertSupplyCommitStateMachine(
+			ctx, SupplyCommitMachineParams{
+				GroupKey:  groupKeyBytes,
+				StateName: sqlStr(pendingStateName),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to update state machine "+
+				"to pending: %w", err)
+		}
+
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -882,132 +1111,123 @@ func (s *SupplyCommitMachine) BindDanglingUpdatesToTransition(
 	return boundEvents, nil
 }
 
-// InsertSignedCommitTx associates a new signed commitment anchor transaction
-// with the current active supply commitment state transition.
-func (s *SupplyCommitMachine) InsertSignedCommitTx(ctx context.Context,
-	assetSpec asset.Specifier,
+// insertSignedCommitTxBody persists a signed commitment transaction within
+// the caller's transaction: it stores the transaction, links it to the
+// pending transition, and moves the state-machine row to
+// CommitBroadcastState.
+func insertSignedCommitTxBody(ctx context.Context, db SupplyCommitStore,
+	groupKeyBytes []byte,
 	commitDetails supplycommit.SupplyCommitTxn) error {
-
-	groupKey := assetSpec.UnwrapGroupKeyToPtr()
-	if groupKey == nil {
-		return ErrMissingGroupKey
-	}
-	groupKeyBytes := schnorr.SerializePubKey(groupKey)
 
 	commitTx := commitDetails.Txn
 	internalKeyDesc := commitDetails.InternalKey
 	outputKey := commitDetails.OutputKey
 	outputIndex := commitDetails.OutputIndex
 
-	writeTx := WriteTxOption()
-	return s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
-		// First, we'll locate the current pending transition for the
-		// state machine.
-		//
-		//nolint:lll
-		pendingTransitionRow, err := db.QueryPendingSupplyCommitTransition(
-			ctx, groupKeyBytes,
-		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("no pending transition "+
-					"found for group key %x",
-					groupKeyBytes)
-			}
-
-			return fmt.Errorf("failed to query pending "+
-				"transition: %w", err)
-		}
-		pendingTransition := pendingTransitionRow.SupplyCommitTransition
-
-		// Next, we'll upsert the chain transaction on disk. The block
-		// related fields are nil as this hasn't been confirmed yet.
-		// Block related fields are populated once the tx confirms.
-		var txBytes bytes.Buffer
-		if err := commitTx.Serialize(&txBytes); err != nil {
-			return fmt.Errorf("failed to serialize commit "+
-				"tx: %w", err)
-		}
-		txid := commitTx.TxHash()
-		chainTxID, err := db.UpsertChainTx(ctx, UpsertChainTxParams{
-			Txid:  txid[:],
-			RawTx: txBytes.Bytes(),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to upsert commit chain tx: "+
-				"%w", err)
+	// First, we'll locate the current pending transition for the
+	// state machine.
+	pendingTransitionRow, err := db.QueryPendingSupplyCommitTransition(
+		ctx, groupKeyBytes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("no pending transition "+
+				"found for group key %x",
+				groupKeyBytes)
 		}
 
-		// Upsert the internal key to get its ID, preserving the full
-		// key derivation information for proper PSBT signing later.
-		internalKeyID, err := db.UpsertInternalKey(ctx, InternalKey{
-			RawKey:    internalKeyDesc.PubKey.SerializeCompressed(),
-			KeyFamily: int32(internalKeyDesc.Family),
-			KeyIndex:  int32(internalKeyDesc.Index),
-		})
-		if err != nil {
-			return fmt.Errorf("error upserting internal key %x: %w",
-				internalKeyDesc.PubKey.SerializeCompressed(),
-				err)
-		}
+		return fmt.Errorf("failed to query pending "+
+			"transition: %w", err)
+	}
+	pendingTransition := pendingTransitionRow.SupplyCommitTransition
 
-		// Insert the new commitment record. Chain details (block
-		// height, header, proof, output index) are NULL at this stage.
-		params := sqlc.InsertSupplyCommitmentParams{
-			GroupKey:        groupKeyBytes,
-			ChainTxnID:      chainTxID,
-			InternalKeyID:   internalKeyID,
-			OutputKey:       outputKey.SerializeCompressed(),
-			SupplyRootHash:  nil,
-			SupplyRootSum:   sql.NullInt64{},
-			OutputIndex:     sqlInt32(outputIndex),
-			SpentCommitment: pendingTransition.OldCommitmentID,
-		}
-		newCommitmentID, err := db.InsertSupplyCommitment(ctx, params)
-		if err != nil {
-			return fmt.Errorf("failed to insert new supply "+
-				"commitment: %w", err)
-		}
-
-		// Update the transition record to link to the new commitment ID
-		// and the pending chain transaction ID in a single query.
-		err = db.UpdateSupplyCommitTransitionCommitment(
-			ctx, UpdateSupplyCommitTransitionCommitmentParams{
-				NewCommitmentID:    sqlInt64(newCommitmentID),
-				PendingCommitTxnID: sqlInt64(chainTxID),
-				TransitionID:       pendingTransition.TransitionID, //nolint:lll
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update transition "+
-				"commitment: %w", err)
-		}
-
-		// As the final step, we'll now update the state on disk to move
-		// broadcast the commit txn we just signed.
-		// to the broadcast state. This ensures that on restart we'll
-		broadcastStateName, err := stateToDBString(
-			&supplycommit.CommitBroadcastState{},
-		)
-		if err != nil {
-			return fmt.Errorf("error getting broadcast state "+
-				"name: %w", err)
-		}
-		// We only update the state name here, leaving the commitment ID
-		// as is (by passing NULL).
-		_, err = db.UpsertSupplyCommitStateMachine(
-			ctx, SupplyCommitMachineParams{
-				GroupKey:  groupKeyBytes,
-				StateName: sqlStr(broadcastStateName),
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update state machine "+
-				"state: %w", err)
-		}
-
-		return nil
+	// Next, we'll upsert the chain transaction on disk. The block
+	// related fields are nil as this hasn't been confirmed yet.
+	// Block related fields are populated once the tx confirms.
+	var txBytes bytes.Buffer
+	if err := commitTx.Serialize(&txBytes); err != nil {
+		return fmt.Errorf("failed to serialize commit "+
+			"tx: %w", err)
+	}
+	txid := commitTx.TxHash()
+	chainTxID, err := db.UpsertChainTx(ctx, UpsertChainTxParams{
+		Txid:  txid[:],
+		RawTx: txBytes.Bytes(),
 	})
+	if err != nil {
+		return fmt.Errorf("failed to upsert commit chain tx: "+
+			"%w", err)
+	}
+
+	// Upsert the internal key to get its ID, preserving the full
+	// key derivation information for proper PSBT signing later.
+	internalKeyID, err := db.UpsertInternalKey(ctx, InternalKey{
+		RawKey:    internalKeyDesc.PubKey.SerializeCompressed(),
+		KeyFamily: int32(internalKeyDesc.Family),
+		KeyIndex:  int32(internalKeyDesc.Index),
+	})
+	if err != nil {
+		return fmt.Errorf("error upserting internal key %x: %w",
+			internalKeyDesc.PubKey.SerializeCompressed(),
+			err)
+	}
+
+	// Insert the new commitment record. Chain details (block
+	// height, header, proof, output index) are NULL at this stage.
+	params := sqlc.InsertSupplyCommitmentParams{
+		GroupKey:        groupKeyBytes,
+		ChainTxnID:      chainTxID,
+		InternalKeyID:   internalKeyID,
+		OutputKey:       outputKey.SerializeCompressed(),
+		SupplyRootHash:  nil,
+		SupplyRootSum:   sql.NullInt64{},
+		OutputIndex:     sqlInt32(outputIndex),
+		SpentCommitment: pendingTransition.OldCommitmentID,
+	}
+	newCommitmentID, err := db.InsertSupplyCommitment(ctx, params)
+	if err != nil {
+		return fmt.Errorf("failed to insert new supply "+
+			"commitment: %w", err)
+	}
+
+	// Update the transition record to link to the new commitment ID
+	// and the pending chain transaction ID in a single query.
+	err = db.UpdateSupplyCommitTransitionCommitment(
+		ctx, UpdateSupplyCommitTransitionCommitmentParams{
+			NewCommitmentID:    sqlInt64(newCommitmentID),
+			PendingCommitTxnID: sqlInt64(chainTxID),
+			TransitionID:       pendingTransition.TransitionID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update transition "+
+			"commitment: %w", err)
+	}
+
+	// As the final step, we'll now update the state on disk to move
+	// broadcast the commit txn we just signed.
+	// to the broadcast state. This ensures that on restart we'll
+	broadcastStateName, err := stateToDBString(
+		&supplycommit.CommitBroadcastState{},
+	)
+	if err != nil {
+		return fmt.Errorf("error getting broadcast state "+
+			"name: %w", err)
+	}
+	// We only update the state name here, leaving the commitment ID
+	// as is (by passing NULL).
+	_, err = db.UpsertSupplyCommitStateMachine(
+		ctx, SupplyCommitMachineParams{
+			GroupKey:  groupKeyBytes,
+			StateName: sqlStr(broadcastStateName),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update state machine "+
+			"state: %w", err)
+	}
+
+	return nil
 }
 
 // InsertSupplyCommit inserts a new, fully complete supply commitment into the
@@ -1037,6 +1257,30 @@ func (s *SupplyCommitMachine) InsertSupplyCommit(ctx context.Context,
 
 	writeTx := WriteTxOption()
 	return s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
+		// A commitment already stored under its outpoint has been
+		// fully applied: the insert below runs in this one
+		// transaction, so the row's existence implies its leaves
+		// and pre-commitment spends landed with it. Absorb the
+		// duplicate rather than failing the outpoint uniqueness —
+		// re-pushes and redelivered pulls present the same
+		// commitment again by design.
+		commitTxidCheck := commitTx.TxHash()
+		_, err := db.QuerySupplyCommitmentByOutpoint(
+			ctx, sqlc.QuerySupplyCommitmentByOutpointParams{
+				GroupKey:    groupKeyBytes,
+				Txid:        commitTxidCheck[:],
+				OutputIndex: sqlInt32(outputIndex),
+			},
+		)
+		switch {
+		case err == nil:
+			return nil
+
+		case !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("failed to check for existing "+
+				"commitment: %w", err)
+		}
+
 		// Next, we'll upsert the chain transaction on disk. The block
 		// related fields are nil as this hasn't been confirmed yet.
 		var txBytes bytes.Buffer
@@ -1824,212 +2068,233 @@ func (s *SupplyCommitMachine) ApplyStateTransition(
 
 	writeTx := WriteTxOption()
 	return s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
-		// First, we'll locate the state transition that we need to
-		// finalize based on the group key.
-		dbTransitionRow, err := db.QueryPendingSupplyCommitTransition(
-			ctx, groupKeyBytes,
+		return applyStateTransitionBody(
+			ctx, db, assetSpec, groupKeyBytes, transition,
 		)
-		if err != nil {
-			// If no pending transition exists, then we'll return an
-			// error.
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("cannot apply transition, "+
-					"no pending transition found for %x",
-					groupKeyBytes)
-			}
-			return fmt.Errorf("failed to query pending "+
-				"transition: %w", err)
-		}
-		dbTransition := dbTransitionRow.SupplyCommitTransition
-		transitionID := dbTransition.TransitionID
+	})
+}
 
-		// Next, we'll update the supply commitment data, before we do
-		// that, perform some basic sanity checks.
-		if !dbTransition.NewCommitmentID.Valid {
-			return fmt.Errorf("pending transition %d has no "+
-				"NewCommitmentID", transitionID)
-		}
-		newCommitmentID := dbTransition.NewCommitmentID.Int64
-		if !dbTransition.PendingCommitTxnID.Valid {
-			return fmt.Errorf("pending transition %d has no "+
-				"PendingCommitTxnID", transitionID)
-		}
-		chainTxnID := dbTransition.PendingCommitTxnID.Int64
+// applyStateTransitionBody is the transaction-scoped body of
+// ApplyStateTransition. It runs against whatever transaction the caller
+// has open: the state machine's own write transaction on the legacy
+// path, or the re-org watcher's delivery transaction on the anchoring
+// path. The transition's NewCommitment must carry the commit
+// transaction; the supply root is recomputed from the durable trees, so
+// the in-memory root is not required here.
+func applyStateTransitionBody(ctx context.Context, db SupplyCommitStore,
+	assetSpec asset.Specifier, groupKeyBytes []byte,
+	transition supplycommit.SupplyStateTransition) error {
 
-		// Next, we'll apply all the pending updates to the supply
-		// sub-trees, then use that to update the root tree.
-		//
-		finalRootSupplyRoot, err := applySupplyUpdatesInternal(
-			ctx, db, assetSpec, transition.PendingUpdates,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to apply SMT updates: "+
-				"%w", err)
-		}
+	newCommitment := transition.NewCommitment
+	if newCommitment.Txn == nil {
+		return fmt.Errorf("transition has no commit transaction")
+	}
 
-		// Update the commitment record with the calculated root hash
-		// and sum.
-		finalRootHash := finalRootSupplyRoot.NodeHash()
-		finalRootSum := finalRootSupplyRoot.NodeSum()
-		err = db.UpdateSupplyCommitmentRoot(
-			ctx, UpdateSupplyCommitmentRootParams{
-				CommitID:       newCommitmentID,
-				SupplyRootHash: finalRootHash[:],
-				SupplyRootSum:  sqlInt64(int64(finalRootSum)),
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update commitment root "+
-				"hash/sum for commit %d: %w",
-				newCommitmentID, err)
+	// First, we'll locate the state transition that we need to
+	// finalize based on the group key.
+	dbTransitionRow, err := db.QueryPendingSupplyCommitTransition(
+		ctx, groupKeyBytes,
+	)
+	if err != nil {
+		// If no pending transition exists, then we'll return an
+		// error.
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("cannot apply transition, "+
+				"no pending transition found for %x",
+				groupKeyBytes)
 		}
+		return fmt.Errorf("failed to query pending "+
+			"transition: %w", err)
+	}
+	dbTransition := dbTransitionRow.SupplyCommitTransition
+	transitionID := dbTransition.TransitionID
 
-		// Next, we'll serialize the merkle proofs and block header, so
-		// we can update them on disk.
-		var (
-			proofBuf  bytes.Buffer
-			headerBuf bytes.Buffer
+	// Next, we'll update the supply commitment data, before we do
+	// that, perform some basic sanity checks.
+	if !dbTransition.NewCommitmentID.Valid {
+		return fmt.Errorf("pending transition %d has no "+
+			"NewCommitmentID", transitionID)
+	}
+	newCommitmentID := dbTransition.NewCommitmentID.Int64
+	if !dbTransition.PendingCommitTxnID.Valid {
+		return fmt.Errorf("pending transition %d has no "+
+			"PendingCommitTxnID", transitionID)
+	}
+	chainTxnID := dbTransition.PendingCommitTxnID.Int64
+
+	// Next, we'll apply all the pending updates to the supply
+	// sub-trees, then use that to update the root tree.
+	//
+	finalRootSupplyRoot, err := applySupplyUpdatesInternal(
+		ctx, db, assetSpec, transition.PendingUpdates,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to apply SMT updates: "+
+			"%w", err)
+	}
+
+	// Update the commitment record with the calculated root hash
+	// and sum.
+	finalRootHash := finalRootSupplyRoot.NodeHash()
+	finalRootSum := finalRootSupplyRoot.NodeSum()
+	err = db.UpdateSupplyCommitmentRoot(
+		ctx, UpdateSupplyCommitmentRootParams{
+			CommitID:       newCommitmentID,
+			SupplyRootHash: finalRootHash[:],
+			SupplyRootSum:  sqlInt64(int64(finalRootSum)),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update commitment root "+
+			"hash/sum for commit %d: %w",
+			newCommitmentID, err)
+	}
+
+	// Next, we'll serialize the merkle proofs and block header, so
+	// we can update them on disk.
+	var (
+		proofBuf  bytes.Buffer
+		headerBuf bytes.Buffer
+	)
+	chainProof, err := transition.ChainProof.UnwrapOrErr(
+		fmt.Errorf("chain proof is required"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap "+
+			"chain proof: %w", err)
+	}
+	err = chainProof.MerkleProof.Encode(&proofBuf)
+	if err != nil {
+		return fmt.Errorf("failed to encode "+
+			"merkle proof: %w", err)
+	}
+	err = chainProof.Header.Serialize(&headerBuf)
+	if err != nil {
+		return fmt.Errorf("failed to "+
+			"serialize block header: %w",
+			err)
+	}
+	blockHeight := sqlInt32(chainProof.BlockHeight)
+
+	// With all the information serialized above, we'll now update
+	// the chain proof information for this current supply commit.
+	err = db.UpdateSupplyCommitmentChainDetails(
+		ctx, SupplyCommitChainDetails{
+			CommitID:    newCommitmentID,
+			MerkleProof: proofBuf.Bytes(),
+			OutputIndex: sqlInt32(newCommitment.TxOutIdx),
+			BlockHeader: headerBuf.Bytes(),
+			ChainTxnID:  chainTxnID,
+			BlockHeight: blockHeight,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update commitment chain "+
+			"details: %w", err)
+	}
+
+	// Also update the chain_txns record itself with the
+	// confirmation details (block hash, height, index).
+	var commitTxBytes bytes.Buffer
+	err = newCommitment.Txn.Serialize(&commitTxBytes)
+	if err != nil {
+		return fmt.Errorf("failed to serialize commit tx for "+
+			"update: %w", err)
+	}
+	commitTxid := newCommitment.Txn.TxHash()
+
+	_, err = db.UpsertChainTx(ctx, UpsertChainTxParams{
+		Txid:      commitTxid[:],
+		RawTx:     commitTxBytes.Bytes(),
+		ChainFees: 0,
+		BlockHash: lnutils.ByteSlice(
+			chainProof.Header.BlockHash(),
+		),
+		BlockHeight: blockHeight,
+		TxIndex:     sqlInt32(chainProof.TxIndex),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update chain_txns "+
+			"confirmation: %w", err)
+	}
+
+	// Mark the specific pre-commitments that were spent in this
+	// transaction as spent by the new commitment. We identify them
+	// by looking at the transaction inputs.
+	for _, txIn := range newCommitment.Txn.TxIn {
+		outpointBytes, err := encodeOutpoint(
+			txIn.PreviousOutPoint,
 		)
-		chainProof, err := transition.ChainProof.UnwrapOrErr(
-			fmt.Errorf("chain proof is required"),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to unwrap "+
-				"chain proof: %w", err)
-		}
-		err = chainProof.MerkleProof.Encode(&proofBuf)
 		if err != nil {
 			return fmt.Errorf("failed to encode "+
-				"merkle proof: %w", err)
+				"outpoint %v: %w",
+				txIn.PreviousOutPoint, err)
 		}
-		err = chainProof.Header.Serialize(&headerBuf)
-		if err != nil {
-			return fmt.Errorf("failed to "+
-				"serialize block header: %w",
-				err)
-		}
-		blockHeight := sqlInt32(chainProof.BlockHeight)
 
-		// With all the information serialized above, we'll now update
-		// the chain proof information for this current supply commit.
-		err = db.UpdateSupplyCommitmentChainDetails(
-			ctx, SupplyCommitChainDetails{
-				CommitID:    newCommitmentID,
-				MerkleProof: proofBuf.Bytes(),
-				OutputIndex: sqlInt32(newCommitment.TxOutIdx),
-				BlockHeader: headerBuf.Bytes(),
-				ChainTxnID:  chainTxnID,
-				BlockHeight: blockHeight,
+		log.Infof("Attempting to mark outpoint as "+
+			"spent: %v (hash=%x, index=%d)",
+			txIn.PreviousOutPoint,
+			txIn.PreviousOutPoint.Hash[:],
+			txIn.PreviousOutPoint.Index)
+
+		// Mark this specific pre-commitment as spent.
+		err = db.MarkMintPreCommitSpentByOutpoint(ctx,
+			sqlc.MarkMintPreCommitSpentByOutpointParams{
+				SpentByCommitID: sqlInt64(
+					newCommitmentID,
+				),
+				Outpoint: outpointBytes,
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("failed to update commitment chain "+
-				"details: %w", err)
+			// It's OK if this outpoint doesn't exist in our
+			// table - it might be an old commitment output
+			// or a wallet input for fees. We only care
+			// about marking actual pre-commitments as
+			// spent.
+			log.Debugf("Could not mark outpoint %v as "+
+				"spent (may not be a "+
+				"pre-commitment): %v",
+				txIn.PreviousOutPoint, err)
+		} else {
+			log.Infof("Successfully marked outpoint "+
+				"as spent: %v", txIn.PreviousOutPoint)
 		}
+	}
 
-		// Also update the chain_txns record itself with the
-		// confirmation details (block hash, height, index).
-		var commitTxBytes bytes.Buffer
-		err = newCommitment.Txn.Serialize(&commitTxBytes)
-		if err != nil {
-			return fmt.Errorf("failed to serialize commit tx for "+
-				"update: %w", err)
-		}
-		commitTxid := newCommitment.Txn.TxHash()
+	// To finish up our book keeping, we'll now finalize the state
+	// transition on disk.
+	err = db.FinalizeSupplyCommitTransition(ctx, transitionID)
+	if err != nil {
+		return fmt.Errorf("failed to finalize transition: "+
+			"%w", err)
+	}
 
-		_, err = db.UpsertChainTx(ctx, UpsertChainTxParams{
-			Txid:      commitTxid[:],
-			RawTx:     commitTxBytes.Bytes(),
-			ChainFees: 0,
-			BlockHash: lnutils.ByteSlice(
-				chainProof.Header.BlockHash(),
-			),
-			BlockHeight: blockHeight,
-			TxIndex:     sqlInt32(chainProof.TxIndex),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to update chain_txns "+
-				"confirmation: %w", err)
-		}
+	// Finally, we'll update the state on disk to be default again,
+	// while also pointing to the _new_ supply commitment on disk.
+	// We'll update both the state name and the latest commitment
+	// ID.
+	defaultStateName, err := stateToDBString(
+		&supplycommit.DefaultState{},
+	)
+	if err != nil {
+		return fmt.Errorf("error getting default state "+
+			"name: %w", err)
+	}
 
-		// Mark the specific pre-commitments that were spent in this
-		// transaction as spent by the new commitment. We identify them
-		// by looking at the transaction inputs.
-		for _, txIn := range newCommitment.Txn.TxIn {
-			outpointBytes, err := encodeOutpoint(
-				txIn.PreviousOutPoint,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to encode "+
-					"outpoint %v: %w",
-					txIn.PreviousOutPoint, err)
-			}
+	_, err = db.UpsertSupplyCommitStateMachine(
+		ctx, SupplyCommitMachineParams{
+			GroupKey:           groupKeyBytes,
+			StateName:          sqlStr(defaultStateName),
+			LatestCommitmentID: dbTransition.NewCommitmentID, //nolint:lll
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update state machine to "+
+			"default: %w", err)
+	}
 
-			log.Infof("Attempting to mark outpoint as "+
-				"spent: %v (hash=%x, index=%d)",
-				txIn.PreviousOutPoint,
-				txIn.PreviousOutPoint.Hash[:],
-				txIn.PreviousOutPoint.Index)
-
-			// Mark this specific pre-commitment as spent.
-			err = db.MarkMintPreCommitSpentByOutpoint(ctx,
-				sqlc.MarkMintPreCommitSpentByOutpointParams{
-					SpentByCommitID: sqlInt64(
-						newCommitmentID,
-					),
-					Outpoint: outpointBytes,
-				},
-			)
-			if err != nil {
-				// It's OK if this outpoint doesn't exist in our
-				// table - it might be an old commitment output
-				// or a wallet input for fees. We only care
-				// about marking actual pre-commitments as
-				// spent.
-				log.Debugf("Could not mark outpoint %v as "+
-					"spent (may not be a "+
-					"pre-commitment): %v",
-					txIn.PreviousOutPoint, err)
-			} else {
-				log.Infof("Successfully marked outpoint "+
-					"as spent: %v", txIn.PreviousOutPoint)
-			}
-		}
-
-		// To finish up our book keeping, we'll now finalize the state
-		// transition on disk.
-		err = db.FinalizeSupplyCommitTransition(ctx, transitionID)
-		if err != nil {
-			return fmt.Errorf("failed to finalize transition: "+
-				"%w", err)
-		}
-
-		// Finally, we'll update the state on disk to be default again,
-		// while also pointing to the _new_ supply commitment on disk.
-		// We'll update both the state name and the latest commitment
-		// ID.
-		defaultStateName, err := stateToDBString(
-			&supplycommit.DefaultState{},
-		)
-		if err != nil {
-			return fmt.Errorf("error getting default state "+
-				"name: %w", err)
-		}
-
-		_, err = db.UpsertSupplyCommitStateMachine(
-			ctx, SupplyCommitMachineParams{
-				GroupKey:           groupKeyBytes,
-				StateName:          sqlStr(defaultStateName),
-				LatestCommitmentID: dbTransition.NewCommitmentID, //nolint:lll
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update state machine to "+
-				"default: %w", err)
-		}
-
-		return nil
-	})
+	return nil
 }
 
 // Compile-time assertions to ensure SupplyCommitMachine implements the

@@ -14,13 +14,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/caddyserver/certmagic"
 	"github.com/jessevdk/go-flags"
 	"github.com/lightninglabs/lndclient"
 	tap "github.com/lightninglabs/taproot-assets"
+	"github.com/lightninglabs/taproot-assets/backup"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/lncfg"
 	"github.com/lightninglabs/taproot-assets/lndservices"
@@ -31,6 +32,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/cert"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/verrpc"
 	"github.com/lightningnetwork/lnd/signal"
@@ -110,9 +112,23 @@ const (
 	// to sync Universe state with the federation.
 	defaultUniverseSyncInterval = time.Minute * 10
 
+	// defaultUniverseSyncAuditInterval is the default period between
+	// the full enumeration syncs that audit cursor-based delta sync.
+	// Matches universe.DefaultSyncAuditInterval.
+	defaultUniverseSyncAuditInterval = time.Hour * 24
+
 	// defaultUniverseSyncBatchSize is the default number of proofs we'll
-	// sync in a single batch.
-	defaultUniverseSyncBatchSize = 200
+	// sync in a single batch. Kept small to shorten the write-side DB
+	// transaction and reduce contention when several roots are being
+	// synced concurrently — see issue #2026 for the "db tx retries
+	// exceeded" symptom the old value of 200 was surfacing.
+	defaultUniverseSyncBatchSize = 50
+
+	// defaultUniverseSyncRootConcurrency caps the number of universe
+	// roots the syncer processes at once. A small cap in combination
+	// with the smaller batch size above keeps the write-side DB
+	// transaction pool from thrashing.
+	defaultUniverseSyncRootConcurrency = 2
 
 	// defaultReOrgSafeDepth is the default number of confirmations we'll
 	// wait for before considering a transaction safely buried in the chain.
@@ -122,6 +138,10 @@ const (
 	// we'll wait before considering a transaction safely buried in the
 	// testnet chain.
 	testnetDefaultReOrgSafeDepth = 120
+
+	// MinSupplyIdleCommitInterval is the smallest allowed non-zero value for
+	// universe.supply-idle-commit-interval.
+	MinSupplyIdleCommitInterval = uint32(1)
 
 	// defaultUniverseMaxQps is the default maximum number of queries per
 	// second for the universe server. This permis 100 queries per second
@@ -316,6 +336,18 @@ type WalletConfig struct {
 	DisableSweepOrphanUtxos bool `long:"disable-sweep-orphan-utxos" description:"Disable sweeping orphaned UTXOs into anchor transactions created during sends and burns. Sweeping is enabled by default."`
 }
 
+// BackupConfig holds the configuration for the on-disk asset wallet backup
+// file that is kept in sync with the wallet state.
+type BackupConfig struct {
+	// Disable turns off the on-disk backup file entirely. The export and
+	// import RPCs keep working regardless of this setting.
+	Disable bool `long:"disable" description:"Disable keeping the encrypted asset wallet backup file on disk up to date."`
+
+	// FilePath is the location of the backup file. If empty, it defaults
+	// to assets.backup inside the network data directory.
+	FilePath string `long:"filepath" description:"The full path to the encrypted asset wallet backup file that is kept up to date with the wallet state. Defaults to assets.backup in the network data directory."`
+}
+
 // UniverseConfig is the config that houses any Universe related config
 // values.
 type UniverseConfig struct {
@@ -326,6 +358,10 @@ type UniverseConfig struct {
 	NoDefaultFederation bool `long:"no-default-federation" description:"If set, the default Universe server (available for testnet and mainnet) will not be added to the list of universe servers on startup."`
 
 	SyncAllAssets bool `long:"sync-all-assets" description:"If set, the federation syncer will default to syncing all assets."`
+
+	NoDeltaSync bool `long:"no-delta-sync" description:"If set, the federation syncer will always use full enumeration sync instead of cursor-based delta sync, even against servers that support the latter."`
+
+	SyncAuditInterval time.Duration `long:"sync-audit-interval" description:"The longest the federation syncer will rely on cursor-based delta sync against a server before forcing a full enumeration sync as an audit. Valid time units are {s, m, h}."`
 
 	PublicAccess string `long:"public-access" description:"The public access mode for the universe server, controlling whether remote parties can read from and/or write to this universe server over RPC if exposed to a public network interface. This can be unset, 'r', 'w', or 'rw'. If unset, public access is not enabled for the universe server. If 'r' is included, public access is allowed for read-only endpoints. If 'w' is included, public access is allowed for write endpoints."`
 
@@ -345,6 +381,10 @@ type UniverseConfig struct {
 
 	SupplyIgnoreCacheSize uint64 `long:"supply-ignore-cache-size" description:"The maximum number of entries in the supply ignore checker's negative lookup LRU cache."`
 
+	SupplyIdleCommitInterval uint32 `long:"supply-idle-commit-interval" description:"The number of blocks after which tapd automatically publishes an ancestry-linked successor supply commitment for a locally controlled asset group whose latest supply commitment has confirmed, even if there were no new supply updates. Set to 0 to disable (the default)."`
+
+	SupplyAutoPublishPending bool `long:"supply-auto-publish-pending" description:"If set, tapd automatically publishes pending supply updates (for example ignored outpoints) when the next block arrives, instead of waiting for a manual UpdateSupplyCommit call."`
+
 	DisableSupplyVerifierChainWatch bool `long:"disable-supply-verifier-chain-watch" description:"Disable chain outpoint watching in supply verifier. If true, the supply verifier will not start state machines to watch on-chain outputs for spends. This option is intended for universe servers, where supply verification should only occur for commitments submitted by peers, not via on-chain spend detection."`
 }
 
@@ -357,6 +397,15 @@ type AddrBookConfig struct {
 // ExperimentalConfig houses experimental tapd cli configuration options.
 type ExperimentalConfig struct {
 	Rfq rfq.CliConfig `group:"rfq" namespace:"rfq"`
+}
+
+// RepairConfig houses one-shot recovery flags that, when set, cause
+// tapd to perform a targeted repair action against the database and
+// exit before constructing the full server. These flags are intended
+// for operator use after a constraint or invariant failure has
+// prevented normal startup.
+type RepairConfig struct {
+	CancelDuplicateBatches bool `long:"cancel-duplicate-batches" description:"If set, tapd cancels all but the most recent minting batch in BatchStatePending or BatchStateFrozen and then exits. Used to recover from a database that violates the singleton pre-broadcast batch invariant added in migration 000061 (e.g. a legacy DB with duplicate pending batches that blocks the migration)."`
 }
 
 // CleanAndValidate performs final processing on the ExperimentalConfig,
@@ -389,9 +438,7 @@ type Config struct {
 	CPUProfile string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
 	Profile    string `long:"profile" description:"Enable HTTP profiling on either a port or host:port"`
 
-	ReOrgSafeDepth int32 `long:"reorgsafedepth" description:"The number of confirmations we'll wait for before considering a transaction safely buried in the chain."`
-
-	ProofActivationHeight uint32 `long:"proofactivationheight" hidden:"true" description:"Override the block height from which transition proofs must satisfy the activation rules. Not available on mainnet."`
+	ReOrgSafeDepth int32 `long:"reorgsafedepth" description:"The number of confirmations before a transaction is considered safely buried in the chain. This is also the act threshold: irreversible emissions (universe publication, supply commitment pushes, burn events) wait for this depth. Must be between 1 and 144; at 1, burial coincides with the first confirmation and the extra act gating is effectively disabled."`
 
 	// The following options are used to configure the proof courier.
 	DefaultProofCourierAddr string                       `long:"proofcourieraddr" description:"Default proof courier service address."`
@@ -413,6 +460,8 @@ type Config struct {
 
 	Wallet *WalletConfig `group:"wallet" namespace:"wallet"`
 
+	Backup *BackupConfig `group:"backup" namespace:"backup"`
+
 	AddrBook *AddrBookConfig `group:"address" namespace:"address"`
 
 	Channel *ChannelConfig `group:"channel" namespace:"channel"`
@@ -420,6 +469,8 @@ type Config struct {
 	Prometheus monitoring.PrometheusConfig `group:"prometheus" namespace:"prometheus"`
 
 	Experimental *ExperimentalConfig `group:"experimental" namespace:"experimental"`
+
+	Repair *RepairConfig `group:"repair" namespace:"repair"`
 
 	HealthChecks *HealthCheckConfig `group:"healthcheck" namespace:"healthcheck"`
 
@@ -514,7 +565,8 @@ func DefaultConfig() Config {
 		},
 		CustodianProofRetrievalDelay: defaultProofRetrievalDelay,
 		Universe: &UniverseConfig{
-			SyncInterval: defaultUniverseSyncInterval,
+			SyncInterval:      defaultUniverseSyncInterval,
+			SyncAuditInterval: defaultUniverseSyncAuditInterval,
 			UniverseQueriesPerSecond: rate.Limit(
 				defaultUniverseMaxQps,
 			),
@@ -530,6 +582,7 @@ func DefaultConfig() Config {
 		Wallet: &WalletConfig{
 			PsbtMaxFeeRatio: DefaultPsbtMaxFeeRatio,
 		},
+		Backup: &BackupConfig{},
 		AddrBook: &AddrBookConfig{
 			DisableSyncer: false,
 		},
@@ -541,6 +594,7 @@ func DefaultConfig() Config {
 				AcceptPriceDeviationPpm: rfq.DefaultAcceptPriceDeviationPpm,
 			},
 		},
+		Repair: &RepairConfig{},
 		HealthChecks: &HealthCheckConfig{
 			TLSCheck: &CheckConfig{
 				Interval: defaultTLSInterval,
@@ -817,14 +871,6 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 			cfg.ChainConf.Network))
 	}
 
-	// The activation height of mainnet is fixed.
-	if cfg.ProofActivationHeight != 0 &&
-		cfg.ActiveNetParams.Name == chaincfg.MainNetParams.Name {
-
-		return nil, mkErr("proofactivationheight can't be set on " +
-			"mainnet")
-	}
-
 	// Validate profile port or host:port.
 	if cfg.Profile != "" {
 		str := "%s: The profile port must be between 1024 and 65535"
@@ -855,6 +901,21 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 	cfg.networkDir = filepath.Join(
 		cfg.DataDir, lncfg.NormalizeNetwork(cfg.ActiveNetParams.Name),
 	)
+
+	// The backup file lives next to the database unless the user chose a
+	// different location.
+	if cfg.Backup.FilePath == "" {
+		cfg.Backup.FilePath = filepath.Join(
+			cfg.networkDir, backup.DefaultBackupFileName,
+		)
+	}
+	cfg.Backup.FilePath = CleanAndExpandPath(cfg.Backup.FilePath)
+	if info, err := os.Stat(cfg.Backup.FilePath); err == nil &&
+		info.IsDir() {
+
+		return nil, fmt.Errorf("backup.filepath %v is a directory, "+
+			"it must name a file", cfg.Backup.FilePath)
+	}
 
 	// We'll also update the database file location as well, if it wasn't
 	// set.
@@ -1024,6 +1085,11 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 		cfg.ReOrgSafeDepth = testnetDefaultReOrgSafeDepth
 	}
 
+	err = validateReOrgSafeDepth(cfg.ReOrgSafeDepth, cfgLogger)
+	if err != nil {
+		return nil, err
+	}
+
 	// Let's validate that the wallet's psbt max fee ratio is within the
 	// expected range.
 	switch {
@@ -1040,8 +1106,48 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 		return nil, fmt.Errorf("error in healthcheck config: %w", err)
 	}
 
+	if cfg.Universe.SupplyIdleCommitInterval != 0 &&
+		cfg.Universe.SupplyIdleCommitInterval <
+			MinSupplyIdleCommitInterval {
+
+		return nil, mkErr("universe.supply-idle-commit-interval "+
+			"must be 0 (disabled) or at least %d blocks",
+			MinSupplyIdleCommitInterval)
+	}
+
 	// All good, return the sanitized result.
 	return &cfg, nil
+}
+
+// validateReOrgSafeDepth bounds the re-org safe depth.
+//
+// The depth doubles as every anchoring's confirmation threshold, which
+// the registration path bounds to the chain notifier's maximum, so an
+// out-of-range value would pass startup cleanly and then fail every
+// registration after its transaction had already broadcast. It is
+// refused at the door instead.
+//
+// A depth of one is legal but collapses act gating, which deserves a
+// warning rather than an error.
+func validateReOrgSafeDepth(depth int32, cfgLogger btclog.Logger) error {
+	if depth < 1 {
+		return fmt.Errorf("reorgsafedepth must be at least 1, "+
+			"got %d", depth)
+	}
+
+	switch {
+	case depth > int32(chainntnfs.MaxNumConfs):
+		return fmt.Errorf("reorgsafedepth %d exceeds the chain "+
+			"notifier's maximum of %d confirmations",
+			depth, uint32(chainntnfs.MaxNumConfs))
+
+	case depth == 1:
+		cfgLogger.Warnf("reorgsafedepth is 1: burial coincides " +
+			"with the first confirmation, so irreversible " +
+			"emissions are not act-gated beyond it")
+	}
+
+	return nil
 }
 
 // getTLSConfig returns a TLS configuration for the gRPC server and credentials

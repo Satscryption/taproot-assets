@@ -8,13 +8,13 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapnode"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/protofsm"
@@ -41,6 +41,15 @@ type DaemonAdapters interface {
 // Manager. It contains all the dependencies needed to
 // manage multiple supply commitment state machines, one for each asset group.
 type ManagerCfg struct {
+	// AnchoringWatcher is the re-org watcher broadcast commitments
+	// register with as speculative anchorings; finalization is then
+	// act-gated on burial.
+	AnchoringWatcher AnchoringRegistrar
+
+	// AnchoringThreshold is the depth at which a commitment is
+	// act-confirmed (buried).
+	AnchoringThreshold uint32
+
 	// TreeView is the interface that allows the state machine to obtain an
 	// up-to-date snapshot of the root supply tree, and the relevant set of
 	// subtrees.
@@ -67,7 +76,7 @@ type ManagerCfg struct {
 	// Chain is our access to the current main chain.
 	//
 	// TODO(roasbeef): can make a slimmer version of
-	Chain tapgarden.ChainBridge
+	Chain tapnode.ChainBridge
 
 	// SupplySyncer is used to insert supply commitments into the remote
 	// universe server.
@@ -89,6 +98,23 @@ type ManagerCfg struct {
 	// IgnoreCheckerCache is used to invalidate the ignore cache when a new
 	// supply commitment is created.
 	IgnoreCheckerCache IgnoreCheckerCache
+
+	// IdleCommitInterval is the number of blocks after which a locally
+	// controlled asset group with a confirmed supply commitment
+	// automatically publishes an ancestry-linked successor commitment, even
+	// if there are no new supply updates. Zero disables idle successors.
+	IdleCommitInterval uint32
+
+	// AutoPublishPending, if true, automatically publishes pending supply
+	// updates when the next block arrives, instead of waiting for a manual
+	// UpdateSupplyCommit call.
+	AutoPublishPending bool
+}
+
+// autoCommitEnabled returns true if the manager should emit an idle tick for
+// every new block.
+func (c *ManagerCfg) autoCommitEnabled() bool {
+	return c.IdleCommitInterval > 0 || c.AutoPublishPending
 }
 
 // Manager is a manager for multiple supply commitment state
@@ -123,12 +149,108 @@ func NewManager(cfg ManagerCfg) *Manager {
 
 // Start starts the multi state machine manager.
 func (m *Manager) Start() error {
+	var startErr error
 	m.startOnce.Do(func() {
 		// Initialize the state machine cache.
 		m.smCache = newStateMachineCache()
+
+		// If idle successors or automatic publishing is enabled, we
+		// need to tick the state machines as new blocks arrive.
+		if !m.cfg.autoCommitEnabled() {
+			return
+		}
+
+		ctx, cancel := m.WithCtxQuitNoTimeout()
+		blockChan, errChan, err := m.cfg.Chain.RegisterBlockEpochNtfn(
+			ctx,
+		)
+		if err != nil {
+			cancel()
+			startErr = fmt.Errorf("unable to register for block "+
+				"epochs: %w", err)
+
+			return
+		}
+
+		log.Infof("Supply commit idle ticker enabled "+
+			"(idle_commit_interval=%d blocks, "+
+			"auto_publish_pending=%v)", m.cfg.IdleCommitInterval,
+			m.cfg.AutoPublishPending)
+
+		m.Wg.Add(1)
+		go func() {
+			defer m.Wg.Done()
+			defer cancel()
+
+			m.idleTickLoop(ctx, blockChan, errChan)
+		}()
 	})
 
-	return nil
+	return startErr
+}
+
+// idleTickLoop sends an IdleTickEvent to the state machine of every locally
+// controlled asset group that supports supply commitments for each new block.
+func (m *Manager) idleTickLoop(ctx context.Context, blockChan chan int32,
+	errChan chan error) {
+
+	for {
+		select {
+		case height := <-blockChan:
+			if height < 0 {
+				continue
+			}
+
+			m.sendIdleTicks(ctx, uint32(height))
+
+		case err := <-errChan:
+			if err != nil {
+				log.Errorf("Supply commit idle ticker stopped "+
+					"on block epoch error: %v", err)
+			}
+
+			return
+
+		case <-ctx.Done():
+			return
+
+		case <-m.Quit:
+			return
+		}
+	}
+}
+
+// sendIdleTicks sends an idle tick for the given block height to all locally
+// controlled supply commit asset groups. Errors are logged, a single failing
+// group must not stop the others.
+func (m *Manager) sendIdleTicks(ctx context.Context, height uint32) {
+	groupKeys, err := m.cfg.AssetLookup.FetchSupplyCommitAssets(ctx, true)
+	if err != nil {
+		log.Errorf("Unable to fetch supply commit assets for idle "+
+			"tick at height %d: %v", height, err)
+
+		return
+	}
+
+	for idx := range groupKeys {
+		groupKey := groupKeys[idx]
+		assetSpec := asset.NewSpecifierFromGroupKey(groupKey)
+
+		sm, err := m.fetchStateMachine(assetSpec)
+		if err != nil {
+			log.Errorf("Unable to get state machine for idle "+
+				"tick (asset=%s, height=%d): %v",
+				assetSpec.String(), height, err)
+
+			continue
+		}
+
+		// SendEvent blocks while the state machine is busy, so make
+		// sure we don't hang forever.
+		sendCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
+		sm.SendEvent(sendCtx, &IdleTickEvent{BlockHeight: height})
+		cancel()
+	}
 }
 
 // Stop stops the multi state machine manager, which in turn stops all asset
@@ -164,13 +286,50 @@ func (m *Manager) startAssetSM(ctx context.Context,
 		CommitConfTarget:   DefaultCommitConfTarget,
 		ChainParams:        m.cfg.ChainParams,
 		IgnoreCheckerCache: m.cfg.IgnoreCheckerCache,
+		AnchoringWatcher:   m.cfg.AnchoringWatcher,
+		AnchoringThreshold: m.cfg.AnchoringThreshold,
+		IdleCommitInterval: m.cfg.IdleCommitInterval,
+		AutoPublishPending: m.cfg.AutoPublishPending,
 	}
 
 	// Before we start the state machine, we'll need to fetch the current
 	// state from disk, to see if we need to emit any new events.
-	initialState, _, err := m.cfg.StateLog.FetchState(ctx, assetSpec)
+	initialState, initialTransition, err := m.cfg.StateLog.FetchState(
+		ctx, assetSpec,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch current state: %w", err)
+	}
+
+	// The durable record keeps the state name and the pending
+	// transition apart. A resumed state that carries the transition in
+	// memory is rehydrated from it; its handlers would otherwise run
+	// against an empty transition, and a broadcast state's first event
+	// would kill the machine over a nil commitment transaction.
+	initialTransition.WhenSome(func(transition SupplyStateTransition) {
+		if state, ok := initialState.(*CommitBroadcastState); ok {
+			state.SupplyTransition = transition
+		}
+	})
+
+	// A restored broadcast state must hold its anchoring before the
+	// machine resumes and rests on it. A record persisted before the
+	// watcher existed has none; adopt it now. The state it watches
+	// over is already durable, so the registration stakes nothing.
+	if broadcast, ok := initialState.(*CommitBroadcastState); ok &&
+		broadcast.SupplyTransition.NewCommitment.Txn != nil {
+
+		registered, err := registerCommitAnchoring(
+			ctx, env, &broadcast.SupplyTransition,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to adopt commit "+
+				"anchoring: %w", err)
+		}
+		if registered {
+			log.Infof("Registered missing commit anchoring for "+
+				"group %v on restart", assetSpec)
+		}
 	}
 
 	// Create a new error reporter for the state machine.
@@ -198,19 +357,31 @@ func (m *Manager) startAssetSM(ctx context.Context,
 
 	// If specific initial states are provided, we send the corresponding
 	// events to the state machine to ensure it begins ticking as expected.
-	switch initialState.(type) {
+	switch state := initialState.(type) {
 	// Once we write the commitment transaction to disk in CommitTxSign,
-	// then on restart, we'll be in the broadcast state. From this point,
-	// we'll trigger the broadcast event so we can resume the state machine.
+	// then on restart, we'll be in the broadcast state. The broadcast
+	// event re-publishes the persisted transaction: the record is
+	// written before the publish, so a crash between the two, or a
+	// publish the wallet rejected, would otherwise leave a signed
+	// transaction nobody broadcasts and a group that can never
+	// advance. Publishing a transaction the network already has is
+	// harmless. The re-org watcher already holds the commitment and
+	// finalizes it out of band, so a tick follows: the resting
+	// handler re-derives the machine's position from the durable
+	// record. Rows persisted by the legacy finalize state load as
+	// this state too — a pending transition awaiting act-level
+	// finality is exactly what the broadcast state means.
 	case *CommitBroadcastState:
-		newSm.SendEvent(ctx, &BroadcastEvent{})
+		if state.SupplyTransition.NewCommitment.Txn != nil {
+			newSm.SendEvent(ctx, &BroadcastEvent{})
+		}
+		newSm.SendEvent(ctx, &CommitTickEvent{})
 
-	// Once we get a confirmation, then we'll transition to the
-	// CommitFinalizeState. If we crashed right after that, then
-	// we'll also send the finalize event so we can apply
-	// everything, and transition back to the normal default state.
-	case *CommitFinalizeState:
-		newSm.SendEvent(ctx, &FinalizeEvent{})
+	// The watcher's finalizer and compensator park bound updates here
+	// for the machine to pick up, so a tick resumes the interrupted
+	// cycle.
+	case *UpdatesPendingState:
+		newSm.SendEvent(ctx, &CommitTickEvent{})
 	}
 
 	return &newSm, nil
@@ -441,7 +612,8 @@ func (m *Manager) SendEventSync(ctx context.Context, assetSpec asset.Specifier,
 
 // SendMintEvent sends a mint event to the supply commitment state machine.
 //
-// NOTE: This implements the tapgarden.MintSupplyCommitter interface.
+// NOTE: This is consumed by the GenesisAugmenter at batch confirmation
+// time via the MintEventEmitter interface.
 func (m *Manager) SendMintEvent(ctx context.Context, assetSpec asset.Specifier,
 	leafKey universe.UniqueLeafKey, issuanceProof universe.Leaf,
 	mintBlockHeight uint32) error {
