@@ -155,6 +155,25 @@ type ChainPorter struct {
 	// subscriberMtx guards the subscribers map.
 	subscriberMtx sync.Mutex
 
+	// publishMu guards pre-anchored in-flight shipments, the
+	// in-flight request ID bindings, and terminal broadcast errors.
+	publishMu sync.Mutex
+
+	// preAnchoredFlights coalesces concurrent publishes of one anchor
+	// transaction so a retry cannot start a second state machine.
+	preAnchoredFlights map[chainhash.Hash]*preAnchoredFlight
+
+	// publishRequestIDs binds a caller request ID to the anchor
+	// transaction of the publish that is using it. The binding is
+	// removed when that publish completes or fails.
+	publishRequestIDs map[string]chainhash.Hash
+
+	// terminalBroadcasts records anchors whose broadcast failed with
+	// ErrDoubleSpend. The transfer row is written before that
+	// broadcast, so a later publish of the same anchor must return
+	// this failure instead of the row.
+	terminalBroadcasts map[chainhash.Hash]error
+
 	*fn.ContextGuard
 }
 
@@ -168,6 +187,13 @@ func NewChainPorter(cfg *ChainPorterConfig) *ChainPorter {
 		cfg:             cfg,
 		outboundParcels: make(chan Parcel),
 		subscribers:     subscribers,
+		preAnchoredFlights: make(
+			map[chainhash.Hash]*preAnchoredFlight,
+		),
+		publishRequestIDs: make(map[string]chainhash.Hash),
+		terminalBroadcasts: make(
+			map[chainhash.Hash]error,
+		),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: tapgarden.DefaultTimeout,
 			Quit:           make(chan struct{}),
@@ -313,20 +339,15 @@ func (p *ChainPorter) RequestShipment(req Parcel) (*OutboundParcel, error) {
 		return nil, fmt.Errorf("failed to validate parcel: %w", err)
 	}
 
-	if !fn.SendOrQuit(p.outboundParcels, req, p.Quit) {
-		return nil, fmt.Errorf("ChainPorter shutting down")
+	// A pre-anchored publish is the custom-anchor terminal step. A retry
+	// after a lost response must return the transfer already logged for
+	// that anchor instead of running the state machine again.
+	anchored, ok := req.(*PreAnchoredParcel)
+	if ok {
+		return p.requestPreAnchoredShipment(anchored)
 	}
 
-	select {
-	case err := <-req.kit().errChan:
-		return nil, err
-
-	case resp := <-req.kit().respChan:
-		return resp, nil
-
-	case <-p.Quit:
-		return nil, fmt.Errorf("ChainPorter shutting down")
-	}
+	return p.enqueueShipment(req)
 }
 
 // QueryParcels returns the set of confirmed or unconfirmed parcels. If the

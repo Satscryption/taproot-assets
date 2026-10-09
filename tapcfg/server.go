@@ -806,6 +806,8 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		},
 	)
 
+	commitIdempotency := tapdb.NewCommitVirtualPsbtStoreFromDB(db)
+
 	// nolint: lll
 	return &tapconfig.Config{
 		DebugLevel:            cfg.DebugLevel,
@@ -860,6 +862,8 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		DefaultProofCourierAddr:  proofCourierAddr,
 		ProofArchive:             proofArchive,
 		AssetWallet:              assetWallet,
+		CommitIdempotency:          commitIdempotency,
+		CommitVirtualPsbtRetention: cfg.Wallet.CommitVirtualPsbtRetention,
 		CoinSelect:               coinSelect,
 		ChainPorter:              chainPorter,
 		DisableSweepOrphanUtxos:  cfg.Wallet.DisableSweepOrphanUtxos,

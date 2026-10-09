@@ -168,6 +168,11 @@ type BaseUniverseStore interface {
 	// a given asset group, ordered by creation time (newest first).
 	FetchSupplySyncerPushLogs(ctx context.Context,
 		groupKey []byte) ([]sqlc.SupplySyncerPushLog, error)
+
+	// FetchSupplySyncerPushedServers returns server addresses that
+	// already received a given supply commitment push.
+	FetchSupplySyncerPushedServers(ctx context.Context,
+		arg sqlc.FetchSupplySyncerPushedServersParams) ([]string, error)
 }
 
 // getUniverseTreeSum retrieves the sum of a universe tree specified by its

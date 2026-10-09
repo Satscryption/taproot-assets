@@ -2,11 +2,14 @@ package rpcserver
 
 import (
 	"context"
+	"time"
 
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 )
+
+const leaseReleaseTimeout = 30 * time.Second
 
 // outputReleaser is the subset of the lnd wallet kit used to release leased
 // outputs.

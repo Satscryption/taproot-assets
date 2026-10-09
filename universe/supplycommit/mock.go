@@ -399,6 +399,14 @@ func newMockDaemonAdapters() *mockDaemonAdapters {
 	}
 }
 
+func (m *mockDaemonAdapters) Start() error {
+	return nil
+}
+
+func (m *mockDaemonAdapters) Stop() error {
+	return nil
+}
+
 func (m *mockDaemonAdapters) BroadcastTransaction(
 	tx *wire.MsgTx, label string) error {
 

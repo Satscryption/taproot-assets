@@ -914,7 +914,12 @@ type CommitVirtualPsbtsRequest_ExistingOutputIndex struct {
 }
 
 type CommitVirtualPsbtsRequest_Add struct {
-	// Add a new P2TR change output to the PSBT if required.
+	// Add a new P2TR change output to the PSBT if required. When set to
+	// false, tapd asks lnd not to add a new change output. Until lnd
+	// supports that mode (see lightningnetwork/lnd#10967), funding may
+	// still alter the anchor output set; tapd then fails closed with an
+	// error (see lightninglabs/taproot-assets#2209). Use
+	// skip_funding=true with caller-supplied inputs or add=true instead.
 	Add bool `protobuf:"varint,5,opt,name=add,proto3,oneof"`
 }
 
@@ -1173,7 +1178,16 @@ type PublishAndLogRequest struct {
 	// An optional short label for the transfer. This label can be used to track
 	// the progress of the transfer via the logs or an event subscription.
 	// Multiple transfers can share the same label.
-	Label         string `protobuf:"bytes,7,opt,name=label,proto3" json:"label,omitempty"`
+	Label string `protobuf:"bytes,7,opt,name=label,proto3" json:"label,omitempty"`
+	// Optional caller-chosen idempotency key for this publish. A retry that
+	// repeats the key with the same anchor transaction returns the transfer
+	// already logged for that anchor. Reusing the key for a different anchor
+	// transaction is rejected while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails and is not kept across a daemon restart. An empty
+	// key still reconciles by the anchor transaction, so a lost response can
+	// be retried safely.
+	RequestId     []byte `protobuf:"bytes,8,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1255,6 +1269,13 @@ func (x *PublishAndLogRequest) GetLabel() string {
 		return x.Label
 	}
 	return ""
+}
+
+func (x *PublishAndLogRequest) GetRequestId() []byte {
+	if x != nil {
+		return x.RequestId
+	}
+	return nil
 }
 
 type NextInternalKeyRequest struct {
@@ -2329,7 +2350,7 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	"#GetCommitVirtualPsbtsStatusResponse\x12@\n" +
 	"\x06status\x18\x01 \x01(\x0e2(.assetwalletrpc.CommitVirtualPsbtsStatusR\x06status\x12\x17\n" +
 	"\alock_id\x18\x02 \x01(\fR\x06lockId\x12:\n" +
-	"\x10lnd_locked_utxos\x18\x03 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\"\xc7\x02\n" +
+	"\x10lnd_locked_utxos\x18\x03 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\"\xe6\x02\n" +
 	"\x14PublishAndLogRequest\x12\x1f\n" +
 	"\vanchor_psbt\x18\x01 \x01(\fR\n" +
 	"anchorPsbt\x12#\n" +
@@ -2338,7 +2359,9 @@ const file_assetwalletrpc_assetwallet_proto_rawDesc = "" +
 	"\x13change_output_index\x18\x04 \x01(\x05R\x11changeOutputIndex\x12:\n" +
 	"\x10lnd_locked_utxos\x18\x05 \x03(\v2\x10.taprpc.OutPointR\x0elndLockedUtxos\x127\n" +
 	"\x18skip_anchor_tx_broadcast\x18\x06 \x01(\bR\x15skipAnchorTxBroadcast\x12\x14\n" +
-	"\x05label\x18\a \x01(\tR\x05label\"7\n" +
+	"\x05label\x18\a \x01(\tR\x05label\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\b \x01(\fR\trequestId\"7\n" +
 	"\x16NextInternalKeyRequest\x12\x1d\n" +
 	"\n" +
 	"key_family\x18\x01 \x01(\rR\tkeyFamily\"S\n" +

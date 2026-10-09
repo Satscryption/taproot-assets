@@ -884,7 +884,7 @@ func TestFundPacketSuccessKeepsLease(t *testing.T) {
 			},
 		},
 		AddrBook:                &mockAddrBook{},
-		KeyRing:                 tapnodemock.NewKeyRing(),
+		KeyRing:                 tapgarden.NewMockKeyRing(),
 		ChainParams:             testParams,
 		DisableSweepOrphanUtxos: true,
 	})

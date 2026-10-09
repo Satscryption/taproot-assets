@@ -131,6 +131,7 @@ type Querier interface {
 	// Fetches all push log entries for a given asset group, ordered by
 	// creation time with the most recent entries first.
 	FetchSupplySyncerPushLogs(ctx context.Context, groupKey []byte) ([]SupplySyncerPushLog, error)
+	FetchSupplySyncerPushedServers(ctx context.Context, arg FetchSupplySyncerPushedServersParams) ([]string, error)
 	// Sort the nodes by node_index here instead of returning the indices.
 	FetchTapscriptTree(ctx context.Context, rootHash []byte) ([]FetchTapscriptTreeRow, error)
 	FetchTransferInputs(ctx context.Context, transferID int64) ([]FetchTransferInputsRow, error)
