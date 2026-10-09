@@ -7,20 +7,19 @@ import (
 	"fmt"
 	"net/url"
 
-	btcaddr "github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chaincfg/v2"
-	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/psbt/v2"
-	"github.com/btcsuite/btcd/txscript/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
-	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
-	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightninglabs/taproot-assets/universe"
 	lfn "github.com/lightningnetwork/lnd/fn/v2"
@@ -377,7 +376,7 @@ func NewPreCommitFromProof(issuanceProof proof.Proof,
 	// supply pre-commitment output.
 	//
 	// Construct the expected pre-commit tx out.
-	expectedTxOut, err := PreCommitTxOut(delegationKey)
+	expectedTxOut, err := tapgarden.PreCommitTxOut(delegationKey)
 	if err != nil {
 		return zero, fmt.Errorf("unable to derive expected pre-commit "+
 			"txout: %w", err)
@@ -775,7 +774,7 @@ type Wallet interface {
 	SignPsbt(context.Context, *psbt.Packet) (*psbt.Packet, error)
 
 	// ImportTaprootOutput imports a new taproot output key into the wallet.
-	ImportTaprootOutput(context.Context, *btcec.PublicKey) (btcaddr.Address,
+	ImportTaprootOutput(context.Context, *btcec.PublicKey) (btcutil.Address,
 		error)
 
 	// UnlockInput unlocks the set of target inputs after a batch or send
@@ -813,21 +812,15 @@ type StateMachineStore interface {
 	// returned.
 	//
 	// This method will also create a new pending SupplyStateTransition.
-	//
-	// If an identical event is already recorded in the update log, no
-	// new row is written and ErrDuplicateUpdate is returned; callers
-	// must treat this as "already recorded" and must not advance state
-	// or cache the event.
 	InsertPendingUpdate(context.Context, asset.Specifier,
 		SupplyUpdateEvent) error
 
-	// ApplyCommitTxStake associates a new signed commitment anchor
-	// transaction with the current active supply commitment state
-	// transition and moves the durable state to CommitBroadcastState.
-	// It runs inside the re-org watcher's registration transaction so
-	// the signed commitment transaction and the anchoring staked on
-	// it commit together.
-	ApplyCommitTxStake(context.Context, *sqlc.Queries, asset.Specifier,
+	// InsertSignedCommitTx will associated a new signed commitment
+	// anchor transaction with the current active supply commitment state
+	// transition. This'll update the existing funded txn with a signed
+	// copy. Finally the state of the  supply commit state transition will
+	// transition to CommitBroadcastState.
+	InsertSignedCommitTx(context.Context, asset.Specifier,
 		SupplyCommitTxn) error
 
 	// CommitState is used to commit the state of the state machine to then
@@ -930,20 +923,10 @@ type Environment struct {
 	// KeyRing is the main key ring interface used to manage keys.
 	KeyRing KeyRing
 
-	// AnchoringWatcher is the re-org watcher a signed commitment is
-	// staked on as a speculative anchoring. The machine defers
-	// finalization until the watcher reports the commit transaction
-	// buried.
-	AnchoringWatcher AnchoringRegistrar
-
-	// AnchoringThreshold is the depth at which the commitment is
-	// act-confirmed (buried).
-	AnchoringThreshold uint32
-
 	// Chain is our access to the current main chain.
 	//
 	// TODO(roasbeef): can make a slimmer version of
-	Chain tapnode.ChainBridge
+	Chain tapgarden.ChainBridge
 
 	// SupplySyncer is used to insert supply commitments into the remote
 	// universe server.

@@ -3,7 +3,7 @@ package rpcserver
 import (
 	"context"
 
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 )

@@ -11,9 +11,7 @@ func TestValidateSupplyIdleCommitInterval(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
-	require.Zero(t, cfg.Universe.SupplyIdleCommitInterval)
-	require.False(t, cfg.Universe.SupplyAutoPublishPending)
-
+	cfg.Universe.SupplyIdleCommitInterval = 0
 	_, err := ValidateConfig(cfg, btclog.Disabled)
 	require.NoError(t, err)
 

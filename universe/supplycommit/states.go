@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/btcsuite/btcd/psbt/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
@@ -29,14 +29,6 @@ var (
 	// ErrNilDoneChannel is returned when attempting to wait for a
 	// synchronous event that doesn't have a done channel.
 	ErrNilDoneChannel = fmt.Errorf("done channel is nil")
-
-	// ErrDuplicateUpdate is returned by StateMachineStore
-	// implementations when an inserted supply update event was absorbed
-	// by the content-hash dedup index: an identical event is already
-	// recorded in the update log, and no new row was written. Callers
-	// must treat this as "already recorded" rather than a fresh insert,
-	// and must not advance state or cache the event on its strength.
-	ErrDuplicateUpdate = fmt.Errorf("supply update event already recorded")
 )
 
 // Event is a special interface used to create the equivalent of a sum-type, but
@@ -442,14 +434,12 @@ type CommitTickEvent struct {
 // eventSealed is a special method that is used to seal the interface.
 func (c *CommitTickEvent) eventSealed() {}
 
-// IdleTickEvent is emitted once per new block when an idle interval or
-// automatic publishing is configured. In DefaultState, a confirmed supply
-// commitment at least the configured number of blocks old starts an
-// ancestry-linked successor, even with no new updates. In
-// UpdatesPendingState the tick publishes staged updates when automatic
-// publishing is on, or resumes an interrupted empty transition. While a
-// commitment cycle is in flight, including while the re-org watcher has
-// not yet buried the transaction, the event is a no-op.
+// IdleTickEvent is emitted periodically (once per new block) by the manager
+// when an idle commit interval is configured. If the state machine is idle
+// and the latest confirmed supply commitment is at least the configured number
+// of blocks old, the state machine publishes an ancestry-linked successor
+// commitment, even if there are no new supply updates. In any other state the
+// event is a no-op.
 type IdleTickEvent struct {
 	// BlockHeight is the current best block height.
 	BlockHeight uint32
@@ -609,16 +599,34 @@ type BroadcastEvent struct {
 // eventSealed is a special method that is used to seal the interface.
 func (b *BroadcastEvent) eventSealed() {}
 
-// CommitBroadcastState is the state the machine rests in once the
-// commitment transaction is signed: the transaction is broadcast and
-// staked on the re-org watcher, which finalizes the pending transition
-// in its delivery transaction at burial. A tick re-derives the
-// machine's position from the durable record.
+// ConfEvent is a special event sent once our latest commitment transaction
+// confirms on chain.
+type ConfEvent struct {
+	// BlockHeight is the height of the block in which the transaction was
+	// confirmed within.
+	BlockHeight uint32
+
+	// TxIndex is the index within the block of the ultimate confirmed
+	// transaction.
+	TxIndex uint32
+
+	// Tx is the transaction for which the notification was requested for.
+	Tx *wire.MsgTx
+
+	// Block is the block that contains the transaction referenced above.
+	Block *wire.MsgBlock
+}
+
+// eventSealed is a special method that is used to seal the interface.
+func (c *ConfEvent) eventSealed() {}
+
+// CommitBroadcastState is the state of the state machine we'll transitions
+// to once we've signed the transaction. In this state, we'll broadcast the
+// transaction, then wait for a confirmation event.
 //
 // State transitions:
 //   - BroadcastEvent -> CommitBroadcastState
-//   - CommitTickEvent -> CommitBroadcastState | DefaultState |
-//     UpdatesPendingState (adopting the record the watcher advanced)
+//   - ConfEvent -> DefaultState
 type CommitBroadcastState struct {
 	// SupplyTransition holds all the information about the current state
 	// transition, including old/new trees and commitments.
@@ -638,6 +646,39 @@ func (c *CommitBroadcastState) String() string {
 	return "CommitBroadcastState"
 }
 
+// FinalizeEvent is a special event that is used to trigger the finalization of
+// the state update.
+type FinalizeEvent struct {
+}
+
+// eventSealed is a special method that is used to seal the interface.
+func (f *FinalizeEvent) eventSealed() {}
+
+// CommitFinalizeState is the final state of the state machine. In this state
+// we'll update the state info on disk, swap in our in-memory tree with the new
+// we've had in memory, then transition back to the DefaultState.
+//
+// State transitions:
+//   - ConfEvent -> DefaultState
+type CommitFinalizeState struct {
+	// SupplyTransition holds all the information about the current state
+	// transition, including old/new trees and commitments.
+	SupplyTransition SupplyStateTransition
+}
+
+// stateSealed is a special method that is used to seal the interface.
+func (c *CommitFinalizeState) stateSealed() {}
+
+// IsTerminal returns true if the target state is a terminal state.
+func (c *CommitFinalizeState) IsTerminal() bool {
+	return true
+}
+
+// String returns the name of the state.
+func (c *CommitFinalizeState) String() string {
+	return "CommitFinalizeState"
+}
+
 // SpendEvent is sent in response to an intent be notified of a spend of an
 // outpoint.
 type SpendEvent struct {
@@ -655,6 +696,10 @@ func (s *SpendEvent) eventSealed() {}
 // SpendMapper is a type used to map the generic spend event to one specific to
 // this package.
 type SpendMapper = protofsm.SpendMapper[Event]
+
+// ConfMapper is a type used to map the generic confirmation event to one
+// specific to this package.
+type ConfMapper = protofsm.ConfMapper[ConfEvent]
 
 func SpendMapperFunc(spendEvent *chainntnfs.SpendDetail) Event {
 	return &SpendEvent{

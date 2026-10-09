@@ -10,14 +10,15 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/itest/rpcassert"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/rpcserver"
+	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
 	unirpc "github.com/lightninglabs/taproot-assets/taprpc/universerpc"
@@ -64,7 +65,7 @@ func assertAnchorTxPreCommitOut(
 	)
 	require.NoError(t.t, err)
 
-	expectedTxOut, err := supplycommit.PreCommitTxOut(*delegationKey)
+	expectedTxOut, err := tapgarden.PreCommitTxOut(*delegationKey)
 	require.NoError(t.t, err)
 
 	// The pre-commitment output should be present in the anchor tx exactly
@@ -682,8 +683,7 @@ func AssertInclusionProof(t *harnessTest, expectedRootHash [32]byte,
 	require.NoError(t.t, err)
 
 	// Derive the root from the inclusion proof and the leaf node.
-	derivedRoot, err := inclusionProof.Root(leafKey, leafNode)
-	require.NoError(t.t, err)
+	derivedRoot := inclusionProof.Root(leafKey, leafNode)
 	derivedRootHash := fn.ByteSlice(derivedRoot.NodeHash())
 
 	// Verify that the derived root hash matches the expected root hash.
@@ -954,39 +954,6 @@ func testSupplyCommitMintBurn(t *harnessTest) {
 		fetchResp.BurnSubtreeRoot,
 	)
 
-	// The universe server verifies every supply commitment pushed
-	// to it, including the burn leaf proofs. Those proofs must
-	// carry the provenance of the burnt input, otherwise the server
-	// rejects the commitment with "missing asset input(s)"
-	// (lightninglabs/taproot-assets#2285).
-	t.Log("Verifying the universe server accepted the burn " +
-		"commitment")
-	uniBurnPred := func(resp *unirpc.FetchSupplyCommitResponse) error {
-		if resp.BurnSubtreeRoot == nil {
-			return fmt.Errorf("BurnSubtreeRoot is nil")
-		}
-
-		actualSum := resp.BurnSubtreeRoot.RootNode.RootSum
-		if actualSum != int64(burnAmt) {
-			return fmt.Errorf("expected burn RootSum %d, got %d",
-				burnAmt, actualSum)
-		}
-
-		return nil
-	}
-	uniBurnReq := unirpc.FetchSupplyCommitRequest{
-		GroupKey: &unirpc.FetchSupplyCommitRequest_GroupKeyBytes{
-			GroupKeyBytes: groupKeyBytes,
-		},
-		Locator: &unirpc.FetchSupplyCommitRequest_SpentCommitOutpoint{
-			SpentCommitOutpoint: fetchResp.SpentCommitmentOutpoint,
-		},
-	}
-	uniBurnResp := rpcassert.FetchSupplyCommitRPC(
-		t.t, ctxb, t.universeServer.service, uniBurnPred, &uniBurnReq,
-	)
-	assertFetchCommitResponse(t, fetchResp, uniBurnResp)
-
 	t.Log("Fetching supply leaves for detailed verification")
 
 	// Fetch supply leaves to verify individual entries have all been
@@ -1196,8 +1163,8 @@ func testFetchSupplyLeaves(t *harnessTest) {
 
 	// Wait for the burn to be fully confirmed and the asset record to
 	// appear before updating the supply commitment. The burn supply
-	// commit events are sent when the anchoring watcher delivers the
-	// transfer's burial, asynchronously after the block.
+	// commit events are sent during LogAnchorTxConfirm which runs
+	// asynchronously after the chain porter processes the confirmation.
 	AssertNumBurns(t.t, t.tapd, 1, nil)
 
 	t.Log("Updating supply commitment after burn")
@@ -1901,7 +1868,8 @@ const supplyIdleCommitInterval = uint32(3)
 
 // testSupplyCommitIdleTick verifies that a locally controlled asset group
 // publishes an empty ancestry-linked successor supply commitment once the
-// latest commitment is at least supplyIdleCommitInterval blocks old.
+// latest commitment is at least supplyIdleCommitInterval blocks old, and that
+// an interrupted idle transition resumes after tapd restarts.
 func testSupplyCommitIdleTick(t *harnessTest) {
 	ctxb := context.Background()
 	miner := t.lndHarness.Miner()
@@ -1992,9 +1960,26 @@ func testSupplyCommitIdleTick(t *harnessTest) {
 		idleCommit.IssuanceSubtreeRoot,
 	)
 
-	t.Log("Publishing a second idle successor after the first")
-	secondIdleCommit, _ := mineIdleSuccessor(
-		idleOutpoint, idleCommit.ChainData.BlockHeight,
+	t.Log("Interrupting the next idle successor and resuming after restart")
+	if supplyIdleCommitInterval > 1 {
+		MineBlocks(t.t, miner, supplyIdleCommitInterval-1, 0)
+	}
+	MineBlocks(t.t, miner, 1, 0)
+
+	_, err := WaitForNTxsInMempool(miner, 1, minerMempoolTimeout)
+	require.NoError(t.t, err)
+
+	require.NoError(t.t, t.tapd.stop(!*noDelete))
+	MineBlocks(t.t, miner, 1, 1)
+	require.NoError(t.t, t.tapd.start(false))
+
+	secondIdleCommit, _ := WaitForSupplyCommit(
+		t.t, ctxb, t.tapd, groupKeyBytes,
+		fn.Some(idleOutpoint),
+		func(resp *unirpc.FetchSupplyCommitResponse) bool {
+			return resp.ChainData.BlockHeight >
+				idleCommit.ChainData.BlockHeight
+		},
 	)
 	require.Equal(
 		t.t, firstRootHash, secondIdleCommit.ChainData.SupplyRootHash,

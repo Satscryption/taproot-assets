@@ -3,10 +3,10 @@ package tapnode
 import (
 	"context"
 
-	btcaddr "github.com/btcsuite/btcd/address/v2"
+	btcaddr "github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/psbt/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/lnwallet"

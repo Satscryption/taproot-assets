@@ -14,12 +14,9 @@ import (
 	"github.com/lightninglabs/taproot-assets/fn"
 	internaltest "github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-<<<<<<< HEAD
-	"github.com/lightninglabs/taproot-assets/tapgarden"
-=======
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/tapnode/tapnodemock"
->>>>>>> 632a0f6d (tapdb: embed input provenance in burn leaf proofs)
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
 	"github.com/stretchr/testify/mock"

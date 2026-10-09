@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/btcsuite/btcd/psbt/v2"
+	"github.com/btcsuite/btcd/btcutil/psbt"
 	wrpc "github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
 )
 

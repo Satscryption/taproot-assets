@@ -5,17 +5,16 @@ import (
 	"net/url"
 	"sync"
 
-	btcaddr "github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/psbt/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
-	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
-	"github.com/lightninglabs/taproot-assets/tapnode"
+	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	lfn "github.com/lightningnetwork/lnd/fn/v2"
@@ -139,13 +138,13 @@ func (m *mockWallet) SignPsbt(ctx context.Context,
 }
 
 func (m *mockWallet) ImportTaprootOutput(ctx context.Context,
-	pubKey *btcec.PublicKey) (btcaddr.Address, error) {
+	pubKey *btcec.PublicKey) (btcutil.Address, error) {
 
 	args := m.Called(ctx, pubKey)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).(btcaddr.Address), args.Error(1)
+	return args.Get(0).(btcutil.Address), args.Error(1)
 }
 
 func (m *mockWallet) UnlockInput(ctx context.Context, op wire.OutPoint) error {
@@ -168,7 +167,7 @@ func (m *mockKeyRing) DeriveNextTaprootAssetKey(
 	return args.Get(0).(keychain.KeyDescriptor), args.Error(1)
 }
 
-// mockChainBridge is a mock implementation of the tapnode.ChainBridge
+// mockChainBridge is a mock implementation of the tapgarden.ChainBridge
 // interface.
 type mockChainBridge struct {
 	mock.Mock
@@ -302,8 +301,8 @@ func (m *mockChainBridge) GenProofChainLookup(
 	return args.Get(0).(asset.ChainLookup), args.Error(1)
 }
 
-// Ensure mockChainBridge implements the tapnode.ChainBridge interface.
-var _ tapnode.ChainBridge = (*mockChainBridge)(nil)
+// Ensure mockChainBridge implements the tapgarden.ChainBridge interface.
+var _ tapgarden.ChainBridge = (*mockChainBridge)(nil)
 
 // mockStateMachineStore is a mock implementation of the StateMachineStore
 // interface.
@@ -318,10 +317,10 @@ func (m *mockStateMachineStore) InsertPendingUpdate(ctx context.Context,
 	return args.Error(0)
 }
 
-func (m *mockStateMachineStore) ApplyCommitTxStake(ctx context.Context,
-	q *sqlc.Queries, spec asset.Specifier, tx SupplyCommitTxn) error {
+func (m *mockStateMachineStore) InsertSignedCommitTx(ctx context.Context,
+	spec asset.Specifier, tx SupplyCommitTxn) error {
 
-	args := m.Called(ctx, q, spec, tx)
+	args := m.Called(ctx, spec, tx)
 	return args.Error(0)
 }
 

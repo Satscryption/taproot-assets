@@ -436,11 +436,6 @@ type PreAnchoredParcel struct {
 	// anchorTxHeightHint is an optional height hint for the anchor
 	// transaction.
 	anchorTxHeightHint fn.Option[uint32]
-
-	// requestID is the caller's idempotency key for this publish.
-	// Empty means the caller did not set one. The anchor transaction
-	// remains the durable reconciliation key either way.
-	requestID []byte
 }
 
 // A compile-time assertion to ensure PreAnchoredParcel implements the Parcel
@@ -465,19 +460,6 @@ func NewPreAnchoredParcel(vPackets []*tappsbt.VPacket,
 		label:                 label,
 		anchorTxHeightHint:    anchorTxHeightHint,
 	}
-}
-
-// SetRequestID records the caller's idempotency key. A repeated key must
-// refer to the same anchor transaction. An empty key clears any previous
-// value.
-func (p *PreAnchoredParcel) SetRequestID(id []byte) {
-	if len(id) == 0 {
-		p.requestID = nil
-
-		return
-	}
-
-	p.requestID = append([]byte(nil), id...)
 }
 
 // pkg returns the send package that should be delivered.

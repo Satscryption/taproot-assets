@@ -12,15 +12,13 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
-	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
-	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightninglabs/taproot-assets/universe/supplycommit"
 	"github.com/lightninglabs/taproot-assets/universe/supplyverifier"
@@ -36,7 +34,6 @@ type supplyCommitTestSetup struct {
 	commitMachine   *SupplyCommitMachine
 	commitTreeStore *SupplyTreeStore
 	db              sqlc.Querier
-	baseDB          *BaseDB
 	baseGenesis     asset.Genesis
 	groupPubKey     *btcec.PublicKey
 }
@@ -87,7 +84,6 @@ func setupSupplyCommitTest(t *testing.T) *supplyCommitTestSetup {
 		commitMachine:   commitMachine,
 		commitTreeStore: commitTreeStore,
 		db:              db,
-		baseDB:          sqlDB,
 		baseGenesis:     baseGenesis,
 		groupPubKey:     groupPubKey,
 	}
@@ -151,23 +147,6 @@ func (h *supplyCommitTestHarness) addTestMintingBatch() ([]byte, int64,
 	})
 	require.NoError(h.t, err)
 
-	// NewMintingBatch hardcodes state=BatchStatePending. These
-	// supply-commit tests need to create multiple batches as
-	// fixtures, which would violate the singleton invariant added
-	// in migration 000061 (≤ 1 batch in {Pending, Frozen}).
-	// Immediately advance to a terminal state so each fixture is
-	// outside the constrained set; the tests do not exercise the
-	// planter state machine, only the supply-commit logic, so the
-	// specific state does not matter as long as it is not
-	// Pending or Frozen.
-	err = db.UpdateMintingBatchState(
-		ctx, sqlc.UpdateMintingBatchStateParams{
-			RawKey:     batchKeyBytes,
-			BatchState: int16(tapgarden.BatchStateFinalized),
-		},
-	)
-	require.NoError(h.t, err)
-
 	_, err = db.BindMintingBatchWithTx(
 		ctx, sqlc.BindMintingBatchWithTxParams{
 			RawKey:    batchKeyDesc.PubKey.SerializeCompressed(),
@@ -204,7 +183,6 @@ type supplyCommitTestHarness struct {
 	groupKey        *asset.GroupKey
 	batchedTreeDB   BatchedUniverseTree
 	commitTreeStore *SupplyTreeStore
-	baseDB          *BaseDB
 }
 
 // newSupplyCommitTestHarness creates a new test harness instance.
@@ -234,7 +212,6 @@ func newSupplyCommitTestHarness(t *testing.T) *supplyCommitTestHarness {
 		groupKey:        groupKey,
 		batchedTreeDB:   setup.commitTreeStore.db,
 		commitTreeStore: setup.commitTreeStore,
-		baseDB:          setup.baseDB,
 	}
 }
 
@@ -1391,110 +1368,6 @@ func TestSupplyCommitInsertPendingUpdate(t *testing.T) {
 	assertEqualEvents(t, event3, deserializedDangling)
 }
 
-// TestSupplyCommitInsertPendingUpdateIsIdempotent verifies that inserting
-// the same logical supply update event twice produces only a single row.
-// This is the dedup invariant relied on by the minting cultivator's
-// Confirmed branch: a crash between SendMintEvent and the batch state
-// transition causes a restarted cultivator to re-fire the same event, and
-// we need the schema -- not the caller -- to be the source of truth for
-// "this event has already been recorded."
-func TestSupplyCommitInsertPendingUpdateIsIdempotent(t *testing.T) {
-	t.Parallel()
-
-	h := newSupplyCommitTestHarness(t)
-
-	// Insert a mint event for the first time.
-	event := h.randMintEvent()
-	err := h.commitMachine.InsertPendingUpdate(h.ctx, h.assetSpec, event)
-	require.NoError(t, err)
-
-	transition := h.assertPendingTransitionExists()
-	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{event})
-
-	// Re-inserting the same event must be a no-op: same transition, same
-	// single row in the events log, and the dedup surfaced to the caller
-	// via the sentinel.
-	err = h.commitMachine.InsertPendingUpdate(h.ctx, h.assetSpec, event)
-	require.ErrorIs(t, err, supplycommit.ErrDuplicateUpdate)
-
-	transitionAgain := h.assertPendingTransitionExists()
-	require.Equal(
-		t, transition.TransitionID, transitionAgain.TransitionID,
-	)
-	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{event})
-
-	// A separate event with the same group key must still be accepted --
-	// the dedup key is per-event content, not per-group.
-	otherEvent := h.randMintEvent()
-	err = h.commitMachine.InsertPendingUpdate(
-		h.ctx, h.assetSpec, otherEvent,
-	)
-	require.NoError(t, err)
-	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{
-		event, otherEvent,
-	})
-}
-
-// TestSupplyCommitInsertPendingUpdateRefiredAfterFinalize verifies that
-// a re-fired event whose duplicate already belongs to a prior,
-// now-finalized transition does not orphan a freshly-created pending
-// transition.
-//
-// Without the rows-affected check inside InsertPendingUpdate, the
-// no-pending-transition arm would: (a) insert a new
-// supply_commit_transitions row, (b) attempt to insert the event and
-// have it deduped to zero rows by the event_key UNIQUE index, and (c)
-// move the state machine to UpdatesPendingState -- leaving the new
-// transition with no events to commit. The fix detects rows-affected
-// == 0, rolls the whole tx back, and returns ErrDuplicateUpdate so the
-// caller knows the event was already recorded and no new row landed.
-//
-// This is the exact scenario the minting cultivator exhibits on restart
-// after the Confirmed branch has already finalized its supply commit:
-// SendMintEvent fires again, and the state machine treats the sentinel
-// as a no-op self-transition rather than advancing on a phantom event.
-func TestSupplyCommitInsertPendingUpdateRefiredAfterFinalize(t *testing.T) {
-	t.Parallel()
-
-	h := newSupplyCommitTestHarness(t)
-
-	// Drive a mint event all the way through to a finalized
-	// transition. After this the supply_update_events row holds the
-	// event content keyed by its content hash, the transition is
-	// finalized, and the state machine is back in DefaultState.
-	event := h.randMintEvent()
-	stateTransition := h.performSingleTransition(
-		[]supplycommit.SupplyUpdateEvent{event},
-		[]wire.OutPoint{}, 442,
-	)
-	h.assertTransitionApplied(stateTransition)
-	h.assertNoPendingTransition()
-	h.assertCurrentStateIs(&supplycommit.DefaultState{})
-
-	// Re-fire the exact same event. The dedup index absorbs the
-	// insert; the store must detect rows-affected == 0, roll back so
-	// no new pending transition lands, and report the dedup.
-	err := h.commitMachine.InsertPendingUpdate(h.ctx, h.assetSpec, event)
-	require.ErrorIs(t, err, supplycommit.ErrDuplicateUpdate)
-
-	// The crucial invariant: no fresh empty pending transition.
-	h.assertNoPendingTransition()
-
-	// And the state machine must not have advanced to
-	// UpdatesPendingState on the strength of a deduped event.
-	h.assertCurrentStateIs(&supplycommit.DefaultState{})
-
-	// A genuinely new event must still be accepted, creating a new
-	// pending transition as usual -- the rollback path must not
-	// poison subsequent legitimate inserts.
-	newEvent := h.randMintEvent()
-	err = h.commitMachine.InsertPendingUpdate(h.ctx, h.assetSpec, newEvent)
-	require.NoError(t, err)
-	h.assertPendingTransitionExists()
-	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{newEvent})
-	h.assertCurrentStateIs(&supplycommit.UpdatesPendingState{})
-}
-
 // TestBindDanglingUpdatesToTransition tests the logic for binding dangling
 // updates to a new transition.
 func TestBindDanglingUpdatesToTransition(t *testing.T) {
@@ -1542,23 +1415,15 @@ func TestBindDanglingUpdatesToTransition(t *testing.T) {
 				)
 				require.NoError(t, err)
 
-				eventData := b.Bytes()
-				eventKey := supplyUpdateEventKey(
-					h.groupKeyBytes, updateTypeID,
-					eventData,
-				)
-
-				rows, err := db.InsertSupplyUpdateEvent(
+				err = db.InsertSupplyUpdateEvent(
 					h.ctx, InsertSupplyUpdateEvent{
 						GroupKey:     h.groupKeyBytes,
 						TransitionID: sql.NullInt64{},
 						UpdateTypeID: updateTypeID,
-						EventData:    eventData,
-						EventKey:     eventKey,
+						EventData:    b.Bytes(),
 					},
 				)
 				require.NoError(t, err)
-				require.Equal(t, int64(1), rows)
 			}
 
 			return nil
@@ -1648,24 +1513,13 @@ func TestBeginIdleTransition(t *testing.T) {
 			)
 			require.NoError(t, err)
 
-			eventData := b.Bytes()
-			eventKey := supplyUpdateEventKey(
-				h.groupKeyBytes, updateTypeID, eventData,
-			)
-
-			rows, err := db.InsertSupplyUpdateEvent(
+			return db.InsertSupplyUpdateEvent(
 				h.ctx, InsertSupplyUpdateEvent{
 					GroupKey:     h.groupKeyBytes,
-					TransitionID: sql.NullInt64{},
 					UpdateTypeID: updateTypeID,
-					EventData:    eventData,
-					EventKey:     eventKey,
+					EventData:    b.Bytes(),
 				},
 			)
-			require.NoError(t, err)
-			require.Equal(t, int64(1), rows)
-
-			return nil
 		},
 	)
 	require.NoError(t, err)
@@ -1683,8 +1537,7 @@ func TestBeginIdleTransition(t *testing.T) {
 	require.True(t, dbTransition.Frozen)
 	require.False(t, dbTransition.Finalized)
 	require.Equal(
-		t, stateMachine.LatestCommitmentID,
-		dbTransition.OldCommitmentID,
+		t, stateMachine.LatestCommitmentID, dbTransition.OldCommitmentID,
 	)
 	h.assertCurrentStateIs(&supplycommit.UpdatesPendingState{})
 	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{dangling})
@@ -1820,6 +1673,7 @@ func TestSupplyCommitState(t *testing.T) {
 		&supplycommit.CommitTxCreateState{},
 		&supplycommit.CommitTxSignState{},
 		&supplycommit.CommitBroadcastState{},
+		&supplycommit.CommitFinalizeState{},
 	}
 
 	// We'll now run through all the tests, then make sure that when we
@@ -2658,22 +2512,6 @@ func TestSupplySyncerPushLog(t *testing.T) {
 		"timestamp=%d, leaves=%d", logEntry.CommitTxid,
 		logEntry.OutputIndex, logEntry.CreatedAt,
 		logEntry.NumLeavesPushed)
-
-	// The pushed-servers view reflects the log: the syncer consults
-	// it before a push so a retry only targets servers still missing
-	// the commitment.
-	pushed, err := syncerStore.FetchPushedServers(
-		h.ctx, h.assetSpec, commitment,
-	)
-	require.NoError(t, err)
-	require.Equal(t, []string{"localhost:8080"}, pushed)
-
-	// A different commitment outpoint reports nothing pushed.
-	other := commitment
-	other.Txn = wire.NewMsgTx(2)
-	pushed, err = syncerStore.FetchPushedServers(h.ctx, h.assetSpec, other)
-	require.NoError(t, err)
-	require.Empty(t, pushed)
 }
 
 // assertEqualEvents compares two supply update events by serializing them and
@@ -2691,58 +2529,4 @@ func assertEqualEvents(t *testing.T, expected,
 	require.NoError(t, err)
 
 	require.Equal(t, expectedBytes.String(), actualBytes.String())
-}
-
-// TestInsertSupplyCommitAbsorbsDuplicate pins the insert's identity
-// idempotency: a commitment already stored under its outpoint is
-// absorbed rather than failing supply_commitments_outpoint_uk. The
-// sender retries its whole dispatch whenever any one universe server
-// fails, and the verifier's pull path can redeliver, so the same
-// commitment is legitimately presented more than once — and the
-// insert runs in one transaction, so an existing row implies its
-// leaves and pre-commitment spends landed with it.
-func TestInsertSupplyCommitAbsorbsDuplicate(t *testing.T) {
-	t.Parallel()
-
-	h := newSupplyCommitTestHarness(t)
-
-	// An existing commitment, recorded the way the apply path
-	// records one.
-	genesisPoint := test.RandOp(h.t)
-	tx := wire.NewMsgTx(2)
-	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: genesisPoint})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    1000,
-		PkScript: test.RandBytes(20),
-	})
-	txBytes, err := encodeTx(tx)
-	require.NoError(t, err)
-	txid := tx.TxHash()
-	chainTxID, err := h.db.UpsertChainTx(h.ctx, sqlc.UpsertChainTxParams{
-		Txid:  txid[:],
-		RawTx: txBytes,
-	})
-	require.NoError(t, err)
-	h.addTestSupplyCommitment(chainTxID, txid[:], txBytes, true)
-
-	// Re-presenting the same commitment — the shape of a re-push or
-	// a redelivered pull — is absorbed. The guard answers before the
-	// leaves are read, so none are needed.
-	commitment := supplycommit.RootCommitment{
-		Txn:         tx,
-		TxOutIdx:    0,
-		InternalKey: keychain.KeyDescriptor{PubKey: h.groupPubKey},
-		OutputKey:   h.groupPubKey,
-		SupplyRoot: mssmt.NewComputedBranch(
-			mssmt.NodeHash{0x01}, 1,
-		),
-		CommitmentBlock: fn.Some(supplycommit.CommitmentBlock{
-			Height: 123,
-		}),
-	}
-	err = h.commitMachine.InsertSupplyCommit(
-		h.ctx, h.assetSpec, commitment, supplycommit.SupplyLeaves{},
-		nil,
-	)
-	require.NoError(t, err)
 }
