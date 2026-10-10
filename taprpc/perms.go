@@ -127,6 +127,10 @@ var (
 			Entity: "assets",
 			Action: "write",
 		}},
+		"/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus": {{
+			Entity: "assets",
+			Action: "read",
+		}},
 		"/assetwalletrpc.AssetWallet/PublishAndLogTransfer": {{
 			Entity: "assets",
 			Action: "write",
@@ -180,6 +184,10 @@ var (
 			Action: "write",
 		}},
 		"/mintrpc.Mint/SealBatch": {{
+			Entity: "mint",
+			Action: "write",
+		}},
+		"/mintrpc.Mint/PrepareBatch": {{
 			Entity: "mint",
 			Action: "write",
 		}},

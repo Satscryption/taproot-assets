@@ -149,6 +149,20 @@ WHERE sc.group_key = @group_key AND
     sc.output_index = @output_index AND
     ct.txid = @txid;
 
+-- name: QuerySupplyCommitmentByTxid :one
+SELECT sqlc.embed(sc)
+FROM supply_commitments AS sc
+JOIN chain_txns AS ct
+    ON sc.chain_txn_id = ct.txn_id
+WHERE sc.group_key = @group_key AND
+    ct.txid = @txid;
+
+-- name: QuerySupplyCommitTransitionByNewCommitment :one
+SELECT sqlc.embed(t)
+FROM supply_commit_transitions t
+WHERE t.new_commitment_id = @new_commitment_id
+LIMIT 1;
+
 -- name: QuerySupplyCommitmentBySpentOutpoint :one
 WITH spent_commitment AS (
     SELECT ssc.commit_id

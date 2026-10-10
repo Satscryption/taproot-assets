@@ -77,6 +77,16 @@ triggers the commitment process, moving through states for tree creation
 finalization (`CommitFinalizeState`) upon confirmation, before returning to the
 `DefaultState`.
 
+**Idle ticks:** when `universe.supply-idle-commit-interval` is non-zero, the
+manager sends an `IdleTickEvent{BlockHeight}` to the state machine of every
+locally controlled supply commitment on each new block. In `DefaultState`, if
+the latest commitment is confirmed and at least `interval` blocks old, the
+machine begins a frozen transition that spends the latest commitment (binding
+any dangling updates) and runs the normal commitment cycle, even with no
+updates. This keeps the on-chain commitment fresh. In `UpdatesPendingState` the
+event publishes staged updates when `universe.supply-auto-publish-pending` is
+set, or resumes an interrupted empty transition.
+
 ### States and Transitions
 
 ```mermaid
@@ -86,6 +96,7 @@ stateDiagram-v2
     [*] --> DefaultState: Initialize
 
     DefaultState --> UpdatesPendingState: SupplyUpdateEvent
+    DefaultState --> CommitTreeCreateState: IdleTickEvent<br/>(commitment older than interval)
     UpdatesPendingState --> CommitTreeCreateState: CommitTickEvent
     
     state CommitmentCycle {

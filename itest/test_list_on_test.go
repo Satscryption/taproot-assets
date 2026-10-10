@@ -50,6 +50,14 @@ var allTestCases = []*testCase{
 		test: testMintFundSealAssets,
 	},
 	{
+		name: "mint custom anchor psbt",
+		test: testMintCustomAnchorPsbt,
+	},
+	{
+		name: "mint custom anchor psbt restart",
+		test: testMintCustomAnchorPsbtRestart,
+	},
+	{
 		name: "mint external group key chantools",
 		test: testMintExternalGroupKeyChantools,
 	},
@@ -430,6 +438,14 @@ var allTestCases = []*testCase{
 	{
 		name: "supply commit mint burn",
 		test: testSupplyCommitMintBurn,
+	},
+	{
+		name: "supply commit idle tick",
+		test: testSupplyCommitIdleTick,
+	},
+	{
+		name: "supply commit burial threshold",
+		test: testSupplyCommitBurialThreshold,
 	},
 	{
 		name: "supply verify peer node",

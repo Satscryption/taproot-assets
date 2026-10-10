@@ -28,7 +28,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightninglabs/lndclient"
@@ -140,6 +139,10 @@ const (
 	// return feedback when importing an address into the wallet. The import
 	// may continue in the background after the timeout expires.
 	addrImportTimeout = 20 * time.Second
+
+	// maxCustomAnchorPsbtSize bounds caller-controlled PSBT work performed
+	// synchronously by the mint gardener.
+	maxCustomAnchorPsbtSize = 4 * 1024 * 1024
 )
 
 type (
@@ -220,6 +223,10 @@ type RPCServer struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// commitNow, when set, is the clock for CommitVirtualPsbts retention.
+	// Production leaves it nil and uses time.Now.
+	commitNow func() time.Time
 }
 
 // NewRPCServer creates a new RPC sever.
@@ -246,6 +253,10 @@ func (r *RPCServer) Start(cfg *tapconfig.Config) error {
 	r.proofQueryRateLimiter = rate.NewLimiter(
 		r.cfg.UniverseQueriesPerSecond, r.cfg.UniverseQueriesBurst,
 	)
+
+	if err := r.purgeExpiredCommitRecords(); err != nil {
+		rpcsLog.Errorf("Error purging expired commit records: %v", err)
+	}
 
 	// All of our dependencies are now wired up, so we can flip the ready
 	// flag. This must happen last: the atomic store also acts as the
@@ -944,13 +955,53 @@ func checkFeeRateSanity(ctx context.Context, rpcFeeRate chainfee.SatPerKWeight,
 func (r *RPCServer) FundBatch(ctx context.Context,
 	req *mintrpc.FundBatchRequest) (*mintrpc.FundBatchResponse, error) {
 
-	feeRate, err := checkFeeRateSanity(
-		ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
-	)
-	if err != nil {
-		return nil, err
+	if len(req.AnchorPsbt) != 0 && req.FeeRate != 0 {
+		return nil, fmt.Errorf("fee rate cannot be combined with a " +
+			"caller-funded anchor PSBT")
 	}
-	feeRateOpt := fn.MaybeSome(feeRate)
+	if len(req.AnchorPsbt) == 0 && (req.AssetAnchorOutputIndex != 0 ||
+		req.ChangeOutputIndex != 0 || req.NoChangeOutput ||
+		req.PreCommitOutputIndex != nil) {
+
+		return nil, fmt.Errorf(
+			"custom anchor output controls require anchor_psbt",
+		)
+	}
+	if req.NoChangeOutput && req.ChangeOutputIndex != 0 {
+		return nil, fmt.Errorf("no_change_output conflicts with " +
+			"change_output_index")
+	}
+
+	var anchorPsbt *psbt.Packet
+	if len(req.AnchorPsbt) != 0 {
+		if len(req.AnchorPsbt) > maxCustomAnchorPsbtSize {
+			return nil, fmt.Errorf(
+				"anchor PSBT exceeds maximum size of %d bytes",
+				maxCustomAnchorPsbtSize,
+			)
+		}
+		var err error
+		anchorPsbt, err = psbt.NewFromRawBytes(
+			bytes.NewReader(req.AnchorPsbt), false,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"unable to parse anchor PSBT: %w", err,
+			)
+		}
+	}
+
+	var feeRateOpt fn.Option[chainfee.SatPerKWeight]
+	if anchorPsbt == nil {
+		feeRate, err := checkFeeRateSanity(
+			ctx, chainfee.SatPerKWeight(req.FeeRate),
+			r.cfg.Lnd.WalletKit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		feeRateOpt = fn.MaybeSome(feeRate)
+	}
 
 	tapTreeOpt, err := rpcutils.UnmarshalTapscriptSibling(
 		req.GetFullTree(), req.GetBranch(),
@@ -959,9 +1010,22 @@ func (r *RPCServer) FundBatch(ctx context.Context,
 		return nil, err
 	}
 
+	changeOutputIndex := req.ChangeOutputIndex
+	if req.NoChangeOutput {
+		changeOutputIndex = -1
+	}
+	preCommitIdx := fn.None[uint32]()
+	if req.PreCommitOutputIndex != nil {
+		preCommitIdx = fn.Some(req.GetPreCommitOutputIndex())
+	}
+
 	fundBatchResp, err := r.cfg.AssetMinter.FundBatch(tapgarden.FundParams{
-		FeeRate:        feeRateOpt,
-		SiblingTapTree: tapTreeOpt,
+		FeeRate:              feeRateOpt,
+		SiblingTapTree:       tapTreeOpt,
+		AnchorPsbt:           anchorPsbt,
+		AssetAnchorOutIdx:    req.AssetAnchorOutputIndex,
+		ChangeOutputIndex:    changeOutputIndex,
+		PreCommitOutputIndex: preCommitIdx,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to fund batch: %w", err)
@@ -1065,30 +1129,78 @@ func (r *RPCServer) SealBatch(ctx context.Context,
 	}, nil
 }
 
+// PrepareBatch commits the current caller-authored batch into its selected
+// anchor output and returns the packet for external signing.
+func (r *RPCServer) PrepareBatch(_ context.Context,
+	req *mintrpc.PrepareBatchRequest) (*mintrpc.PrepareBatchResponse, error) {
+
+	batch, err := r.cfg.AssetMinter.PrepareBatch()
+	if err != nil {
+		return nil, fmt.Errorf("unable to prepare batch: %w", err)
+	}
+	rpcBatch, err := marshalMintingBatch(batch, req.ShortResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return &mintrpc.PrepareBatchResponse{
+		Batch: rpcBatch,
+	}, nil
+}
+
 // FinalizeBatch attempts to finalize the current pending batch.
 func (r *RPCServer) FinalizeBatch(ctx context.Context,
 	req *mintrpc.FinalizeBatchRequest) (*mintrpc.FinalizeBatchResponse,
 	error) {
 
-	feeRate, err := checkFeeRateSanity(
-		ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	feeRateOpt := fn.MaybeSome(feeRate)
+	var signedPsbt *psbt.Packet
+	if len(req.SignedPsbt) != 0 {
+		if len(req.SignedPsbt) > maxCustomAnchorPsbtSize {
+			return nil, fmt.Errorf(
+				"signed PSBT exceeds maximum size of %d bytes",
+				maxCustomAnchorPsbtSize,
+			)
+		}
+		if req.FeeRate != 0 || req.GetFullTree() != nil ||
+			req.GetBranch() != nil {
 
-	tapTreeOpt, err := rpcutils.UnmarshalTapscriptSibling(
-		req.GetFullTree(), req.GetBranch(),
-	)
-	if err != nil {
-		return nil, err
+			return nil, fmt.Errorf("signed PSBT cannot be combined " +
+				"with fee rate or tapscript sibling")
+		}
+		var err error
+		signedPsbt, err = psbt.NewFromRawBytes(
+			bytes.NewReader(req.SignedPsbt), false,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse signed PSBT: %w",
+				err)
+		}
+	}
+
+	var feeRateOpt fn.Option[chainfee.SatPerKWeight]
+	var tapTreeOpt fn.Option[asset.TapscriptTreeNodes]
+	if signedPsbt == nil {
+		feeRate, err := checkFeeRateSanity(
+			ctx, chainfee.SatPerKWeight(req.FeeRate), r.cfg.Lnd.WalletKit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		feeRateOpt = fn.MaybeSome(feeRate)
+
+		tapTreeOpt, err = rpcutils.UnmarshalTapscriptSibling(
+			req.GetFullTree(), req.GetBranch(),
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	batch, err := r.cfg.AssetMinter.FinalizeBatch(
 		tapgarden.FinalizeParams{
 			FeeRate:        feeRateOpt,
 			SiblingTapTree: tapTreeOpt,
+			SignedPsbt:     signedPsbt,
 		},
 	)
 	if err != nil {
@@ -3043,237 +3155,6 @@ func transitionProofOptions(
 	}
 }
 
-// CommitVirtualPsbts creates the output commitments and proofs for the given
-// virtual transactions by committing them to the BTC level anchor transaction.
-// In addition, the BTC level anchor transaction is funded and prepared up to
-// the point where it is ready to be signed.
-func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
-	req *wrpc.CommitVirtualPsbtsRequest) (*wrpc.CommitVirtualPsbtsResponse,
-	error) {
-
-	proofOpts, err := transitionProofOptions(req.TransitionProofVersion)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(req.VirtualPsbts) == 0 {
-		return nil, fmt.Errorf("no virtual PSBTs specified")
-	}
-
-	pkt, err := psbt.NewFromRawBytes(bytes.NewReader(req.AnchorPsbt), false)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding packet: %w", err)
-	}
-
-	activePackets, err := decodeVirtualPackets(req.VirtualPsbts)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding active packets: %w", err)
-	}
-
-	passivePackets, err := decodeVirtualPackets(req.PassiveAssetPsbts)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding passive packets: %w",
-			err)
-	}
-
-	// Make sure the assets given fully satisfy the input commitments.
-	allPackets := append([]*tappsbt.VPacket{}, activePackets...)
-	allPackets = append(allPackets, passivePackets...)
-	err = r.validateInputAssets(ctx, pkt, allPackets)
-	if err != nil {
-		return nil, fmt.Errorf("error validating input assets: %w", err)
-	}
-
-	// We're ready to attempt to fund the transaction now. For that we first
-	// need to re-serialize our packet.
-	packetBytes, err := fn.Serialize(pkt)
-	if err != nil {
-		return nil, fmt.Errorf("error serializing packet: %w", err)
-	}
-
-	var (
-		lockedUTXO      []*walletrpc.UtxoLease
-		lockedOutpoints []wire.OutPoint
-		fundedPacket    *psbt.Packet = pkt
-		changeIndex     int32        = -1
-		success         bool
-	)
-
-	if !req.SkipFunding {
-		// The change output and fee parameters of this RPC are
-		// identical to the walletrpc.FundPsbt, so we just map them 1:1
-		// and let lnd do the validation.
-		coinSelect := &walletrpc.PsbtCoinSelect{
-			Psbt: packetBytes,
-		}
-		fundRequest := &walletrpc.FundPsbtRequest{
-			Template: &walletrpc.FundPsbtRequest_CoinSelect{
-				CoinSelect: coinSelect,
-			},
-			MinConfs:              1,
-			ChangeType:            P2TRChangeType,
-			CustomLockId:          req.CustomLockId,
-			LockExpirationSeconds: req.LockExpirationSeconds,
-		}
-
-		// Unfortunately we can't use the same RPC types, so we have to
-		// do a 1:1 mapping to the walletrpc types for the anchor change
-		// output and fee "oneof" fields.
-		switch change := req.AnchorChangeOutput.(type) {
-		case *wrpc.CommitVirtualPsbtsRequest_ExistingOutputIndex:
-			coinSelect.ChangeOutput = &coinSelectExistingIndex{
-				ExistingOutputIndex: change.ExistingOutputIndex,
-			}
-
-		case *wrpc.CommitVirtualPsbtsRequest_Add:
-			coinSelect.ChangeOutput = &walletrpc.PsbtCoinSelect_Add{
-				Add: change.Add,
-			}
-
-		default:
-			return nil, fmt.Errorf("unknown change output type")
-		}
-
-		switch fee := req.Fees.(type) {
-		case *wrpc.CommitVirtualPsbtsRequest_TargetConf:
-			fundRequest.Fees =
-				&walletrpc.FundPsbtRequest_TargetConf{
-					TargetConf: fee.TargetConf,
-				}
-
-		case *wrpc.CommitVirtualPsbtsRequest_SatPerVbyte:
-			fundRequest.Fees =
-				&walletrpc.FundPsbtRequest_SatPerVbyte{
-					SatPerVbyte: fee.SatPerVbyte,
-				}
-
-		default:
-			return nil, fmt.Errorf("unknown fee type")
-		}
-
-		lndWallet := r.cfg.Lnd.WalletKit
-		fundedPacket, changeIndex, lockedUTXO, err = lndWallet.FundPsbt(
-			ctx, fundRequest,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error funding packet: %w", err)
-		}
-
-		lockedOutpoints = fn.Map(lockedUTXO,
-			func(utxo *walletrpc.UtxoLease) wire.OutPoint {
-				var hash chainhash.Hash
-				copy(hash[:], utxo.Outpoint.TxidBytes)
-				return wire.OutPoint{
-					Hash:  hash,
-					Index: utxo.Outpoint.OutputIndex,
-				}
-			},
-		)
-
-		// From now on, if we error out, we need to make sure we unlock
-		// the UTXOs that lnd just locked for us.
-		defer func() {
-			if success {
-				return
-			}
-
-			for idx, utxo := range lockedUTXO {
-				var lockID wtxmgr.LockID
-				copy(lockID[:], utxo.Id)
-
-				op := lockedOutpoints[idx]
-				err := lndWallet.ReleaseOutput(ctx, lockID, op)
-				if err != nil {
-					rpcsLog.Errorf("Error unlocking lnd "+
-						"UTXO %v: %v", op, err)
-				}
-			}
-		}()
-	}
-
-	// We can now update the anchor outputs as we have the final
-	// commitments.
-	outputCommitments, err := tapsend.CreateOutputCommitments(
-		allPackets, tapsend.WithSpenderLeaves(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create new output "+
-			"commitments: %w", err)
-	}
-
-	for _, vPkt := range allPackets {
-		err = tapsend.UpdateTaprootOutputKeys(
-			fundedPacket, vPkt, outputCommitments,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error updating taproot output "+
-				"keys: %w", err)
-		}
-	}
-
-	// We're done creating the output commitments, we can now create the
-	// transition proof suffixes.
-	for idx := range allPackets {
-		vPkt := allPackets[idx]
-
-		for vOutIdx := range vPkt.Outputs {
-			proofSuffix, err := tapsend.CreateProofSuffix(
-				fundedPacket.UnsignedTx, fundedPacket.Outputs,
-				vPkt, outputCommitments, vOutIdx, allPackets,
-				proofOpts...,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to create "+
-					"proof suffix for output %d of vPSBT "+
-					"%d: %w", vOutIdx, idx, err)
-			}
-
-			vPkt.Outputs[vOutIdx].ProofSuffix = proofSuffix
-		}
-	}
-
-	// We can now prepare the full answer, beginning with the serialized
-	// final packet.
-	response := &wrpc.CommitVirtualPsbtsResponse{
-		ChangeOutputIndex: changeIndex,
-	}
-
-	response.AnchorPsbt, err = fn.Serialize(fundedPacket)
-	if err != nil {
-		return nil, fmt.Errorf("error serializing packet: %w", err)
-	}
-
-	// Serialize the final active and passive virtual packets.
-	response.VirtualPsbts, err = encodeVirtualPackets(activePackets)
-	if err != nil {
-		return nil, fmt.Errorf("error encoding active packets: %w", err)
-	}
-	response.PassiveAssetPsbts, err = encodeVirtualPackets(passivePackets)
-	if err != nil {
-		return nil, fmt.Errorf("error encoding passive packets: %w",
-			err)
-	}
-
-	// And finally, we need to also return the locked UTXOs. We just return
-	// the outpoint, as any additional information can be fetched from the
-	// lnd wallet directly (we don't want to create pass-through RPCs for
-	// all those methods).
-	response.LndLockedUtxos = make([]*taprpc.OutPoint, len(lockedOutpoints))
-	for idx := range lockedOutpoints {
-		response.LndLockedUtxos[idx] = &taprpc.OutPoint{
-			Txid:        lockedOutpoints[idx].Hash[:],
-			OutputIndex: lockedOutpoints[idx].Index,
-		}
-	}
-
-	// We were successful, let's cancel the UTXO release in the defer.
-	success = true
-
-	return response, nil
-}
-
-// validateInputAssets makes sure that the input assets are correct and their
-// combined commitments match the inputs of the BTC level anchor transaction.
 func (r *RPCServer) validateInputAssets(ctx context.Context,
 	btcPkt *psbt.Packet, vPackets []*tappsbt.VPacket) error {
 
@@ -3471,21 +3352,8 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
-	// Before we commit the transaction to the database, we want to make
-	// sure everything is in order. We start by validating the inputs.
 	allPackets := append([]*tappsbt.VPacket{}, activePackets...)
 	allPackets = append(allPackets, passivePackets...)
-	err = r.validateInputAssets(ctx, pkt, allPackets)
-	if err != nil {
-		return nil, fmt.Errorf("error validating input assets: %w", err)
-	}
-
-	// And then the outputs as well.
-	err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
-	if err != nil {
-		return nil, fmt.Errorf("error validating anchor outputs: %w",
-			err)
-	}
 
 	chainFees, err := pkt.GetTxFee()
 	if err != nil {
@@ -3493,12 +3361,38 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 			err)
 	}
 
-	// The BTC level transaction must be fully complete, and we must be able
-	// to extract the final transaction from it.
+	// Extract the final transaction before input validation. A retry of
+	// an already-logged anchor must be reconciled even when those inputs
+	// are now leased or spent, which would fail validation.
 	finalTx, err := psbt.Extract(pkt)
 	if err != nil {
 		return nil, fmt.Errorf("error extracting final anchor "+
 			"transaction: %w", err)
+	}
+
+	anchorHash := finalTx.TxHash()
+	logged, err := r.cfg.ChainPorter.QueryParcels(
+		ctx, fn.Some(anchorHash), false,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error querying logged transfer: %w",
+			err)
+	}
+
+	// Nothing is logged yet, so this is the first publish. Validate
+	// before the porter writes the transfer.
+	if len(logged) == 0 {
+		err = r.validateInputAssets(ctx, pkt, allPackets)
+		if err != nil {
+			return nil, fmt.Errorf("error validating input "+
+				"assets: %w", err)
+		}
+
+		err = tapsend.ValidateAnchorOutputs(pkt, allPackets, true)
+		if err != nil {
+			return nil, fmt.Errorf("error validating anchor "+
+				"outputs: %w", err)
+		}
 	}
 
 	anchorTx := &tapsend.AnchorTransaction{
@@ -3530,18 +3424,17 @@ func (r *RPCServer) PublishAndLogTransfer(ctx context.Context,
 		parcelLabel = req.Label
 	}
 
-	// We now have everything to ship the pre-anchored parcel using the
-	// freighter. This will publish the TX, create the transfer database
-	// entries and ship the proofs to the counterparties. It'll also wait
-	// for a confirmation and then update the proofs with the block header
-	// information.
-	resp, err := r.cfg.ChainPorter.RequestShipment(
-		tapfreighter.NewPreAnchoredParcel(
-			activePackets, passivePackets, anchorTx,
-			req.SkipAnchorTxBroadcast, parcelLabel,
-			fn.None[uint32](),
-		),
+	// Ship the pre-anchored parcel. When this anchor is already logged,
+	// the porter returns that transfer and does not publish it again.
+	// Otherwise it logs the transfer, publishes, and ships proofs.
+	preAnchored := tapfreighter.NewPreAnchoredParcel(
+		activePackets, passivePackets, anchorTx,
+		req.SkipAnchorTxBroadcast, parcelLabel,
+		fn.None[uint32](),
 	)
+	preAnchored.SetRequestID(req.GetRequestId())
+
+	resp, err := r.cfg.ChainPorter.RequestShipment(preAnchored)
 	if err != nil {
 		return nil, fmt.Errorf("error requesting delivery: %w", err)
 	}

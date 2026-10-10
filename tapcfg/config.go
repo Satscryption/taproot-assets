@@ -28,6 +28,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/rpcserver"
+	"github.com/lightninglabs/taproot-assets/tapconfig"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/cert"
@@ -122,6 +123,10 @@ const (
 	// we'll wait before considering a transaction safely buried in the
 	// testnet chain.
 	testnetDefaultReOrgSafeDepth = 120
+
+	// MinSupplyIdleCommitInterval is the smallest allowed non-zero value for
+	// universe.supply-idle-commit-interval.
+	MinSupplyIdleCommitInterval = uint32(1)
 
 	// defaultUniverseMaxQps is the default maximum number of queries per
 	// second for the universe server. This permis 100 queries per second
@@ -314,6 +319,10 @@ type WalletConfig struct {
 	// UTXOs into anchor transactions created during sends and burns.
 	// Sweeping is enabled by default.
 	DisableSweepOrphanUtxos bool `long:"disable-sweep-orphan-utxos" description:"Disable sweeping orphaned UTXOs into anchor transactions created during sends and burns. Sweeping is enabled by default."`
+
+	// CommitVirtualPsbtRetention is how long a completed or failed
+	// CommitVirtualPsbts request_id and its stored response are kept.
+	CommitVirtualPsbtRetention time.Duration `long:"commit-virtual-psbt-retention" description:"How long a completed or failed CommitVirtualPsbts request_id and its stored response are kept. Pending requests are never removed by this window. Valid time units are {s, m, h}."`
 }
 
 // UniverseConfig is the config that houses any Universe related config
@@ -344,6 +353,10 @@ type UniverseConfig struct {
 	MultiverseCaches *tapdb.MultiverseCacheConfig `group:"multiverse-caches" namespace:"multiverse-caches"`
 
 	SupplyIgnoreCacheSize uint64 `long:"supply-ignore-cache-size" description:"The maximum number of entries in the supply ignore checker's negative lookup LRU cache."`
+
+	SupplyIdleCommitInterval uint32 `long:"supply-idle-commit-interval" description:"The number of blocks after which tapd automatically publishes an ancestry-linked successor supply commitment for a locally controlled asset group whose latest supply commitment has confirmed, even if there were no new supply updates. Set to 0 to disable (the default)."`
+
+	SupplyAutoPublishPending bool `long:"supply-auto-publish-pending" description:"If set, tapd automatically publishes pending supply updates (for example ignored outpoints) when the next block arrives, instead of waiting for a manual UpdateSupplyCommit call."`
 
 	DisableSupplyVerifierChainWatch bool `long:"disable-supply-verifier-chain-watch" description:"Disable chain outpoint watching in supply verifier. If true, the supply verifier will not start state machines to watch on-chain outputs for spends. This option is intended for universe servers, where supply verification should only occur for commitments submitted by peers, not via on-chain spend detection."`
 }
@@ -528,7 +541,8 @@ func DefaultConfig() Config {
 			DisableSupplyVerifierChainWatch: false,
 		},
 		Wallet: &WalletConfig{
-			PsbtMaxFeeRatio: DefaultPsbtMaxFeeRatio,
+			PsbtMaxFeeRatio:            DefaultPsbtMaxFeeRatio,
+			CommitVirtualPsbtRetention: tapconfig.DefaultCommitVirtualPsbtRetention,
 		},
 		AddrBook: &AddrBookConfig{
 			DisableSyncer: false,
@@ -1034,10 +1048,28 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 			"range of 0.00 to 1.00")
 	}
 
+	if cfg.Wallet.CommitVirtualPsbtRetention < 0 {
+		return nil, fmt.Errorf("wallet.commit-virtual-psbt-" +
+			"retention must not be negative")
+	}
+	if cfg.Wallet.CommitVirtualPsbtRetention == 0 {
+		cfg.Wallet.CommitVirtualPsbtRetention =
+			tapconfig.DefaultCommitVirtualPsbtRetention
+	}
+
 	// Validate the healthcheck config.
 	err = cfg.HealthChecks.Validate()
 	if err != nil {
 		return nil, fmt.Errorf("error in healthcheck config: %w", err)
+	}
+
+	if cfg.Universe.SupplyIdleCommitInterval != 0 &&
+		cfg.Universe.SupplyIdleCommitInterval <
+			MinSupplyIdleCommitInterval {
+
+		return nil, mkErr("universe.supply-idle-commit-interval "+
+			"must be 0 (disabled) or at least %d blocks",
+			MinSupplyIdleCommitInterval)
 	}
 
 	// All good, return the sanitized result.

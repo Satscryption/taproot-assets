@@ -434,6 +434,20 @@ type CommitTickEvent struct {
 // eventSealed is a special method that is used to seal the interface.
 func (c *CommitTickEvent) eventSealed() {}
 
+// IdleTickEvent is emitted periodically (once per new block) by the manager
+// when an idle commit interval is configured. If the state machine is idle
+// and the latest confirmed supply commitment is at least the configured number
+// of blocks old, the state machine publishes an ancestry-linked successor
+// commitment, even if there are no new supply updates. In any other state the
+// event is a no-op.
+type IdleTickEvent struct {
+	// BlockHeight is the current best block height.
+	BlockHeight uint32
+}
+
+// eventSealed is a special method that is used to seal the interface.
+func (i *IdleTickEvent) eventSealed() {}
+
 // UpdatesPendingState is the state of the state machine when we have. From this
 // state, we can queue/accept new supply commit events. Periodically, we'll rely
 // on a new incoming Commit event, that'll be used as a trigger to progress the

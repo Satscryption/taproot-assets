@@ -13,7 +13,6 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
 	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -114,11 +113,180 @@ func (d *DefaultState) ProcessEvent(event Event,
 			NextState: d,
 		}, nil
 
+	// An idle tick either starts an ancestry-linked successor commitment
+	// if the latest commitment is old enough, or it's a no-op.
+	case *IdleTickEvent:
+		return d.processIdleTick(supplyEvent, env)
+
 	// Any other messages in this state will result in an error, as this is
 	// an undefined state transition.
 	default:
 		return nil, fmt.Errorf("%w: received %T while in %T",
 			ErrInvalidStateTransition, event, d)
+	}
+}
+
+// processIdleTick handles an IdleTickEvent in the DefaultState. If idle
+// commits are enabled, there is a confirmed latest supply commitment, and that
+// commitment is at least env.IdleCommitInterval blocks old at the height of
+// the tick, a new transition is started that commits to the current supply
+// trees (plus any dangling updates), so that a successor commitment that spends
+// the latest one is published automatically, without any new supply update.
+func (d *DefaultState) processIdleTick(tick *IdleTickEvent,
+	env *Environment) (*StateTransition, error) {
+
+	noop := &StateTransition{NextState: d}
+
+	// Idle commits are opt-in.
+	if env.IdleCommitInterval == 0 {
+		return noop, nil
+	}
+
+	prefixedLog := env.Logger()
+	ctx := context.Background()
+
+	// Without a confirmed commitment there is nothing to succeed, the first
+	// commitment is always driven by supply updates.
+	latest, err := env.Commitments.SupplyCommit(ctx, env.AssetSpec).Unpack()
+	if err != nil {
+		return nil, fmt.Errorf("unable to fetch latest supply "+
+			"commitment: %w", err)
+	}
+	if latest.IsNone() {
+		return noop, nil
+	}
+	commit := latest.UnwrapOr(RootCommitment{})
+	block, err := commit.CommitmentBlock.UnwrapOrErr(ErrNoBlockInfo)
+	if err != nil {
+		// The latest commitment isn't confirmed yet, so it can't be
+		// old enough.
+		return noop, nil
+	}
+
+	// Compare in 64 bits to avoid overflowing for very large intervals.
+	dueHeight := uint64(block.Height) + uint64(env.IdleCommitInterval)
+	if uint64(tick.BlockHeight) < dueHeight {
+		return noop, nil
+	}
+
+	prefixedLog.Infof("Latest supply commitment confirmed at height %d "+
+		"is older than the idle interval of %d blocks (current "+
+		"height %d), starting idle successor commitment",
+		block.Height, env.IdleCommitInterval, tick.BlockHeight)
+
+	// Persist a frozen transition first, so a restart or a failure resumes
+	// this cycle, and any update arriving from now on is stored as a
+	// dangling update for the next one.
+	updates, err := env.StateLog.BeginIdleTransition(ctx, env.AssetSpec)
+	if err != nil {
+		return nil, fmt.Errorf("unable to begin idle transition: %w",
+			err)
+	}
+
+	return &StateTransition{
+		NextState: &CommitTreeCreateState{},
+		NewEvents: lfn.Some(FsmEvent{
+			InternalEvent: []Event{&CreateTreeEvent{
+				updatesToCommit: updates,
+			}},
+		}),
+	}, nil
+}
+
+// collectUpdates returns the updates a commit from this state should include.
+// If we hold updates in memory, those are used. Otherwise (after a restart) the
+// updates are re-derived from the durable pending transition. The second return
+// value is true if a pending transition exists on disk.
+func (u *UpdatesPendingState) collectUpdates(ctx context.Context,
+	env *Environment) ([]SupplyUpdateEvent, bool, error) {
+
+	if len(u.pendingUpdates) > 0 {
+		return u.pendingUpdates, true, nil
+	}
+
+	_, diskTransition, err := env.StateLog.FetchState(ctx, env.AssetSpec)
+	if err != nil {
+		return nil, false, fmt.Errorf("unable to fetch durable "+
+			"state: %w", err)
+	}
+
+	var updates []SupplyUpdateEvent
+	diskTransition.WhenSome(func(t SupplyStateTransition) {
+		updates = t.PendingUpdates
+	})
+
+	return updates, diskTransition.IsSome(), nil
+}
+
+// backToDefault persists and returns the transition back to the DefaultState.
+func (u *UpdatesPendingState) backToDefault(ctx context.Context,
+	env *Environment) (*StateTransition, error) {
+
+	err := env.StateLog.CommitState(ctx, env.AssetSpec, &DefaultState{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to commit state "+
+			"transition: %w", err)
+	}
+
+	return &StateTransition{
+		NextState: &DefaultState{},
+	}, nil
+}
+
+// startCommit freezes the pending transition (no new updates can be added to
+// the batch after this) and starts the commitment cycle for the given updates.
+func (u *UpdatesPendingState) startCommit(ctx context.Context,
+	env *Environment, updates []SupplyUpdateEvent) (*StateTransition,
+	error) {
+
+	err := env.StateLog.FreezePendingTransition(ctx, env.AssetSpec)
+	if err != nil {
+		return nil, fmt.Errorf("unable to freeze pending "+
+			"transition: %w", err)
+	}
+
+	env.Logger().Infof("Committing %d supply updates", len(updates))
+
+	return &StateTransition{
+		NextState: &CommitTreeCreateState{},
+		NewEvents: lfn.Some(FsmEvent{
+			InternalEvent: []Event{&CreateTreeEvent{
+				updatesToCommit: updates,
+			}},
+		}),
+	}, nil
+}
+
+// processIdleTick handles an IdleTickEvent in the UpdatesPendingState.
+func (u *UpdatesPendingState) processIdleTick(env *Environment) (
+	*StateTransition, error) {
+
+	noop := &StateTransition{NextState: u}
+
+	// Both behaviors are opt-in.
+	if !env.AutoPublishPending && env.IdleCommitInterval == 0 {
+		return noop, nil
+	}
+
+	ctx := context.Background()
+	updates, hasTransition, err := u.collectUpdates(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	// Real pending updates are only published automatically if asked, the
+	// operator may be batching them for a manual update otherwise.
+	case len(updates) > 0 && env.AutoPublishPending:
+		return u.startCommit(ctx, env, updates)
+
+	// An empty, durable transition is an idle successor transition that
+	// was interrupted (by a restart for example), resume it.
+	case len(updates) == 0 && hasTransition && env.IdleCommitInterval > 0:
+		return u.startCommit(ctx, env, nil)
+
+	default:
+		return noop, nil
 	}
 }
 
@@ -166,27 +334,31 @@ func (u *UpdatesPendingState) ProcessEvent(event Event, env *Environment) (
 	// the new set of supply commitments. We'll emit the CreateTxEvent to
 	// the next state will begin the process of making the new commitment.
 	case *CommitTickEvent:
-		// Before we transition, we'll freeze the current pending
-		// transition. This ensures that no new updates can be added
-		// to this batch.
 		ctx := context.Background()
-		err := env.StateLog.FreezePendingTransition(ctx, env.AssetSpec)
+
+		// A machine resumed from disk rests here with no in-memory
+		// updates, the durable record is authoritative.
+		updates, hasTransition, err := u.collectUpdates(ctx, env)
 		if err != nil {
-			return nil, fmt.Errorf("unable to freeze "+
-				"pending transition: %w", err)
+			return nil, err
 		}
 
-		prefixedLog.Infof("Received tick event, committing %d "+
-			"supply updates", len(u.pendingUpdates))
+		// With nothing to commit and no durable transition, ticking is
+		// vacuous: return to the default state rather than committing
+		// an empty batch. A durable transition without updates is an
+		// interrupted idle successor, which we resume.
+		if len(updates) == 0 && !hasTransition {
+			return u.backToDefault(ctx, env)
+		}
 
-		return &StateTransition{
-			NextState: &CommitTreeCreateState{},
-			NewEvents: lfn.Some(FsmEvent{
-				InternalEvent: []Event{&CreateTreeEvent{
-					updatesToCommit: u.pendingUpdates,
-				}},
-			}),
-		}, nil
+		return u.startCommit(ctx, env, updates)
+
+	// An idle tick only starts a commit if the operator opted in: either
+	// to publish pending updates automatically once a block arrives, or to
+	// resume an idle successor transition that was interrupted (by a
+	// restart for example).
+	case *IdleTickEvent:
+		return u.processIdleTick(env)
 
 	// Any other messages in this state will result in an error, as this is
 	// an undefined state transition.
@@ -350,6 +522,12 @@ func (c *CommitTreeCreateState) ProcessEvent(event Event,
 	// If we get a tick in this state, then it's just a no-op. We'll
 	// transition back to the same state.
 	case *CommitTickEvent:
+		return &StateTransition{
+			NextState: c,
+		}, nil
+
+	// An idle tick is a no-op while a commitment cycle is in flight.
+	case *IdleTickEvent:
 		return &StateTransition{
 			NextState: c,
 		}, nil
@@ -779,6 +957,12 @@ func (c *CommitTxCreateState) ProcessEvent(event Event,
 			}),
 		}, nil
 
+	// An idle tick is a no-op while a commitment cycle is in flight.
+	case *IdleTickEvent:
+		return &StateTransition{
+			NextState: c,
+		}, nil
+
 	// Any other messages in this state will result in an error, as this is
 	// an undefined state transition.
 	default:
@@ -881,6 +1065,12 @@ func (s *CommitTxSignState) ProcessEvent(event Event,
 			}),
 		}, nil
 
+	// An idle tick is a no-op while a commitment cycle is in flight.
+	case *IdleTickEvent:
+		return &StateTransition{
+			NextState: s,
+		}, nil
+
 	// Any other messages in this state will result in an error, as this is
 	// an undefined state transition.
 	default:
@@ -925,9 +1115,34 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 	// We're at the final step of the state machine. We'll broadcast the
 	// signed commit tx, then register for a confirmation for when it
 	// confirms.
+	case *CommitTickEvent:
+		ctx := context.Background()
+		transition, recovered, err := tryRecoverBuriedBroadcast(
+			ctx, c, env,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if recovered {
+			return transition, nil
+		}
+
+		return &StateTransition{NextState: c}, nil
+
 	case *BroadcastEvent:
 		if c.SupplyTransition.NewCommitment.Txn == nil {
 			return nil, fmt.Errorf("commitment transaction is nil")
+		}
+
+		recCtx := context.Background()
+		transition, recovered, err := tryRecoverBuriedBroadcast(
+			recCtx, c, env,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if recovered {
+			return transition, nil
 		}
 
 		commitTxid := c.SupplyTransition.NewCommitment.Txn.TxHash()
@@ -977,7 +1192,7 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 			Txid:       commitTx.TxHash(),
 			PkScript:   pkScript,
 			HeightHint: currentHeight,
-			NumConfs:   lfn.Some(uint32(1)),
+			NumConfs:   lfn.Some(commitBurialDepth(env)),
 			FullBlock:  true,
 			PostConfMapper: lfn.Some[protofsm.ConfMapper[Event]](
 				confMapper,
@@ -1002,50 +1217,20 @@ func (c *CommitBroadcastState) ProcessEvent(event Event,
 	// the CommitFinalizeState, which will finalize our supply transition
 	// with the new root and sub-tree information.
 	case *ConfEvent:
-		stateTransition := c.SupplyTransition
-
-		merkleProof, err := proof.NewTxMerkleProof(
-			newEvent.Block.Transactions, int(newEvent.TxIndex),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create merkle "+
-				"proof: %w", err)
-		}
-
-		// Now that the transaction has been confirmed, we'll construct
-		// a merkle proof for the commitment transaction. This'll be
-		// used to prove that the supply commit is canonical.
-		stateTransition.ChainProof = lfn.Some(ChainProof{
-			Header:      newEvent.Block.Header,
-			BlockHeight: newEvent.BlockHeight,
-			MerkleProof: *merkleProof,
-			TxIndex:     newEvent.TxIndex,
-		})
-
-		prefixedLog.Tracef("Supply commitment txn confirmed "+
+		prefixedLog.Tracef("Supply commitment txn buried "+
 			"in block %d (hash=%v): %v",
 			newEvent.BlockHeight, newEvent.Block.Header.BlockHash(),
 			limitSpewer.Sdump(c.SupplyTransition.NewCommitment.Txn))
 
-		// The commitment has been confirmed, so we'll transition to the
-		// finalize state, but also log on disk that we no longer need
-		// to request confirmations on restart.
 		ctx := context.Background()
-		err = env.StateLog.CommitState(
-			ctx, env.AssetSpec, &CommitFinalizeState{},
+		return transitionForBuriedConf(
+			ctx, env, c.SupplyTransition, newEvent,
 		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to commit "+
-				"state transition: %w", err)
-		}
 
+	// An idle tick is a no-op while a commitment cycle is in flight.
+	case *IdleTickEvent:
 		return &StateTransition{
-			NextState: &CommitFinalizeState{
-				SupplyTransition: stateTransition,
-			},
-			NewEvents: lfn.Some(FsmEvent{
-				InternalEvent: []Event{&FinalizeEvent{}}},
-			),
+			NextState: c,
 		}, nil
 
 	// Any other messages in this state will result in an error, as this is
@@ -1218,6 +1403,12 @@ func (c *CommitFinalizeState) ProcessEvent(event Event,
 					updatesToCommit: danglingUpdates,
 				}},
 			}),
+		}, nil
+
+	// An idle tick is a no-op while a commitment cycle is in flight.
+	case *IdleTickEvent:
+		return &StateTransition{
+			NextState: c,
 		}, nil
 
 	// Any other messages in this state will result in an error, as this is

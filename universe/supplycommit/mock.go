@@ -362,6 +362,16 @@ func (m *mockStateMachineStore) FreezePendingTransition(ctx context.Context,
 	return args.Error(0)
 }
 
+func (m *mockStateMachineStore) BeginIdleTransition(ctx context.Context,
+	spec asset.Specifier) ([]SupplyUpdateEvent, error) {
+
+	args := m.Called(ctx, spec)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]SupplyUpdateEvent), args.Error(1)
+}
+
 func (m *mockStateMachineStore) BindDanglingUpdatesToTransition(
 	ctx context.Context,
 	spec asset.Specifier) ([]SupplyUpdateEvent, error) {
@@ -387,6 +397,14 @@ func newMockDaemonAdapters() *mockDaemonAdapters {
 		confChan:  make(chan *chainntnfs.TxConfirmation, 1),
 		spendChan: make(chan *chainntnfs.SpendDetail, 1),
 	}
+}
+
+func (m *mockDaemonAdapters) Start() error {
+	return nil
+}
+
+func (m *mockDaemonAdapters) Stop() error {
+	return nil
 }
 
 func (m *mockDaemonAdapters) BroadcastTransaction(

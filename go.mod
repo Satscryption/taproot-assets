@@ -227,3 +227,6 @@ replace github.com/golang-migrate/migrate/v4 => github.com/lightninglabs/migrate
 replace github.com/prometheus/common => github.com/prometheus/common v0.26.0
 
 replace github.com/lightningnetwork/lnd/tor => github.com/lightningnetwork/lnd/tor v1.1.6
+
+// Local taprpc carries idempotency RPCs until tagged.
+replace github.com/lightninglabs/taproot-assets/taprpc => ./taprpc

@@ -38,10 +38,31 @@ type AssetWalletClient interface {
 	// In addition, the BTC level anchor transaction is funded and prepared up to
 	// the point where it is ready to be signed.
 	CommitVirtualPsbts(ctx context.Context, in *CommitVirtualPsbtsRequest, opts ...grpc.CallOption) (*CommitVirtualPsbtsResponse, error)
+	// GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts
+	// call made with a request_id. It says whether that call is still in
+	// progress or completed, and lists the lnd lock ID and locked outpoints
+	// recorded for it. An unknown request_id is reported as unknown rather
+	// than an error. Repeating CommitVirtualPsbts returns a completed or
+	// failed stored response as-is while it is still inside the retention
+	// window. A repeat while the first call is still running, or while lnd
+	// still holds its input leases, is rejected. After those leases expire,
+	// the pending row is deleted and the same request funds again.
+	GetCommitVirtualPsbtsStatus(ctx context.Context, in *GetCommitVirtualPsbtsStatusRequest, opts ...grpc.CallOption) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the
 	// transfer of the given active and passive assets in the database and ships
 	// any outgoing proofs to the counterparties.
+	//
+	// The RPC is safe to retry after a lost response. A repeat call whose
+	// final anchor transaction is already logged returns that transfer as the
+	// SendAssetResponse and does not insert another asset_transfers row or
+	// publish the anchor again. Callers reconcile by retrying this RPC (with
+	// the same request_id when they set one) or by calling ListTransfers with
+	// the anchor txid. An empty request_id still reconciles by the anchor
+	// transaction. A request_id must not be reused for a different anchor
+	// transaction while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails, and it is not kept across a daemon restart.
 	PublishAndLogTransfer(ctx context.Context, in *PublishAndLogRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
@@ -126,6 +147,15 @@ func (c *assetWalletClient) AnchorVirtualPsbts(ctx context.Context, in *AnchorVi
 func (c *assetWalletClient) CommitVirtualPsbts(ctx context.Context, in *CommitVirtualPsbtsRequest, opts ...grpc.CallOption) (*CommitVirtualPsbtsResponse, error) {
 	out := new(CommitVirtualPsbtsResponse)
 	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/CommitVirtualPsbts", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *assetWalletClient) GetCommitVirtualPsbtsStatus(ctx context.Context, in *GetCommitVirtualPsbtsStatusRequest, opts ...grpc.CallOption) (*GetCommitVirtualPsbtsStatusResponse, error) {
+	out := new(GetCommitVirtualPsbtsStatusResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -254,10 +284,31 @@ type AssetWalletServer interface {
 	// In addition, the BTC level anchor transaction is funded and prepared up to
 	// the point where it is ready to be signed.
 	CommitVirtualPsbts(context.Context, *CommitVirtualPsbtsRequest) (*CommitVirtualPsbtsResponse, error)
+	// GetCommitVirtualPsbtsStatus reports the outcome of a CommitVirtualPsbts
+	// call made with a request_id. It says whether that call is still in
+	// progress or completed, and lists the lnd lock ID and locked outpoints
+	// recorded for it. An unknown request_id is reported as unknown rather
+	// than an error. Repeating CommitVirtualPsbts returns a completed or
+	// failed stored response as-is while it is still inside the retention
+	// window. A repeat while the first call is still running, or while lnd
+	// still holds its input leases, is rejected. After those leases expire,
+	// the pending row is deleted and the same request funds again.
+	GetCommitVirtualPsbtsStatus(context.Context, *GetCommitVirtualPsbtsStatusRequest) (*GetCommitVirtualPsbtsStatusResponse, error)
 	// PublishAndLogTransfer accepts a fully committed and signed anchor
 	// transaction and publishes it to the Bitcoin network. It also logs the
 	// transfer of the given active and passive assets in the database and ships
 	// any outgoing proofs to the counterparties.
+	//
+	// The RPC is safe to retry after a lost response. A repeat call whose
+	// final anchor transaction is already logged returns that transfer as the
+	// SendAssetResponse and does not insert another asset_transfers row or
+	// publish the anchor again. Callers reconcile by retrying this RPC (with
+	// the same request_id when they set one) or by calling ListTransfers with
+	// the anchor txid. An empty request_id still reconciles by the anchor
+	// transaction. A request_id must not be reused for a different anchor
+	// transaction while that publish is in flight. The binding is
+	// process-local and in-flight only: it is released when the publish
+	// completes or fails, and it is not kept across a daemon restart.
 	PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
@@ -320,6 +371,9 @@ func (UnimplementedAssetWalletServer) AnchorVirtualPsbts(context.Context, *Ancho
 }
 func (UnimplementedAssetWalletServer) CommitVirtualPsbts(context.Context, *CommitVirtualPsbtsRequest) (*CommitVirtualPsbtsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CommitVirtualPsbts not implemented")
+}
+func (UnimplementedAssetWalletServer) GetCommitVirtualPsbtsStatus(context.Context, *GetCommitVirtualPsbtsStatusRequest) (*GetCommitVirtualPsbtsStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCommitVirtualPsbtsStatus not implemented")
 }
 func (UnimplementedAssetWalletServer) PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method PublishAndLogTransfer not implemented")
@@ -435,6 +489,24 @@ func _AssetWallet_CommitVirtualPsbts_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AssetWalletServer).CommitVirtualPsbts(ctx, req.(*CommitVirtualPsbtsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AssetWallet_GetCommitVirtualPsbtsStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCommitVirtualPsbtsStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).GetCommitVirtualPsbtsStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/GetCommitVirtualPsbtsStatus",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).GetCommitVirtualPsbtsStatus(ctx, req.(*GetCommitVirtualPsbtsStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -659,6 +731,10 @@ var AssetWallet_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CommitVirtualPsbts",
 			Handler:    _AssetWallet_CommitVirtualPsbts_Handler,
+		},
+		{
+			MethodName: "GetCommitVirtualPsbtsStatus",
+			Handler:    _AssetWallet_GetCommitVirtualPsbtsStatus_Handler,
 		},
 		{
 			MethodName: "PublishAndLogTransfer",

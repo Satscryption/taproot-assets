@@ -1,6 +1,7 @@
 package tapconfig
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -146,6 +147,40 @@ func (s UniversePublicAccessStatus) IsWriteAccessGranted() bool {
 		s == UniversePublicAccessStatusReadWrite
 }
 
+// CommitIdempotencyStore persists opaque CommitVirtualPsbts records keyed by
+// the caller-supplied request ID. The RPC server owns the record encoding.
+type CommitIdempotencyStore interface {
+	InsertCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	FetchCommitRecord(ctx context.Context, requestID []byte) ([]byte, error)
+
+	UpdateCommitRecord(ctx context.Context, requestID, record []byte) error
+
+	DeleteCommitRecord(ctx context.Context, requestID []byte) error
+
+	SwapCommitRecord(ctx context.Context, requestID, expected,
+		next []byte, finishedAt *time.Time) error
+
+	DeleteCommitRecordIf(ctx context.Context, requestID,
+		expected []byte) error
+
+	PurgeFinishedCommitRecords(ctx context.Context, before time.Time) (
+		int64, error)
+
+	ListFinishedCommitRecords(ctx context.Context, before time.Time) (
+		[]tapdb.CommitRecordRow, error)
+
+	ListUnstampedCommitRecords(ctx context.Context) (
+		[]tapdb.CommitRecordRow, error)
+
+	ListCommitRecords(ctx context.Context) ([]tapdb.CommitRecordRow, error)
+}
+
+// DefaultCommitVirtualPsbtRetention is how long a completed or failed
+// CommitVirtualPsbts outcome is kept when the operator does not choose a
+// window. Pending requests are not removed by this window.
+const DefaultCommitVirtualPsbtRetention = 24 * time.Hour
+
 // ParseUniversePublicAccessStatus parses a string into a universe public access
 // status.
 func ParseUniversePublicAccessStatus(
@@ -220,6 +255,16 @@ type Config struct {
 	ProofArchive proof.Archiver
 
 	AssetWallet tapfreighter.Wallet
+
+	// CommitIdempotency stores CommitVirtualPsbts outcomes keyed by the
+	// caller-supplied request ID. A nil store rejects calls that set a
+	// request ID.
+	CommitIdempotency CommitIdempotencyStore
+
+	// CommitVirtualPsbtRetention is how long a completed or failed
+	// CommitVirtualPsbts outcome is kept. Pending rows are not removed
+	// because of this window. Zero selects DefaultCommitVirtualPsbtRetention.
+	CommitVirtualPsbtRetention time.Duration
 
 	CoinSelect *tapfreighter.CoinSelect
 

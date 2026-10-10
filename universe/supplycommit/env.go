@@ -858,6 +858,16 @@ type StateMachineStore interface {
 	// group key as frozen.
 	FreezePendingTransition(context.Context, asset.Specifier) error
 
+	// BeginIdleTransition starts a new, frozen transition that spends the
+	// latest confirmed supply commitment, without requiring any new supply
+	// update. Dangling updates are bound to it and returned. The state
+	// machine must be in the default state, have a latest commitment and
+	// no pending transition, otherwise an error is returned. The persisted
+	// state becomes the updates pending state, so that the cycle resumes
+	// after a restart.
+	BeginIdleTransition(context.Context, asset.Specifier) (
+		[]SupplyUpdateEvent, error)
+
 	// BindDanglingUpdatesToTransition finds any supply update events for
 	// the given asset specifier that are not yet associated with a
 	// transition, creates a new transition for them, and links them. It
@@ -941,6 +951,17 @@ type Environment struct {
 
 	// Log is the prefixed logger for this supply commitment state machine.
 	Log btclog.Logger
+
+	// IdleCommitInterval is the number of blocks after which an idle
+	// state machine publishes an ancestry-linked successor commitment to
+	// its latest confirmed commitment, even if there are no new supply
+	// updates. Zero disables idle successors.
+	IdleCommitInterval uint32
+
+	// AutoPublishPending, if true, publishes pending supply updates
+	// automatically when the next block arrives, instead of waiting for a
+	// manual UpdateSupplyCommit call.
+	AutoPublishPending bool
 }
 
 // SupplyCommitTxn encapsulates the details of the transaction that creates a

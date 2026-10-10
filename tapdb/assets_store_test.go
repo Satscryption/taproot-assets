@@ -2305,6 +2305,18 @@ func TestAssetExportLog(t *testing.T) {
 		ctx, spendDelta, leaseOwner, leaseExpiry,
 	))
 
+	// A second log of the same anchor is how a lost
+	// PublishAndLogTransfer response is retried. It must not insert
+	// another asset_transfers row.
+	require.NoError(t, assetsStore.LogPendingParcel(
+		ctx, spendDelta, leaseOwner, leaseExpiry,
+	))
+	loggedTwice, err := db.QueryAssetTransfers(ctx, TransferQuery{
+		AnchorTxHash: anchorTxHash[:],
+	})
+	require.NoError(t, err)
+	require.Len(t, loggedTwice, 1)
+
 	assetID := inputAsset.ID()
 	receiverIdentifier := tapfreighter.NewOutputIdentifier(
 		assetID, 0, *newScriptKey.PubKey,
@@ -2624,6 +2636,61 @@ func TestAssetGroupComplexWitness(t *testing.T) {
 
 	require.Equal(t, groupAnchorGen, *storedGroup.Genesis)
 	require.True(t, groupKey.IsEqual(storedGroup.GroupKey))
+}
+
+// TestGroupKeyUpsertAfterPlaceholderImport verifies the default proof and
+// universe import order: a raw-key-only placeholder can be inserted first,
+// then a grouped mint can resolve the same stable key ID without granting the
+// generic upsert path authority to change its locator.
+func TestGroupKeyUpsertAfterPlaceholderImport(t *testing.T) {
+	t.Parallel()
+
+	_, assetStore, db := newAssetStore(t)
+	ctx := context.Background()
+	internalKey := test.RandPubKey(t)
+	rawKey := internalKey.SerializeCompressed()
+
+	placeholderID, err := db.UpsertInternalKey(ctx, InternalKey{
+		RawKey: rawKey,
+	})
+	require.NoError(t, err)
+
+	groupAnchorGen := asset.RandGenesis(t, asset.Normal)
+	groupAnchorGen.MetaHash = [32]byte{}
+	genesisPointID, err := upsertGenesisPoint(
+		ctx, db, groupAnchorGen.FirstPrevOut,
+	)
+	require.NoError(t, err)
+	genAssetID, err := upsertGenesis(
+		ctx, db, genesisPointID, groupAnchorGen,
+	)
+	require.NoError(t, err)
+
+	groupKey := asset.GroupKey{
+		RawKey: keychain.KeyDescriptor{
+			KeyLocator: keychain.KeyLocator{
+				Family: 212,
+				Index:  721,
+			},
+			PubKey: internalKey,
+		},
+		GroupPubKey: *internalKey,
+	}
+	_, err = upsertGroupKey(
+		ctx, &groupKey, assetStore.db, genesisPointID, genAssetID,
+	)
+	require.NoError(t, err)
+
+	resolvedID, err := db.UpsertInternalKey(ctx, InternalKey{
+		RawKey: rawKey, KeyFamily: int32(groupKey.RawKey.Family),
+		KeyIndex: int32(groupKey.RawKey.Index),
+	})
+	require.NoError(t, err)
+	require.Equal(t, placeholderID, resolvedID)
+	locator, err := db.FetchInternalKeyLocator(ctx, rawKey)
+	require.NoError(t, err)
+	require.Zero(t, locator.KeyFamily)
+	require.Zero(t, locator.KeyIndex)
 }
 
 // TestStoreFetchAssetGroupV1 tests that we can store and fetch an asset group

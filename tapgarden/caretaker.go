@@ -141,10 +141,16 @@ type BatchCaretaker struct {
 //
 // TODO(roasbeef): rename to Cultivator?
 func NewBatchCaretaker(cfg *BatchCaretakerConfig) *BatchCaretaker {
+	var anchorIdx uint32
+	if cfg.Batch != nil && cfg.Batch.GenesisPacket != nil {
+		anchorIdx = cfg.Batch.GenesisPacket.AssetAnchorOutIdx
+	}
+
 	return &BatchCaretaker{
 		batchKey:  asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
 		cfg:       cfg,
 		confEvent: make(chan *chainntnfs.TxConfirmation, 1),
+		anchorOutputIndex: anchorIdx,
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),
@@ -649,6 +655,11 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 
 		genesisTxPkt.UnsignedTx.
 			TxOut[b.anchorOutputIndex].PkScript = genesisScript
+		if isCustomAnchorPsbt(genesisTxPkt) {
+			pOut := &genesisTxPkt.Outputs[b.anchorOutputIndex]
+			pOut.TaprootInternalKey = nil
+			pOut.TaprootBip32Derivation = nil
+		}
 
 		log.Infof("BatchCaretaker(%x): committing sprouts to disk",
 			b.batchKey[:])
@@ -704,17 +715,30 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		log.Infof("BatchCaretaker(%x): finalizing GenesisPacket",
 			b.batchKey[:])
 
-		// First, we'll have the wallet sign the PSBT is created, which
-		// was then modified.
-		//
-		// TODO(roasbeef): only execute if finalized? or missing sig
 		ctx, cancel := b.WithCtxQuit()
 		defer cancel()
-		signedPkt, err := b.cfg.Wallet.SignAndFinalizePsbt(
-			ctx, b.cfg.Batch.GenesisPacket.Pkt,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("unable to sign psbt: %w", err)
+		signedPkt := b.cfg.Batch.GenesisPacket.Pkt
+
+		// Caller-authored anchor batches pause here until
+		// FinalizeBatch supplies a fully signed PSBT. Never ask the
+		// wallet to sign external inputs on restart.
+		if isCustomAnchorPsbt(signedPkt) {
+			if _, extractErr := psbt.Extract(signedPkt); extractErr != nil {
+				return BatchStateCommitted, nil
+			}
+		} else {
+			// First, we'll have the wallet sign the PSBT that was
+			// created, which was then modified.
+			_, extractErr := psbt.Extract(signedPkt)
+			if extractErr != nil {
+				signedPkt, extractErr = b.cfg.Wallet.SignAndFinalizePsbt(
+					ctx, signedPkt,
+				)
+				if extractErr != nil {
+					return 0, fmt.Errorf("unable to sign psbt: %w",
+						extractErr)
+				}
+			}
 		}
 
 		// Final TX sanity check.
@@ -863,9 +887,14 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		// TODO(roasbeef): eventually want to be able to RBF the bump
 		heightHint := b.cfg.Batch.HeightHint
 		txHash := signedTx.TxHash()
+		anchorIdx := b.anchorOutputIndex
+		if int(anchorIdx) >= len(signedTx.TxOut) {
+			return 0, fmt.Errorf("asset anchor output index %d out "+
+				"of range", anchorIdx)
+		}
 		confCtx, confCancel := b.WithCtxQuitNoTimeout()
 		confNtfn, errChan, err := b.cfg.ChainBridge.RegisterConfirmationsNtfn(
-			confCtx, &txHash, signedTx.TxOut[0].PkScript, 1,
+			confCtx, &txHash, signedTx.TxOut[anchorIdx].PkScript, 1,
 			heightHint, true, nil,
 		)
 		if err != nil {

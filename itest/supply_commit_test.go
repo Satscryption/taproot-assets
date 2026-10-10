@@ -147,6 +147,89 @@ func testPreCommitOutput(t *harnessTest) {
 	require.EqualValues(t.t, tweakedGroupKey, secondAssetGroupKey)
 }
 
+// testSupplyCommitBurialThreshold verifies review item 2: commitments are not
+// finalized (no chain metadata in FetchSupplyCommit, no universe copy) until
+// the broadcast tx reaches burial depth, then finalize runs.
+func testSupplyCommitBurialThreshold(t *harnessTest) {
+	ctxb := context.Background()
+	miner := t.lndHarness.Miner()
+
+	mintReq := CopyRequest(issuableAssets[0])
+	mintReq.Asset.Amount = 1000
+
+	rpcAsset, _ := MintAssetWithSupplyCommit(
+		t, mintReq, fn.None[btcec.PublicKey](),
+	)
+	groupKeyBytes := rpcAsset.AssetGroup.TweakedGroupKey
+	require.NotNil(t.t, groupKeyBytes)
+
+	fetchReq := &unirpc.FetchSupplyCommitRequest{
+		GroupKey: &unirpc.FetchSupplyCommitRequest_GroupKeyBytes{
+			GroupKeyBytes: groupKeyBytes,
+		},
+		Locator: &unirpc.FetchSupplyCommitRequest_VeryFirst{
+			VeryFirst: true,
+		},
+	}
+
+	respUpdate, err := t.tapd.UpdateSupplyCommit(
+		ctxb, &unirpc.UpdateSupplyCommitRequest{
+			GroupKey: &unirpc.UpdateSupplyCommitRequest_GroupKeyBytes{
+				GroupKeyBytes: groupKeyBytes,
+			},
+		},
+	)
+	require.NoError(t.t, err)
+	require.NotNil(t.t, respUpdate)
+
+	t.Log("Mine inclusion block only (before burial depth)")
+	minedBlocks := MineBlocks(t.t, miner, 1, 1)
+	require.Len(t.t, minedBlocks, 1)
+	inclusionHash := minedBlocks[0].BlockHash()
+
+	require.Eventually(t.t, func() bool {
+		_, fetchErr := t.tapd.FetchSupplyCommit(ctxb, fetchReq)
+		if fetchErr == nil {
+			return false
+		}
+
+		return strings.Contains(
+			fetchErr.Error(), "no block info available",
+		)
+	}, defaultWaitTimeout, time.Second)
+
+	_, uniErr := t.universeServer.service.FetchSupplyCommit(
+		ctxb, fetchReq,
+	)
+	require.Error(t.t, uniErr)
+
+	t.Log("Mine burial depth blocks and expect finalize + universe push")
+	MineSupplyCommitBurial(t.t, miner)
+
+	fetchResp, _ := WaitForSupplyCommit(
+		t.t, ctxb, t.tapd, groupKeyBytes, fn.None[wire.OutPoint](),
+		func(resp *unirpc.FetchSupplyCommitResponse) bool {
+			return resp.ChainData.BlockHeight > 0 &&
+				len(resp.ChainData.BlockHash) > 0
+		},
+	)
+
+	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
+	require.NoError(t.t, err)
+	require.True(t.t, fetchBlockHash.IsEqual(&inclusionHash))
+
+	uniFetchPred := func(resp *unirpc.FetchSupplyCommitResponse) error {
+		if resp.ChainData.BlockHeight == 0 {
+			return fmt.Errorf("supply commitment not on universe")
+		}
+
+		return nil
+	}
+	rpcassert.FetchSupplyCommitRPC(
+		t.t, ctxb, t.universeServer.service, uniFetchPred, fetchReq,
+	)
+}
+
 // testSupplyCommitIgnoreAsset verifies that universe supply commitments
 // correctly account for ignored asset outpoints. It:
 //
@@ -277,20 +360,11 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.ErrorContains(t.t, err, "commitment not found")
 
 	t.Log("Update on-chain supply commitment for asset group")
-
-	// nolint: lll
-	respUpdate, err := t.tapd.UpdateSupplyCommit(
-		ctxb, &unirpc.UpdateSupplyCommitRequest{
-			GroupKey: &unirpc.UpdateSupplyCommitRequest_GroupKeyBytes{
-				GroupKeyBytes: groupKeyBytes,
-			},
-		},
+	_, commitInclusionHeightBefore := t.lndHarness.Miner().GetBestBlock()
+	minedBlocks := UpdateAndMineSupplyCommit(
+		t.t, ctxb, t.tapd, t.lndHarness.Miner(), groupKeyBytes, 1,
 	)
-	require.NoError(t.t, err)
-	require.NotNil(t.t, respUpdate)
-
-	t.Log("Mining supply commitment tx")
-	minedBlocks := MineBlocks(t.t, t.lndHarness.Miner(), 1, 1)
+	commitInclusionHeight := commitInclusionHeightBefore + 1
 
 	t.Log("Fetch updated supply commitment")
 
@@ -398,19 +472,16 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.Len(t.t, minedBlocks, 1)
 
 	block := minedBlocks[0]
-	expectedBlockHash := block.BlockHash()
-
-	// Get block height for block.
-	blockHash, blockHeight := t.lndHarness.Miner().GetBestBlock()
-	require.True(t.t, blockHash.IsEqual(&expectedBlockHash))
+	commitBlockHash := block.BlockHash()
 
 	// Ensure that the block hash and height matches the values in the fetch
-	// response.
+	// response (inclusion block, not chain tip after burial confs).
 	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
 	require.NoError(t.t, err)
-	require.True(t.t, fetchBlockHash.IsEqual(blockHash))
+	require.True(t.t, fetchBlockHash.IsEqual(&commitBlockHash))
 
-	require.EqualValues(t.t, blockHeight, fetchResp.ChainData.BlockHeight)
+	require.EqualValues(t.t, commitInclusionHeight,
+		fetchResp.ChainData.BlockHeight)
 
 	// We expect two transactions in the block:
 	// 1. The supply commitment transaction.
@@ -999,11 +1070,11 @@ func testSupplyCommitMintBurn(t *harnessTest) {
 	// pkScript that we expect.
 	require.Len(t.t, finalMinedBlocks, 1, "expected one mined block")
 	block := finalMinedBlocks[0]
-	blockHash, _ := t.lndHarness.Miner().GetBestBlock()
+	commitBlockHash := block.BlockHash()
 
 	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
 	require.NoError(t.t, err)
-	require.True(t.t, fetchBlockHash.IsEqual(blockHash))
+	require.True(t.t, fetchBlockHash.IsEqual(&commitBlockHash))
 
 	// Re-compute the supply commitment root hash from the latest fetch,
 	// then use that to derive the expected commitment output.
@@ -1863,4 +1934,134 @@ func testSupplyVerifyPeerNode(t *harnessTest) {
 	// Verify that the secondary node's third supply commitment matches the
 	// primary's.
 	assertFetchCommitResponse(t, thirdSupplyCommitResp, peerFetchResp3)
+}
+
+// Keep the idle interval well above supply-commit burial depth so the extra
+// blocks mined for finalization do not publish the idle successor early.
+const supplyIdleCommitInterval = uint32(12)
+
+// testSupplyCommitIdleTick verifies that a locally controlled asset group
+// publishes an empty ancestry-linked successor supply commitment once the
+// latest commitment is at least supplyIdleCommitInterval blocks old, and that
+// an interrupted idle transition resumes after tapd restarts.
+func testSupplyCommitIdleTick(t *harnessTest) {
+	ctxb := context.Background()
+	miner := t.lndHarness.Miner()
+
+	// Enable the idle tick before any supply commitment activity.
+	t.tapd.setCliFlag(
+		"universe.supply-idle-commit-interval",
+		fmt.Sprintf("%d", supplyIdleCommitInterval),
+	)
+	require.NoError(t.t, t.tapd.stop(false))
+	require.NoError(t.t, t.tapd.start(false))
+
+	t.Log("Minting asset with supply commitments enabled")
+	mintReq := CopyRequest(issuableAssets[0])
+	mintReq.Asset.Amount = 1000
+	rpcAsset, _ := MintAssetWithSupplyCommit(
+		t, mintReq, fn.None[btcec.PublicKey](),
+	)
+
+	groupKeyBytes := rpcAsset.AssetGroup.TweakedGroupKey
+	require.NotNil(t.t, groupKeyBytes)
+
+	t.Log("Creating the first on-chain supply commitment manually")
+	UpdateAndMineSupplyCommit(
+		t.t, ctxb, t.tapd, miner, groupKeyBytes, 1,
+	)
+
+	firstCommit, firstOutpoint := WaitForSupplyCommit(
+		t.t, ctxb, t.tapd, groupKeyBytes, fn.None[wire.OutPoint](),
+		func(resp *unirpc.FetchSupplyCommitResponse) bool {
+			return resp.ChainData.BlockHeight > 0 &&
+				len(resp.ChainData.BlockHash) > 0
+		},
+	)
+	require.NotNil(t.t, firstCommit.IssuanceSubtreeRoot)
+	firstRootHash := firstCommit.ChainData.SupplyRootHash
+	firstIssuanceRoot := firstCommit.IssuanceSubtreeRoot.RootNode.RootHash
+	firstIssuanceSum := firstCommit.IssuanceSubtreeRoot.RootNode.RootSum
+
+	mineIdleSuccessor := func(prevOutpoint wire.OutPoint,
+		prevHeight uint32) (*unirpc.FetchSupplyCommitResponse,
+		wire.OutPoint) {
+
+		if supplyIdleCommitInterval > 1 {
+			MineBlocks(
+				t.t, miner, supplyIdleCommitInterval-1, 0,
+			)
+		}
+
+		// The idle tick fires once the chain reaches the due height,
+		// broadcasting the successor into the mempool. Mine that block
+		// without expecting the tx yet, then mine the inclusion block.
+		MineBlocks(t.t, miner, 1, 0)
+		MineBlocks(t.t, miner, 1, 1)
+		MineSupplyCommitBurial(t.t, miner)
+
+		return WaitForSupplyCommit(
+			t.t, ctxb, t.tapd, groupKeyBytes,
+			fn.Some(prevOutpoint),
+			func(r *unirpc.FetchSupplyCommitResponse) bool {
+				if r.ChainData.BlockHeight <= prevHeight {
+					return false
+				}
+
+				if r.IssuanceSubtreeRoot == nil {
+					return false
+				}
+
+				return r.IssuanceSubtreeRoot.RootNode.RootSum ==
+					firstIssuanceSum
+			},
+		)
+	}
+
+	t.Log("Mining blocks until the idle successor should be published")
+	idleCommit, idleOutpoint := mineIdleSuccessor(
+		firstOutpoint, firstCommit.ChainData.BlockHeight,
+	)
+
+	require.Equal(
+		t.t, firstRootHash, idleCommit.ChainData.SupplyRootHash,
+	)
+	require.Equal(
+		t.t, firstIssuanceRoot,
+		idleCommit.IssuanceSubtreeRoot.RootNode.RootHash,
+	)
+	AssertSubtreeInclusionProof(
+		t, idleCommit.ChainData.SupplyRootHash,
+		idleCommit.IssuanceSubtreeRoot,
+	)
+
+	t.Log("Interrupting the next idle successor and resuming after restart")
+	if supplyIdleCommitInterval > 1 {
+		MineBlocks(t.t, miner, supplyIdleCommitInterval-1, 0)
+	}
+	MineBlocks(t.t, miner, 1, 0)
+
+	_, err := WaitForNTxsInMempool(miner, 1, minerMempoolTimeout)
+	require.NoError(t.t, err)
+
+	require.NoError(t.t, t.tapd.stop(false))
+	MineBlocks(t.t, miner, 1, 1)
+	MineSupplyCommitBurial(t.t, miner)
+	require.NoError(t.t, t.tapd.start(false))
+
+	secondIdleCommit, _ := WaitForSupplyCommit(
+		t.t, ctxb, t.tapd, groupKeyBytes,
+		fn.Some(idleOutpoint),
+		func(resp *unirpc.FetchSupplyCommitResponse) bool {
+			return resp.ChainData.BlockHeight >
+				idleCommit.ChainData.BlockHeight
+		},
+	)
+	require.Equal(
+		t.t, firstRootHash, secondIdleCommit.ChainData.SupplyRootHash,
+	)
+	AssertSubtreeInclusionProof(
+		t, secondIdleCommit.ChainData.SupplyRootHash,
+		secondIdleCommit.IssuanceSubtreeRoot,
+	)
 }
