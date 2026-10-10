@@ -277,9 +277,11 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.ErrorContains(t.t, err, "commitment not found")
 
 	t.Log("Update on-chain supply commitment for asset group")
+	_, commitInclusionHeightBefore := t.lndHarness.Miner().GetBestBlock()
 	minedBlocks := UpdateAndMineSupplyCommit(
 		t.t, ctxb, t.tapd, t.lndHarness.Miner(), groupKeyBytes, 1,
 	)
+	commitInclusionHeight := commitInclusionHeightBefore + 1
 
 	t.Log("Fetch updated supply commitment")
 
@@ -395,7 +397,7 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.NoError(t.t, err)
 	require.True(t.t, fetchBlockHash.IsEqual(&commitBlockHash))
 
-	require.EqualValues(t.t, block.BlockHeader().BlockHeight(),
+	require.EqualValues(t.t, commitInclusionHeight,
 		fetchResp.ChainData.BlockHeight)
 
 	// We expect two transactions in the block:
