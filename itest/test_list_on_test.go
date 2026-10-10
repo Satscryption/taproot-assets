@@ -444,6 +444,10 @@ var allTestCases = []*testCase{
 		test: testSupplyCommitIdleTick,
 	},
 	{
+		name: "supply commit burial threshold",
+		test: testSupplyCommitBurialThreshold,
+	},
+	{
 		name: "supply verify peer node",
 		test: testSupplyVerifyPeerNode,
 	},

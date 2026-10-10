@@ -147,6 +147,89 @@ func testPreCommitOutput(t *harnessTest) {
 	require.EqualValues(t.t, tweakedGroupKey, secondAssetGroupKey)
 }
 
+// testSupplyCommitBurialThreshold verifies review item 2: commitments are not
+// finalized (no chain metadata in FetchSupplyCommit, no universe copy) until
+// the broadcast tx reaches burial depth, then finalize runs.
+func testSupplyCommitBurialThreshold(t *harnessTest) {
+	ctxb := context.Background()
+	miner := t.lndHarness.Miner()
+
+	mintReq := CopyRequest(issuableAssets[0])
+	mintReq.Asset.Amount = 1000
+
+	rpcAsset, _ := MintAssetWithSupplyCommit(
+		t, mintReq, fn.None[btcec.PublicKey](),
+	)
+	groupKeyBytes := rpcAsset.AssetGroup.TweakedGroupKey
+	require.NotNil(t.t, groupKeyBytes)
+
+	fetchReq := &unirpc.FetchSupplyCommitRequest{
+		GroupKey: &unirpc.FetchSupplyCommitRequest_GroupKeyBytes{
+			GroupKeyBytes: groupKeyBytes,
+		},
+		Locator: &unirpc.FetchSupplyCommitRequest_VeryFirst{
+			VeryFirst: true,
+		},
+	}
+
+	respUpdate, err := t.tapd.UpdateSupplyCommit(
+		ctxb, &unirpc.UpdateSupplyCommitRequest{
+			GroupKey: &unirpc.UpdateSupplyCommitRequest_GroupKeyBytes{
+				GroupKeyBytes: groupKeyBytes,
+			},
+		},
+	)
+	require.NoError(t.t, err)
+	require.NotNil(t.t, respUpdate)
+
+	t.Log("Mine inclusion block only (before burial depth)")
+	minedBlocks := MineBlocks(t.t, miner, 1, 1)
+	require.Len(t.t, minedBlocks, 1)
+	inclusionHash := minedBlocks[0].BlockHash()
+
+	require.Eventually(t.t, func() bool {
+		_, fetchErr := t.tapd.FetchSupplyCommit(ctxb, fetchReq)
+		if fetchErr == nil {
+			return false
+		}
+
+		return strings.Contains(
+			fetchErr.Error(), "no block info available",
+		)
+	}, defaultWaitTimeout, time.Second)
+
+	_, uniErr := t.universeServer.service.FetchSupplyCommit(
+		ctxb, fetchReq,
+	)
+	require.Error(t.t, uniErr)
+
+	t.Log("Mine burial depth blocks and expect finalize + universe push")
+	MineSupplyCommitBurial(t.t, miner)
+
+	fetchResp, _ := WaitForSupplyCommit(
+		t.t, ctxb, t.tapd, groupKeyBytes, fn.None[wire.OutPoint](),
+		func(resp *unirpc.FetchSupplyCommitResponse) bool {
+			return resp.ChainData.BlockHeight > 0 &&
+				len(resp.ChainData.BlockHash) > 0
+		},
+	)
+
+	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
+	require.NoError(t.t, err)
+	require.True(t.t, fetchBlockHash.IsEqual(&inclusionHash))
+
+	uniFetchPred := func(resp *unirpc.FetchSupplyCommitResponse) error {
+		if resp.ChainData.BlockHeight == 0 {
+			return fmt.Errorf("supply commitment not on universe")
+		}
+
+		return nil
+	}
+	rpcassert.FetchSupplyCommitRPC(
+		t.t, ctxb, t.universeServer.service, uniFetchPred, fetchReq,
+	)
+}
+
 // testSupplyCommitIgnoreAsset verifies that universe supply commitments
 // correctly account for ignored asset outpoints. It:
 //
