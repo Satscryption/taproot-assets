@@ -27,6 +27,12 @@ const (
 	// table by querying all assets and detecting burns from their
 	// witnesses.
 	Migration51InsertAssetBurns = 51
+
+	// Migration61RepairGenesisAnchor is the version of the programmatic
+	// migration that points each genesis anchor at the mint transaction
+	// and abandons never-confirmed supply commitments that do not spend
+	// a real pre-commit or confirmed commitment outpoint.
+	Migration61RepairGenesisAnchor = 61
 )
 
 // programmaticMigration is a function type for a function that performs a
@@ -39,8 +45,9 @@ var (
 	// These functions are used to perform additional checks on the
 	// database state that are not fully expressible in SQL.
 	programmaticMigrations = map[uint]programmaticMigration{
-		Migration50ScriptKeyType:    determineAndAssignScriptKeyType,
-		Migration51InsertAssetBurns: insertAssetBurns,
+		Migration50ScriptKeyType:       determineAndAssignScriptKeyType,
+		Migration51InsertAssetBurns:    insertAssetBurns,
+		Migration61RepairGenesisAnchor: repairGenesisAnchorMigration,
 	}
 )
 

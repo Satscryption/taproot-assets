@@ -732,6 +732,10 @@ FROM genesis_assets;
 SELECT *
 FROM genesis_points;
 
+-- name: FetchAllChainTxns :many
+SELECT txn_id, txid, raw_tx
+FROM chain_txns;
+
 -- name: FetchGenesisID :one
 WITH target_point(genesis_id) AS (
     SELECT genesis_id
