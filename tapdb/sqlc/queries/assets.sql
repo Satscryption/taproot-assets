@@ -1444,3 +1444,7 @@ WHERE asset_id = (SELECT asset_id FROM target_asset)
         AND claimant_txn.block_hash IS NOT NULL
   )
 RETURNING assets.asset_id;
+
+-- name: FetchAllChainTxns :many
+SELECT txn_id, txid, raw_tx
+FROM chain_txns;

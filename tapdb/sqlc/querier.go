@@ -61,6 +61,9 @@ type Querier interface {
 	// the same message is still recognized as one. substr yields an empty value of
 	// the column's own type on both database backends.
 	ClearAuthMailboxMessagePayload(ctx context.Context, arg ClearAuthMailboxMessagePayloadParams) (int64, error)
+	ClearPendingSupplyCommitTransition(ctx context.Context, transitionID int64) error
+	ClearSpentCommitmentRef(ctx context.Context, spentCommitment sql.NullInt64) error
+	ClearSupplyCommitmentRefs(ctx context.Context, commitID sql.NullInt64) error
 	// A certified foreclosure is absorbing and never cleared.
 	ClearReorgDependencyForeclosure(ctx context.Context, arg ClearReorgDependencyForeclosureParams) error
 	ConfirmChainAnchorTx(ctx context.Context, arg ConfirmChainAnchorTxParams) error
@@ -158,6 +161,7 @@ type Querier interface {
 	FetchAddrEventProofs(ctx context.Context, addrEventID int64) ([]FetchAddrEventProofsRow, error)
 	FetchAddrs(ctx context.Context, arg FetchAddrsParams) ([]FetchAddrsRow, error)
 	FetchAllAssetMeta(ctx context.Context) ([]FetchAllAssetMetaRow, error)
+	FetchAllChainTxns(ctx context.Context) ([]FetchAllChainTxnsRow, error)
 	FetchAllNodes(ctx context.Context) ([]MssmtNode, error)
 	FetchAssetID(ctx context.Context, arg FetchAssetIDParams) ([]int64, error)
 	FetchAssetMeta(ctx context.Context, metaID int64) (FetchAssetMetaRow, error)
@@ -197,6 +201,7 @@ type Querier interface {
 	FetchAuthMailboxMessageByOutpoint(ctx context.Context, claimedOutpoint []byte) (FetchAuthMailboxMessageByOutpointRow, error)
 	FetchAuxCloseInfo(ctx context.Context, chanPoint []byte) ([]byte, error)
 	FetchChainTx(ctx context.Context, txid []byte) (ChainTxn, error)
+	FetchConfirmedSupplyCommitOutpoints(ctx context.Context) ([]FetchConfirmedSupplyCommitOutpointsRow, error)
 	FetchChainTxByID(ctx context.Context, txnID int64) (FetchChainTxByIDRow, error)
 	// Returns the node with the given hash key alongside its direct children, in
 	// no particular order. Each row is a primary key lookup, so the cost is
@@ -232,6 +237,7 @@ type Querier interface {
 	FetchManagedUTXOs(ctx context.Context) ([]FetchManagedUTXOsRow, error)
 	// Fetch records from the supply_pre_commits table with optional
 	// filtering.
+	FetchMintSupplyPreCommitOutpoints(ctx context.Context) ([][]byte, error)
 	FetchMintSupplyPreCommits(ctx context.Context, arg FetchMintSupplyPreCommitsParams) ([]FetchMintSupplyPreCommitsRow, error)
 	FetchMintingBatch(ctx context.Context, rawKey []byte) (FetchMintingBatchRow, error)
 	// ORDER BY matches the tie-break used by migration 61's self-heal
@@ -242,6 +248,7 @@ type Querier interface {
 	FetchMultiverseRoot(ctx context.Context, namespaceRoot string) (FetchMultiverseRootRow, error)
 	FetchOrphanManagedUTXOs(ctx context.Context, arg FetchOrphanManagedUTXOsParams) ([]FetchOrphanManagedUTXOsRow, error)
 	FetchPeerAcceptedBuyPeerByScid(ctx context.Context, scid int64) ([]byte, error)
+	FetchRemoteSupplyPreCommitOutpoints(ctx context.Context) ([][]byte, error)
 	FetchReorgAnchoring(ctx context.Context, id int64) (ReorgAnchoring, error)
 	FetchReorgCandidateSpends(ctx context.Context, anchoringID int64) ([]ReorgCandidateSpend, error)
 	FetchReorgDependencyEdgesByChild(ctx context.Context, childID int64) ([]ReorgDependency, error)
@@ -281,6 +288,7 @@ type Querier interface {
 	FetchTapscriptTree(ctx context.Context, rootHash []byte) ([]FetchTapscriptTreeRow, error)
 	FetchTransferInputs(ctx context.Context, transferID int64) ([]FetchTransferInputsRow, error)
 	FetchTransferOutputs(ctx context.Context, transferID int64) ([]FetchTransferOutputsRow, error)
+	FetchUnconfirmedBroadcastSupplyCommits(ctx context.Context) ([]FetchUnconfirmedBroadcastSupplyCommitsRow, error)
 	FetchUnindexedAssetProofs(ctx context.Context, rowLimit int32) ([]FetchUnindexedAssetProofsRow, error)
 	// Note on hash construction: mssmt_nodes.hash_key on a compacted leaf
 	// commits to the subtree root at that leaf's tree height, which
@@ -496,6 +504,7 @@ type Querier interface {
 	// Their expected-output rows (addr_event_outputs) stand: they
 	// describe the address's expectation, not materialized state.
 	ResetAddrEventsByAnchorTx(ctx context.Context, arg ResetAddrEventsByAnchorTxParams) (int64, error)
+	ResetSupplyCommitMachineForAbandon(ctx context.Context, arg ResetSupplyCommitMachineForAbandonParams) error
 	// The inverse of ReAnchorPassiveAssets: restore the anchor UTXO and
 	// the spend-template fields that the re-anchor reset.
 	RestoreAssetSpendTemplate(ctx context.Context, arg RestoreAssetSpendTemplateParams) error
@@ -582,6 +591,8 @@ type Querier interface {
 	//
 	// The abandoned transfer's own confirmation is withdrawn before this
 	// runs, so it cannot answer as the conflicting claimant.
+	UnmarkMintPreCommitsSpentBy(ctx context.Context, spentBy sql.NullInt64) error
+	UnmarkRemotePreCommitsSpentBy(ctx context.Context, spentBy sql.NullInt64) error
 	UnsupersedeSafeTransfer(ctx context.Context, transferID int64) (int64, error)
 	// Lift the confirming transfer's own superseded flag. A rivalry loser
 	// can still confirm — the rival that superseded it may since have been

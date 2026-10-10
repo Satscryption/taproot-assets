@@ -4172,3 +4172,37 @@ func (q *Queries) UpsertTapscriptTreeRootHash(ctx context.Context, arg UpsertTap
 	err := row.Scan(&root_id)
 	return root_id, err
 }
+
+const FetchAllChainTxns = `-- name: FetchAllChainTxns :many
+SELECT txn_id, txid, raw_tx
+FROM chain_txns
+`
+
+type FetchAllChainTxnsRow struct {
+	TxnID int64
+	Txid  []byte
+	RawTx []byte
+}
+
+func (q *Queries) FetchAllChainTxns(ctx context.Context) ([]FetchAllChainTxnsRow, error) {
+	rows, err := q.db.QueryContext(ctx, FetchAllChainTxns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []FetchAllChainTxnsRow
+	for rows.Next() {
+		var i FetchAllChainTxnsRow
+		if err := rows.Scan(&i.TxnID, &i.Txid, &i.RawTx); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
