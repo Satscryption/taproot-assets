@@ -1948,7 +1948,7 @@ func testSupplyCommitSendBeforeCommit(t *harnessTest) {
 	secondSend := sendAssetAndAssert(
 		ctxb, t, t.tapd, secondTapd, secondSendAmt,
 		rpcSecondAsset.Amount-secondSendAmt,
-		rpcSecondAsset.AssetGenesis, rpcSecondAsset, 0, 1, 1,
+		rpcSecondAsset.AssetGenesis, rpcSecondAsset, 1, 2, 2,
 	)
 	importIssuerTransferProof(
 		t, secondTapd, rpcSecondAsset, groupKeyBytes,
