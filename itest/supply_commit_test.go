@@ -277,20 +277,9 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.ErrorContains(t.t, err, "commitment not found")
 
 	t.Log("Update on-chain supply commitment for asset group")
-
-	// nolint: lll
-	respUpdate, err := t.tapd.UpdateSupplyCommit(
-		ctxb, &unirpc.UpdateSupplyCommitRequest{
-			GroupKey: &unirpc.UpdateSupplyCommitRequest_GroupKeyBytes{
-				GroupKeyBytes: groupKeyBytes,
-			},
-		},
+	minedBlocks := UpdateAndMineSupplyCommit(
+		t.t, ctxb, t.tapd, t.lndHarness.Miner(), groupKeyBytes, 1,
 	)
-	require.NoError(t.t, err)
-	require.NotNil(t.t, respUpdate)
-
-	t.Log("Mining supply commitment tx")
-	minedBlocks := MineBlocks(t.t, t.lndHarness.Miner(), 1, 1)
 
 	t.Log("Fetch updated supply commitment")
 
@@ -398,19 +387,16 @@ func testSupplyCommitIgnoreAsset(t *harnessTest) {
 	require.Len(t.t, minedBlocks, 1)
 
 	block := minedBlocks[0]
-	expectedBlockHash := block.BlockHash()
-
-	// Get block height for block.
-	blockHash, blockHeight := t.lndHarness.Miner().GetBestBlock()
-	require.True(t.t, blockHash.IsEqual(&expectedBlockHash))
+	commitBlockHash := block.BlockHash()
 
 	// Ensure that the block hash and height matches the values in the fetch
-	// response.
+	// response (inclusion block, not chain tip after burial confs).
 	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
 	require.NoError(t.t, err)
-	require.True(t.t, fetchBlockHash.IsEqual(blockHash))
+	require.True(t.t, fetchBlockHash.IsEqual(&commitBlockHash))
 
-	require.EqualValues(t.t, blockHeight, fetchResp.ChainData.BlockHeight)
+	require.EqualValues(t.t, block.BlockHeader().BlockHeight(),
+		fetchResp.ChainData.BlockHeight)
 
 	// We expect two transactions in the block:
 	// 1. The supply commitment transaction.
@@ -999,11 +985,11 @@ func testSupplyCommitMintBurn(t *harnessTest) {
 	// pkScript that we expect.
 	require.Len(t.t, finalMinedBlocks, 1, "expected one mined block")
 	block := finalMinedBlocks[0]
-	blockHash, _ := t.lndHarness.Miner().GetBestBlock()
+	commitBlockHash := block.BlockHash()
 
 	fetchBlockHash, err := chainhash.NewHash(fetchResp.ChainData.BlockHash)
 	require.NoError(t.t, err)
-	require.True(t.t, fetchBlockHash.IsEqual(blockHash))
+	require.True(t.t, fetchBlockHash.IsEqual(&commitBlockHash))
 
 	// Re-compute the supply commitment root hash from the latest fetch,
 	// then use that to derive the expected commitment output.
