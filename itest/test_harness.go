@@ -74,6 +74,10 @@ const (
 	// defaultTimeout is a timeout that will be used for various wait
 	// scenarios where no custom timeout value is defined.
 	defaultTimeout = time.Second * 10
+
+	// tapdStartTimeout bounds how long we wait for tapd's gRPC listener
+	// after process start (migrations can be slow under parallel itest).
+	tapdStartTimeout = time.Second * 60
 )
 
 // testCase is a struct that holds a single test case.

@@ -11,28 +11,29 @@ shift 3
 # Create a variable to hold the final exit code.
 exit_code=0
 
-# Run commands using xargs in parallel and capture their PIDs
-pids=()
-for ((i=0; i<PROCESSES; i++)); do 
-    scripts/itest_part.sh $i $TRANCHES $SHUFFLE_SEED $@ &
-    pids+=($!)
+# Run all tranches (0..TRANCHES-1) with at most PROCESSES concurrent jobs.
+active=0
+for ((tranche=0; tranche<TRANCHES; tranche++)); do
+	while [ "$active" -ge "$PROCESSES" ]; do
+		wait -n
+		ec=$?
+		active=$((active - 1))
+		if [ "$ec" -ne 0 ] && [ "$exit_code" -eq 0 ]; then
+			exit_code=$ec
+		fi
+	done
+
+	scripts/itest_part.sh "$tranche" "$TRANCHES" "$SHUFFLE_SEED" "$@" &
+	active=$((active + 1))
 done
 
-
-# Wait for the processes created by xargs to finish.
-for pid in "${pids[@]}"; do
-    wait $pid
-
-    # Once finished, grab its exit code.
-    current_exit_code=$?
-
-    # Overwrite the exit code if current itest doesn't return 0.
-    if [ $current_exit_code -ne 0 ]; then
-        # Only write the exit code of the first failing itest.
-        if [ $exit_code -eq 0 ]; then
-            exit_code=$current_exit_code
-        fi
-    fi
+while [ "$active" -gt 0 ]; do
+	wait -n
+	ec=$?
+	active=$((active - 1))
+	if [ "$ec" -ne 0 ] && [ "$exit_code" -eq 0 ]; then
+		exit_code=$ec
+	fi
 done
 
 # Exit with the exit code of the first failing itest or 0.

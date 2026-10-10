@@ -657,11 +657,29 @@ func (hs *tapdHarness) start(expectErrExit bool) error {
 		close(hs.processDone)
 	}()
 
-	// Wait until the RPC server is actually listening.
+	// Ensure the backing lnd node accepts RPC before tapd connects.
 	err := wait.NoError(func() error {
-		_, err := net.Dial("tcp", hs.rpcListenAddr)
+		ctx, cancel := context.WithTimeout(
+			context.Background(), defaultTimeout,
+		)
+		defer cancel()
+
+		_, err := hs.cfg.LndNode.RPC.GetInfo(
+			ctx, &lnrpc.GetInfoRequest{},
+		)
+
 		return err
 	}, defaultTimeout)
+	if err != nil {
+		return fmt.Errorf("error waiting for lnd before tapd "+
+			"start: %w", err)
+	}
+
+	// Wait until the RPC server is actually listening.
+	err = wait.NoError(func() error {
+		_, err := net.Dial("tcp", hs.rpcListenAddr)
+		return err
+	}, tapdStartTimeout)
 	if err != nil {
 		return fmt.Errorf("error waiting for tapd to start: %w", err)
 	}
