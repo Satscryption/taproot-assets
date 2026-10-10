@@ -918,7 +918,6 @@ func (p *ChainPorter) storePackageAnchorTxConf(pkg *sendPackage) error {
 	}
 
 	anchorTxBlockHeight := int32(pkg.TransferTxConfEvent.BlockHeight)
-	anchorTxBlockHeader := pkg.TransferTxConfEvent.Block.Header
 
 	// Now we scan through the VPacket for any burns.
 	//
@@ -952,9 +951,26 @@ func (p *ChainPorter) storePackageAnchorTxConf(pkg *sendPackage) error {
 				OutPoint:   op,
 			}
 
-			// Set the block height and header in the burn proof.
-			b.Proof.BlockHeight = uint32(anchorTxBlockHeight)
-			b.Proof.BlockHeader = anchorTxBlockHeader
+			// storeProofs updates a decoded copy of the proof
+			// suffix, not this virtual-packet suffix. Copy the
+			// confirmation onto the burn proof, including the
+			// transaction merkle proof. Burn-leaf verification
+			// checks that proof.
+			err := b.Proof.UpdateTransitionProof(
+				&proof.BaseProofParams{
+					Block: pkg.TransferTxConfEvent.Block,
+					BlockHeight: pkg.TransferTxConfEvent.
+						BlockHeight,
+					Tx: pkg.TransferTxConfEvent.Tx,
+					TxIndex: int(
+						pkg.TransferTxConfEvent.TxIndex,
+					),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("unable to update burn "+
+					"proof: %w", err)
+			}
 
 			if o.Asset.GroupKey != nil {
 				groupKey := o.Asset.GroupKey.GroupPubKey
