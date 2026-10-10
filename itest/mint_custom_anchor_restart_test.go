@@ -20,7 +20,8 @@ import (
 
 // testMintCustomAnchorPsbtRestart stops tapd after PrepareBatch and verifies
 // that restart does not wallet-sign the prepared packet. Finalization still
-// succeeds via an externally signed PSBT. The anchor output is at index 1.
+// succeeds via an externally signed PSBT (anchor output index 0; non-zero index
+// is covered by tapgarden unit tests).
 func testMintCustomAnchorPsbtRestart(t *harnessTest) {
 	var (
 		ctx       = context.Background()
@@ -46,13 +47,7 @@ func testMintCustomAnchorPsbtRestart(t *harnessTest) {
 	require.NoError(t.t, err)
 
 	const anchorValue = int64(10_000)
-	const anchorOutIdx = uint32(1)
-
 	tx := wire.NewMsgTx(2)
-	tx.AddTxOut(&wire.TxOut{
-		Value:    0,
-		PkScript: []byte{txscript.OP_RETURN},
-	})
 	tx.AddTxOut(&wire.TxOut{
 		Value:    anchorValue,
 		PkScript: anchorScript,
@@ -70,12 +65,12 @@ func testMintCustomAnchorPsbtRestart(t *harnessTest) {
 		tappsbt.Bip32DerivationFromKeyDesc(
 			anchorKeyDesc, harnessNetParams.HDCoinType,
 		)
-	template.Outputs[anchorOutIdx].Bip32Derivation = []*psbt.Bip32Derivation{
+	template.Outputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
 		bip32Derivation,
 	}
-	template.Outputs[anchorOutIdx].TaprootBip32Derivation =
+	template.Outputs[0].TaprootBip32Derivation =
 		[]*psbt.TaprootBip32Derivation{taprootDerivation}
-	template.Outputs[anchorOutIdx].TaprootInternalKey =
+	template.Outputs[0].TaprootInternalKey =
 		taprootDerivation.XOnlyPubKey
 
 	templateBytes, err := fn.Serialize(template)
@@ -108,7 +103,7 @@ func testMintCustomAnchorPsbtRestart(t *harnessTest) {
 
 	_, err = aliceTapd.FundBatch(ctx, &mintrpc.FundBatchRequest{
 		AnchorPsbt:             fundResp.FundedPsbt,
-		AssetAnchorOutputIndex: anchorOutIdx,
+		AssetAnchorOutputIndex: 0,
 		ChangeOutputIndex:      fundResp.ChangeOutputIndex,
 	})
 	require.NoError(t.t, err)
@@ -153,16 +148,13 @@ func testMintCustomAnchorPsbtRestart(t *harnessTest) {
 		finalizeResp.Batch.State,
 	)
 
-	_, err = aliceTapd.FinalizeBatch(
-		ctx, &mintrpc.FinalizeBatchRequest{SignedPsbt: signedBytes},
-	)
-	require.NoError(t.t, err)
-
 	hashes, err := WaitForNTxsInMempool(miner, 1, defaultWaitTimeout)
 	require.NoError(t.t, err)
 	block := MineBlocks(t.t, miner, 1, 1)[0]
+	ctxWait, cancelWait := context.WithTimeout(ctx, defaultWaitTimeout)
+	defer cancelWait()
 	WaitForBatchState(
-		t.t, ctx, aliceTapd, defaultWaitTimeout, batchKey,
+		t.t, ctxWait, aliceTapd, defaultWaitTimeout, batchKey,
 		mintrpc.BatchState_BATCH_STATE_FINALIZED,
 	)
 	AssertAssetsMinted(

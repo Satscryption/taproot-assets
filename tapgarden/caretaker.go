@@ -141,10 +141,16 @@ type BatchCaretaker struct {
 //
 // TODO(roasbeef): rename to Cultivator?
 func NewBatchCaretaker(cfg *BatchCaretakerConfig) *BatchCaretaker {
+	var anchorIdx uint32
+	if cfg.Batch != nil && cfg.Batch.GenesisPacket != nil {
+		anchorIdx = cfg.Batch.GenesisPacket.AssetAnchorOutIdx
+	}
+
 	return &BatchCaretaker{
 		batchKey:  asset.ToSerialized(cfg.Batch.BatchKey.PubKey),
 		cfg:       cfg,
 		confEvent: make(chan *chainntnfs.TxConfirmation, 1),
+		anchorOutputIndex: anchorIdx,
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
 			Quit:           make(chan struct{}),

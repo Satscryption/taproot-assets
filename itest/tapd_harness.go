@@ -618,6 +618,15 @@ func (hs *tapdHarness) updateLndNode(lndNode *node.HarnessNode) {
 // start spins up the tapd process and waits for it to be ready for gRPC
 // connections.
 func (hs *tapdHarness) start(expectErrExit bool) error {
+	if hs.cmd != nil && hs.processDone != nil {
+		select {
+		case <-hs.processDone:
+		default:
+			return fmt.Errorf("tapd (name=%v) is already running",
+				hs.cfg.LndNode.Cfg.Name)
+		}
+	}
+
 	//nolint:gosec
 	hs.cmd = exec.Command("./tapd-itest", hs.cliArgs...)
 
@@ -774,6 +783,15 @@ func (hs *tapdHarness) stop(deleteData bool) error {
 
 	// Reset RPC clients so they get re-created on next start().
 	hs.TaprootAssetsClient = nil
+	hs.AssetWalletClient = nil
+	hs.MintClient = nil
+	hs.RfqClient = nil
+	hs.TaprootAssetChannelsClient = nil
+	hs.UniverseClient = nil
+	hs.TapDevClient = nil
+	hs.MailboxClient = nil
+	hs.cmd = nil
+	hs.processDone = nil
 
 	// Clean up data directory.
 	if deleteData {
