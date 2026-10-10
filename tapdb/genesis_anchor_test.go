@@ -158,7 +158,7 @@ func TestTransferProofKeepsCustomGenesisPreCommit(t *testing.T) {
 
 // insertMintPreCommit stores a local mint pre-commit at the given index
 // of mintTx, bound to the genesis already inserted for that mint.
-func insertMintPreCommit(t *testing.T, db *SqliteStore, genesis asset.Genesis,
+func insertMintPreCommit(t *testing.T, db sqlc.Querier, genesis asset.Genesis,
 	mintTx *wire.MsgTx, outIdx int32, groupKey []byte) {
 
 	t.Helper()
@@ -355,9 +355,10 @@ func TestRepairGenesisAnchor(t *testing.T) {
 	})
 }
 
-// signedCommitTx inserts a signed commitment that spends prevOut.
+// signedCommitTx inserts a signed commitment that spends prevOut and
+// returns that transaction.
 func signedCommitTx(t *testing.T, h *supplyCommitTestHarness,
-	prevOut wire.OutPoint) {
+	prevOut wire.OutPoint) *wire.MsgTx {
 
 	t.Helper()
 
@@ -375,6 +376,8 @@ func signedCommitTx(t *testing.T, h *supplyCommitTestHarness,
 		},
 	)
 	require.NoError(t, err)
+
+	return tx
 }
 
 // TestAbandonInvalidUnconfirmedSupplyCommit drops a broadcast commitment
@@ -438,5 +441,241 @@ func TestAbandonInvalidUnconfirmedSupplyCommit(t *testing.T) {
 		h.assertCurrentStateIs(&supplycommit.CommitBroadcastState{})
 		transition := h.assertPendingTransitionExists()
 		require.True(t, transition.NewCommitmentID.Valid)
+	})
+}
+
+// confirmBroadcastTx writes block metadata onto the signed commitment
+// transaction. The state machine stays in CommitBroadcastState.
+func confirmBroadcastTx(h *supplyCommitTestHarness, tx *wire.MsgTx) {
+	h.t.Helper()
+
+	raw, err := encodeTx(tx)
+	require.NoError(h.t, err)
+	txid := tx.TxHash()
+	transition := h.assertPendingTransitionExists()
+	require.True(h.t, transition.PendingCommitTxnID.Valid)
+	h.confirmChainTx(transition.PendingCommitTxnID.Int64, txid[:], raw)
+}
+
+// insertCustomGenesisPreCommit stores a mint whose pre-commit output is
+// at outIdx, then points the genesis anchor at that mint transaction.
+// The returned outpoint is mint_txid:outIdx.
+func insertCustomGenesisPreCommit(t *testing.T, h *supplyCommitTestHarness,
+	outIdx int32) (wire.OutPoint, *wire.MsgTx, int64) {
+
+	t.Helper()
+
+	genesis := asset.RandGenesis(t, asset.Normal)
+	mintTx := customMintTx(t, genesis.FirstPrevOut)
+	raw, err := encodeTx(mintTx)
+	require.NoError(t, err)
+	mintTxid := mintTx.TxHash()
+	mintChainID, err := h.db.UpsertChainTx(
+		h.ctx, sqlc.UpsertChainTxParams{
+			Txid:  mintTxid[:],
+			RawTx: raw,
+		},
+	)
+	require.NoError(t, err)
+
+	insertMintPreCommit(
+		t, h.db, genesis, mintTx, outIdx, h.groupKeyBytes,
+	)
+
+	encoded, err := encodeOutpoint(genesis.FirstPrevOut)
+	require.NoError(t, err)
+	err = h.db.AnchorGenesisPoint(
+		h.ctx, sqlc.AnchorGenesisPointParams{
+			PrevOut: encoded,
+			AnchorTxID: sql.NullInt64{
+				Int64: mintChainID,
+				Valid: true,
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	preOut := wire.OutPoint{
+		Hash:  mintTxid,
+		Index: uint32(outIdx),
+	}
+	return preOut, mintTx, mintChainID
+}
+
+// retargetGenesisAnchor points the mint's genesis outpoint at a transfer
+// that does not spend it. That is the anchor-retarget corruption.
+func retargetGenesisAnchor(t *testing.T, h *supplyCommitTestHarness,
+	mintTx *wire.MsgTx) int64 {
+
+	t.Helper()
+
+	transfer := transferSpendingMint(mintTx)
+	raw, err := encodeTx(transfer)
+	require.NoError(t, err)
+	txid := transfer.TxHash()
+	transferID, err := h.db.UpsertChainTx(
+		h.ctx, sqlc.UpsertChainTxParams{
+			Txid:  txid[:],
+			RawTx: raw,
+		},
+	)
+	require.NoError(t, err)
+
+	encoded, err := encodeOutpoint(mintTx.TxIn[0].PreviousOutPoint)
+	require.NoError(t, err)
+	err = h.db.AnchorGenesisPoint(
+		h.ctx, sqlc.AnchorGenesisPointParams{
+			PrevOut: encoded,
+			AnchorTxID: sql.NullInt64{
+				Int64: transferID,
+				Valid: true,
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	return transferID
+}
+
+// assertGenesisAnchorID asserts the genesis outpoint's anchor_tx_id.
+func assertGenesisAnchorID(t *testing.T, h *supplyCommitTestHarness,
+	genesis wire.OutPoint, chainID int64) {
+
+	t.Helper()
+
+	encoded, err := encodeOutpoint(genesis)
+	require.NoError(t, err)
+	points, err := h.db.GenesisPoints(h.ctx)
+	require.NoError(t, err)
+
+	for _, point := range points {
+		if bytes.Equal(point.PrevOut, encoded) {
+			require.True(t, point.AnchorTxID.Valid)
+			require.Equal(t, chainID, point.AnchorTxID.Int64)
+			return
+		}
+	}
+
+	t.Fatalf("genesis outpoint %v not found", genesis)
+}
+
+// TestMigration61CommitmentSafety checks the abandon rule against a
+// confirmed commitment and against an unconfirmed commitment that spends
+// a confirmed commitment outpoint.
+func TestMigration61CommitmentSafety(t *testing.T) {
+	t.Parallel()
+
+	t.Run("keeps confirmed commitment", func(t *testing.T) {
+		h := newSupplyCommitTestHarness(t)
+		batchKey, _, mintTx, _, _ := h.addTestMintingBatch()
+		_, _ = h.addTestMintAnchorUniCommitment(
+			batchKey, sql.NullInt64{}, mintTx.TxHash(),
+		)
+
+		err := h.commitMachine.InsertPendingUpdate(
+			h.ctx, h.assetSpec, h.randMintEvent(),
+		)
+		require.NoError(t, err)
+
+		// The input is not a pre-commit. Confirmation is what
+		// keeps the row: the migration only considers commitments
+		// whose chain transaction has no block hash.
+		tx := signedCommitTx(t, h, test.RandOp(t))
+		confirmBroadcastTx(h, tx)
+
+		err = repairGenesisAnchorMigration(h.ctx, h.db)
+		require.NoError(t, err)
+
+		h.assertCurrentStateIs(&supplycommit.CommitBroadcastState{})
+		kept := h.assertPendingTransitionExists()
+		require.True(t, kept.NewCommitmentID.Valid)
+		_, err = h.fetchCommitmentByID(kept.NewCommitmentID.Int64)
+		require.NoError(t, err)
+
+		left, err := h.db.FetchUnconfirmedBroadcastSupplyCommits(
+			h.ctx,
+		)
+		require.NoError(t, err)
+		require.Empty(t, left)
+	})
+
+	t.Run("keeps mempool spend of confirmed commitment", func(t *testing.T) {
+		h := newSupplyCommitTestHarness(t)
+
+		prior := wire.NewMsgTx(2)
+		prior.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: test.RandOp(t),
+		})
+		prior.AddTxOut(&wire.TxOut{
+			Value:    1000,
+			PkScript: []byte{0x51},
+		})
+		raw, err := encodeTx(prior)
+		require.NoError(t, err)
+		txid := prior.TxHash()
+		chainID, err := h.db.UpsertChainTx(
+			h.ctx, sqlc.UpsertChainTxParams{
+				Txid:  txid[:],
+				RawTx: raw,
+			},
+		)
+		require.NoError(t, err)
+		h.addTestSupplyCommitment(chainID, txid[:], raw, true)
+
+		spent := wire.OutPoint{Hash: txid, Index: 0}
+		err = h.commitMachine.InsertPendingUpdate(
+			h.ctx, h.assetSpec, h.randMintEvent(),
+		)
+		require.NoError(t, err)
+		signedCommitTx(t, h, spent)
+
+		err = repairGenesisAnchorMigration(h.ctx, h.db)
+		require.NoError(t, err)
+
+		h.assertCurrentStateIs(&supplycommit.CommitBroadcastState{})
+		kept := h.assertPendingTransitionExists()
+		require.True(t, kept.NewCommitmentID.Valid)
+		require.True(t, kept.PendingCommitTxnID.Valid)
+	})
+
+	t.Run("keeps custom genesis pre-commit spend", func(t *testing.T) {
+		h := newSupplyCommitTestHarness(t)
+		const preCommitIdx = int32(1)
+		preOut, mintTx, mintChainID := insertCustomGenesisPreCommit(
+			t, h, preCommitIdx,
+		)
+		require.Equal(t, uint32(preCommitIdx), preOut.Index)
+
+		transferID := retargetGenesisAnchor(t, h, mintTx)
+		assertGenesisAnchorID(
+			t, h, mintTx.TxIn[0].PreviousOutPoint, transferID,
+		)
+
+		err := h.commitMachine.InsertPendingUpdate(
+			h.ctx, h.assetSpec, h.randMintEvent(),
+		)
+		require.NoError(t, err)
+		signedCommitTx(t, h, preOut)
+
+		err = repairGenesisAnchorMigration(h.ctx, h.db)
+		require.NoError(t, err)
+
+		assertGenesisAnchorID(
+			t, h, mintTx.TxIn[0].PreviousOutPoint, mintChainID,
+		)
+		h.assertCurrentStateIs(&supplycommit.CommitBroadcastState{})
+		kept := h.assertPendingTransitionExists()
+		require.True(t, kept.NewCommitmentID.Valid)
+
+		rows, err := h.db.FetchUnspentMintSupplyPreCommits(
+			h.ctx, h.groupKeyBytes,
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, rows)
+		require.Equal(t, preCommitIdx, rows[0].TxOutputIndex)
+		var got wire.MsgTx
+		err = got.Deserialize(bytes.NewReader(rows[0].RawTx))
+		require.NoError(t, err)
+		require.Equal(t, mintTx.TxHash(), got.TxHash())
 	})
 }
