@@ -101,6 +101,38 @@ func TestTryRecoverBuriedBroadcastNotBuried(t *testing.T) {
 	require.Nil(t, transition)
 }
 
+func TestTryRecoverBuriedBroadcastReorgBeforeBurial(t *testing.T) {
+	commitTx := wire.NewMsgTx(2)
+	commitTx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
+
+	header := wire.BlockHeader{}
+
+	chain := tapgarden.NewMockChainBridge()
+	chain.BlocksByHeight = map[int64]*wire.MsgBlock{}
+	for height := int64(1); height <= 20; height++ {
+		chain.BlocksByHeight[height] = wire.NewMsgBlock(&header)
+	}
+	// Commitment was seen at height 10 but re-orged away before burial.
+	chain.TipHeight = 20
+
+	env := &Environment{
+		Chain:            chain,
+		CommitConfTarget: DefaultCommitConfTarget,
+	}
+	state := &CommitBroadcastState{
+		SupplyTransition: SupplyStateTransition{
+			NewCommitment: RootCommitment{Txn: commitTx},
+		},
+	}
+
+	transition, recovered, err := tryRecoverBuriedBroadcast(
+		context.Background(), state, env,
+	)
+	require.NoError(t, err)
+	require.False(t, recovered)
+	require.Nil(t, transition)
+}
+
 func TestTryRecoverBuriedBroadcastScanError(t *testing.T) {
 	commitTx := wire.NewMsgTx(2)
 	commitTx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})

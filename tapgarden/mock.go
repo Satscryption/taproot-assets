@@ -600,6 +600,10 @@ type MockChainBridge struct {
 	// TipHeight, when non-zero, overrides CurrentHeight.
 	TipHeight uint32
 
+	// LastConfPkScript records the pkScript from the most recent conf
+	// registration (for caretaker regression tests).
+	LastConfPkScript []byte
+
 	failFeeEstimates atomic.Bool
 	errConf          atomic.Int32
 	emptyConf        atomic.Int32
@@ -660,8 +664,10 @@ func (m *MockChainBridge) SendConfNtfn(reqNo int, blockHash *chainhash.Hash,
 }
 
 func (m *MockChainBridge) RegisterConfirmationsNtfn(ctx context.Context,
-	_ *chainhash.Hash, _ []byte, _, _ uint32, _ bool,
+	_ *chainhash.Hash, pkScript []byte, _, _ uint32, _ bool,
 	_ chan struct{}) (*chainntnfs.ConfirmationEvent, chan error, error) {
+
+	m.LastConfPkScript = pkScript
 
 	select {
 	case <-ctx.Done():
