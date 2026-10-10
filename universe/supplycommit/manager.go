@@ -16,6 +16,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/universe"
+	lfn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/protofsm"
 )
@@ -146,6 +147,27 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
+// hydrateInitialState copies a persisted transition's pending updates onto
+// an UpdatesPendingState that was loaded without them. Other states are
+// left unchanged, including a CommitBroadcastState whose signed
+// transaction is not rehydrated here.
+func hydrateInitialState(state State,
+	transition lfn.Option[SupplyStateTransition]) {
+
+	pending, ok := state.(*UpdatesPendingState)
+	if !ok {
+		return
+	}
+
+	transition.WhenSome(func(tr SupplyStateTransition) {
+		if len(pending.pendingUpdates) == 0 &&
+			len(tr.PendingUpdates) > 0 {
+
+			pending.pendingUpdates = tr.PendingUpdates
+		}
+	})
+}
+
 // startAssetSM creates and starts a new supply commitment state
 // machine for the given asset specifier.
 func (m *Manager) startAssetSM(ctx context.Context,
@@ -168,10 +190,18 @@ func (m *Manager) startAssetSM(ctx context.Context,
 
 	// Before we start the state machine, we'll need to fetch the current
 	// state from disk, to see if we need to emit any new events.
-	initialState, _, err := m.cfg.StateLog.FetchState(ctx, assetSpec)
+	initialState, transitionOpt, err := m.cfg.StateLog.FetchState(
+		ctx, assetSpec,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch current state: %w", err)
 	}
+
+	// intToState does not carry the pending update log. After a
+	// never-confirmed commitment is abandoned, the machine is in
+	// UpdatesPendingState and the next tick must rebuild from those
+	// events.
+	hydrateInitialState(initialState, transitionOpt)
 
 	// Create a new error reporter for the state machine.
 	errorReporter := NewErrorReporter(assetSpec)

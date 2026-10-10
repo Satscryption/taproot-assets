@@ -23,6 +23,9 @@ type Querier interface {
 	AssetsInBatch(ctx context.Context, rawKey []byte) ([]AssetsInBatchRow, error)
 	BindMintingBatchWithTapSibling(ctx context.Context, arg BindMintingBatchWithTapSiblingParams) error
 	BindMintingBatchWithTx(ctx context.Context, arg BindMintingBatchWithTxParams) (int64, error)
+	ClearPendingSupplyCommitTransition(ctx context.Context, transitionID int64) error
+	ClearSpentCommitmentRef(ctx context.Context, spentCommitment sql.NullInt64) error
+	ClearSupplyCommitmentRefs(ctx context.Context, commitID sql.NullInt64) error
 	ConfirmChainAnchorTx(ctx context.Context, arg ConfirmChainAnchorTxParams) error
 	ConfirmChainTx(ctx context.Context, arg ConfirmChainTxParams) error
 	CountAuthMailboxMessages(ctx context.Context) (int64, error)
@@ -39,6 +42,7 @@ type Querier interface {
 	DeleteMultiverseRoot(ctx context.Context, namespaceRoot string) error
 	DeleteNode(ctx context.Context, arg DeleteNodeParams) (int64, error)
 	DeleteRoot(ctx context.Context, namespace string) (int64, error)
+	DeleteSupplyCommitment(ctx context.Context, commitID int64) error
 	DeleteSupplyCommitTransition(ctx context.Context, transitionID int64) error
 	DeleteSupplyUpdateEvents(ctx context.Context, transitionID sql.NullInt64) error
 	DeleteTapscriptTreeEdges(ctx context.Context, rootHash []byte) error
@@ -61,6 +65,7 @@ type Querier interface {
 	FetchAddrEventProofs(ctx context.Context, addrEventID int64) ([]FetchAddrEventProofsRow, error)
 	FetchAddrs(ctx context.Context, arg FetchAddrsParams) ([]FetchAddrsRow, error)
 	FetchAllAssetMeta(ctx context.Context) ([]FetchAllAssetMetaRow, error)
+	FetchAllChainTxns(ctx context.Context) ([]FetchAllChainTxnsRow, error)
 	FetchAllNodes(ctx context.Context) ([]MssmtNode, error)
 	FetchAssetID(ctx context.Context, arg FetchAssetIDParams) ([]int64, error)
 	FetchAssetMeta(ctx context.Context, metaID int64) (FetchAssetMetaRow, error)
@@ -93,6 +98,7 @@ type Querier interface {
 	FetchAuthMailboxMessageByOutpoint(ctx context.Context, claimedOutpoint []byte) (FetchAuthMailboxMessageByOutpointRow, error)
 	FetchAuxCloseInfo(ctx context.Context, chanPoint []byte) ([]byte, error)
 	FetchChainTx(ctx context.Context, txid []byte) (ChainTxn, error)
+	FetchConfirmedSupplyCommitOutpoints(ctx context.Context) ([]FetchConfirmedSupplyCommitOutpointsRow, error)
 	FetchChainTxByID(ctx context.Context, txnID int64) (FetchChainTxByIDRow, error)
 	// Returns the node with the given hash key alongside its direct children, in
 	// no particular order. Each row is a primary key lookup, so the cost is
@@ -115,12 +121,14 @@ type Querier interface {
 	FetchManagedUTXOs(ctx context.Context) ([]FetchManagedUTXOsRow, error)
 	// Fetch records from the supply_pre_commits table with optional
 	// filtering.
+	FetchMintSupplyPreCommitOutpoints(ctx context.Context) ([][]byte, error)
 	FetchMintSupplyPreCommits(ctx context.Context, arg FetchMintSupplyPreCommitsParams) ([]FetchMintSupplyPreCommitsRow, error)
 	FetchMintingBatch(ctx context.Context, rawKey []byte) (FetchMintingBatchRow, error)
 	FetchMintingBatchesByInverseState(ctx context.Context, batchState int16) ([]FetchMintingBatchesByInverseStateRow, error)
 	FetchMultiverseRoot(ctx context.Context, namespaceRoot string) (FetchMultiverseRootRow, error)
 	FetchOrphanManagedUTXOs(ctx context.Context, arg FetchOrphanManagedUTXOsParams) ([]FetchOrphanManagedUTXOsRow, error)
 	FetchPeerAcceptedBuyPeerByScid(ctx context.Context, scid int64) ([]byte, error)
+	FetchRemoteSupplyPreCommitOutpoints(ctx context.Context) ([][]byte, error)
 	FetchRootNode(ctx context.Context, namespace string) (MssmtNode, error)
 	FetchScriptKeyByTweakedKey(ctx context.Context, tweakedScriptKey []byte) (FetchScriptKeyByTweakedKeyRow, error)
 	FetchScriptKeyIDByTweakedKey(ctx context.Context, tweakedScriptKey []byte) (int64, error)
@@ -142,6 +150,7 @@ type Querier interface {
 	// Fetch unspent supply pre-commitment outputs. Each pre-commitment output
 	// comes from a mint anchor transaction and relates to an asset issuance
 	// where the local node acted as the issuer.
+	FetchUnconfirmedBroadcastSupplyCommits(ctx context.Context) ([]FetchUnconfirmedBroadcastSupplyCommitsRow, error)
 	FetchUnspentMintSupplyPreCommits(ctx context.Context, groupKey []byte) ([]FetchUnspentMintSupplyPreCommitsRow, error)
 	// Fetch unspent supply pre-commitment outputs. Each pre-commitment output
 	// comes from a mint anchor transaction and relates to an asset issuance
@@ -252,6 +261,7 @@ type Querier interface {
 	QueryUniverseStats(ctx context.Context) (QueryUniverseStatsRow, error)
 	QueryUniverseSupplyLeaves(ctx context.Context, arg QueryUniverseSupplyLeavesParams) ([]QueryUniverseSupplyLeavesRow, error)
 	ReAnchorPassiveAssets(ctx context.Context, arg ReAnchorPassiveAssetsParams) error
+	ResetSupplyCommitMachineForAbandon(ctx context.Context, arg ResetSupplyCommitMachineForAbandonParams) error
 	SetAddrManaged(ctx context.Context, arg SetAddrManagedParams) error
 	SetAssetSpent(ctx context.Context, arg SetAssetSpentParams) (int64, error)
 	SetTransferOutputProofDeliveryStatus(ctx context.Context, arg SetTransferOutputProofDeliveryStatusParams) error
@@ -260,6 +270,8 @@ type Querier interface {
 	// conflicting transfer has confirmed on-chain, these transfers' anchor
 	// transactions can never confirm.
 	SupersedeConflictingTransfers(ctx context.Context, arg SupersedeConflictingTransfersParams) (int64, error)
+	UnmarkMintPreCommitsSpentBy(ctx context.Context, spentBy sql.NullInt64) error
+	UnmarkRemotePreCommitsSpentBy(ctx context.Context, spentBy sql.NullInt64) error
 	UniverseLeaves(ctx context.Context) ([]UniverseLeafe, error)
 	UniverseRoots(ctx context.Context, arg UniverseRootsParams) ([]UniverseRootsRow, error)
 	UpdateBatchGenesisTx(ctx context.Context, arg UpdateBatchGenesisTxParams) error
