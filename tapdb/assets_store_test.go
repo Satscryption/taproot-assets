@@ -2312,6 +2312,18 @@ func TestAssetExportLog(t *testing.T) {
 		ctx, spendDelta, leaseOwner, leaseExpiry,
 	))
 
+	// A second log of the same anchor is how a lost
+	// PublishAndLogTransfer response is retried. It must not insert
+	// another asset_transfers row.
+	require.NoError(t, assetsStore.LogPendingParcel(
+		ctx, spendDelta, leaseOwner, leaseExpiry,
+	))
+	loggedTwice, err := db.QueryAssetTransfers(ctx, TransferQuery{
+		AnchorTxHash: anchorTxHash[:],
+	})
+	require.NoError(t, err)
+	require.Len(t, loggedTwice, 1)
+
 	assetID := inputAsset.ID()
 	receiverIdentifier := tapfreighter.NewOutputIdentifier(
 		assetID, 0, *newScriptKey.PubKey,
