@@ -707,6 +707,7 @@ func genServerConfig(ctx context.Context, cfg *Config,
 			ClientFactory:          rpcserver.NewRpcSupplySync,
 			Store:                  supplySyncerStore,
 			UniverseFederationView: federationDB,
+			History:                supplyCommitStore,
 		},
 	)
 
