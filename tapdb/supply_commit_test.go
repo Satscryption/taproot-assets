@@ -1613,6 +1613,88 @@ func TestBindDanglingUpdatesToTransition(t *testing.T) {
 	)
 }
 
+// TestBeginIdleTransition tests that an idle transition can only be started
+// from the default state with a latest commitment, that it is frozen, that it
+// spends the latest commitment and that it picks up dangling updates.
+func TestBeginIdleTransition(t *testing.T) {
+	t.Parallel()
+
+	h := newSupplyCommitTestHarness(t)
+
+	// Without a latest commitment there is nothing to spend, so we expect
+	// an error and no transition to be created.
+	_, err := h.commitMachine.BeginIdleTransition(h.ctx, h.assetSpec)
+	require.Error(t, err)
+	h.assertNoPendingTransition()
+
+	// Create a finalized transition, so there is a latest commitment.
+	updates := []supplycommit.SupplyUpdateEvent{h.randMintEvent()}
+	transition := h.performSingleTransition(updates, []wire.OutPoint{}, 442)
+	h.assertTransitionApplied(transition)
+
+	stateMachine, err := h.fetchStateMachine()
+	require.NoError(t, err)
+	require.True(t, stateMachine.LatestCommitmentID.Valid)
+
+	// Add a dangling update, it should be bound to the idle transition.
+	dangling := h.randBurnEvent()
+	err = h.commitMachine.db.ExecTx(
+		h.ctx, WriteTxOption(), func(db SupplyCommitStore) error {
+			var b bytes.Buffer
+			err := serializeSupplyUpdateEvent(&b, dangling)
+			require.NoError(t, err)
+			updateTypeID, err := updateTypeToInt(
+				dangling.SupplySubTreeType(),
+			)
+			require.NoError(t, err)
+
+			eventData := b.Bytes()
+			eventKey := supplyUpdateEventKey(
+				h.groupKeyBytes, updateTypeID, eventData,
+			)
+
+			rows, err := db.InsertSupplyUpdateEvent(
+				h.ctx, InsertSupplyUpdateEvent{
+					GroupKey:     h.groupKeyBytes,
+					TransitionID: sql.NullInt64{},
+					UpdateTypeID: updateTypeID,
+					EventData:    eventData,
+					EventKey:     eventKey,
+				},
+			)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), rows)
+
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, h.fetchDanglingUpdates(), 1)
+
+	bound, err := h.commitMachine.BeginIdleTransition(h.ctx, h.assetSpec)
+	require.NoError(t, err)
+	require.Len(t, bound, 1)
+	assertEqualEvents(t, dangling, bound[0])
+	require.Empty(t, h.fetchDanglingUpdates())
+
+	// The new transition is frozen, unfinalized and spends the latest
+	// commitment, and the machine is now in the updates pending state.
+	dbTransition := h.assertPendingTransitionExists()
+	require.True(t, dbTransition.Frozen)
+	require.False(t, dbTransition.Finalized)
+	require.Equal(
+		t, stateMachine.LatestCommitmentID,
+		dbTransition.OldCommitmentID,
+	)
+	h.assertCurrentStateIs(&supplycommit.UpdatesPendingState{})
+	h.assertPendingUpdates([]supplycommit.SupplyUpdateEvent{dangling})
+
+	// Starting another idle transition now must fail, as the machine is
+	// no longer in the default state.
+	_, err = h.commitMachine.BeginIdleTransition(h.ctx, h.assetSpec)
+	require.Error(t, err)
+}
+
 // TestSupplyCommitInsertSignedCommitTx tests associating a signed commit tx
 // with a transition.
 func TestSupplyCommitInsertSignedCommitTx(t *testing.T) {

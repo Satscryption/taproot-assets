@@ -966,6 +966,151 @@ func bindDanglingUpdatesBody(ctx context.Context, db SupplyCommitStore,
 	return boundEvents, nil
 }
 
+// BeginIdleTransition starts a new, frozen transition that spends the latest
+// confirmed supply commitment without requiring a new supply update. Any
+// dangling updates are bound to the new transition and returned. The state
+// machine must be in the default state, have a latest commitment, and have no
+// pending transition.
+func (s *SupplyCommitMachine) BeginIdleTransition(ctx context.Context,
+	assetSpec asset.Specifier) ([]supplycommit.SupplyUpdateEvent, error) {
+
+	groupKey := assetSpec.UnwrapGroupKeyToPtr()
+	if groupKey == nil {
+		return nil, ErrMissingGroupKey
+	}
+	groupKeyBytes := schnorr.SerializePubKey(groupKey)
+
+	var boundEvents []supplycommit.SupplyUpdateEvent
+
+	writeTx := WriteTxOption()
+	err := s.db.ExecTx(ctx, writeTx, func(db SupplyCommitStore) error {
+		// Start from a clean slate, so a failed attempt can be retried.
+		boundEvents = nil
+
+		stateMachine, err := db.QuerySupplyCommitStateMachine(
+			ctx, groupKeyBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to query state machine: %w",
+				err)
+		}
+
+		currentState, err := intToState(stateMachine.CurrentStateID)
+		if err != nil {
+			return fmt.Errorf("invalid state ID %d: %w",
+				stateMachine.CurrentStateID, err)
+		}
+		if _, ok := currentState.(*supplycommit.DefaultState); !ok {
+			return fmt.Errorf("cannot begin idle transition in "+
+				"state: %s", currentState.String())
+		}
+
+		// An idle transition spends the latest commitment, so there
+		// has to be one.
+		if !stateMachine.LatestCommitmentID.Valid {
+			return fmt.Errorf("cannot begin idle transition "+
+				"without a latest commitment for group key %x",
+				groupKeyBytes)
+		}
+
+		// We can't start a new transition while one is pending.
+		_, err = db.QueryPendingSupplyCommitTransition(
+			ctx, groupKeyBytes,
+		)
+		switch {
+		case err == nil:
+			return fmt.Errorf("cannot begin idle transition, "+
+				"a transition is already pending for group "+
+				"key %x", groupKeyBytes)
+
+		case !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("failed to query pending "+
+				"transition: %w", err)
+		}
+
+		// The transition is created frozen, so that updates arriving
+		// while it is in flight become dangling updates for the next
+		// one.
+		transitionID, err := db.InsertSupplyCommitTransition(
+			ctx, InsertSupplyCommitTransition{
+				StateMachineGroupKey: groupKeyBytes,
+				OldCommitmentID:      stateMachine.LatestCommitmentID, //nolint:lll
+				Finalized:            false,
+				Frozen:               true,
+				CreationTime:         time.Now().Unix(),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert new "+
+				"transition: %w", err)
+		}
+
+		// Bind any dangling updates, they are committed together with
+		// the idle successor.
+		eventRows, err := db.QueryDanglingSupplyUpdateEvents(
+			ctx, groupKeyBytes,
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to query dangling "+
+				"events: %w", err)
+		}
+		if len(eventRows) > 0 {
+			err = db.LinkDanglingSupplyUpdateEvents(
+				ctx, LinkDanglingSupplyUpdateEventsParams{
+					GroupKey:     groupKeyBytes,
+					TransitionID: sqlInt64(transitionID),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to link dangling "+
+					"events: %w", err)
+			}
+		}
+
+		boundEvents = make(
+			[]supplycommit.SupplyUpdateEvent, 0, len(eventRows),
+		)
+		for _, eventRow := range eventRows {
+			event, err := deserializeSupplyUpdateEvent(
+				eventRow.UpdateTypeName,
+				bytes.NewReader(eventRow.EventData),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize "+
+					"event: %w", err)
+			}
+			boundEvents = append(boundEvents, event)
+		}
+
+		// Finally persist the updates pending state, so the cycle is
+		// resumed after a restart.
+		pendingStateName, err := stateToDBString(
+			&supplycommit.UpdatesPendingState{},
+		)
+		if err != nil {
+			return fmt.Errorf("error getting pending state "+
+				"name: %w", err)
+		}
+		_, err = db.UpsertSupplyCommitStateMachine(
+			ctx, SupplyCommitMachineParams{
+				GroupKey:  groupKeyBytes,
+				StateName: sqlStr(pendingStateName),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to update state machine "+
+				"to pending: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return boundEvents, nil
+}
+
 // insertSignedCommitTxBody persists a signed commitment transaction within
 // the caller's transaction: it stores the transaction, links it to the
 // pending transition, and moves the state-machine row to
